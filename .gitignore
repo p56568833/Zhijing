@@ -1,0 +1,6 @@
+.build/
+dist/
+tmp/
+Assets/AppIcon-keyed.png
+.reasonix/
+.DS_Store
