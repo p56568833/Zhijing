@@ -14,7 +14,7 @@ let package = Package(
             exclude: [
                 "Tests",
                 "script",
-                "dist",
+                "知境.app",
                 "Assets",
                 "tmp",
                 "知识库笔记软件-MVP产品需求文档.md",

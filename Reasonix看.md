@@ -4,21 +4,20 @@
 
 1. 改代码
 2. `swift build --disable-sandbox`
-3. 打包到 `dist/`：
+3. 打包到项目根目录：
    ```
-   mkdir -p dist/知境测试版.app/Contents/MacOS dist/知境测试版.app/Contents/Resources
-   cp .build/arm64-apple-macosx/debug/Zhijing dist/知境测试版.app/Contents/MacOS/Zhijing
-   cp Assets/AppIcon.icns dist/知境测试版.app/Contents/Resources/
+   mkdir -p 知境.app/Contents/MacOS 知境.app/Contents/Resources
+   cp .build/arm64-apple-macosx/debug/Zhijing 知境.app/Contents/MacOS/Zhijing
+   cp Assets/AppIcon.icns 知境.app/Contents/Resources/
    ```
    （Info.plist 如不存在也需创建）
 4. `open dist/知境.app` 快速预览效果
 
 ## 重要规则
 
-- **不要**试图写入 `~/Applications/知境.app` 或 `~/Applications/知境测试版.app`。开发包只保留在 `dist/`。
-- **不要**手动删除用户的 `~/Applications/知境.app`。那是用户的唯一安装版本。
-- 最终安装由用户手动完成：`dist/知境.app` → 拖到 `~/Applications/` 替换。
-- 开发期间始终从 `dist/知境测试版.app` 直接启动测试。Dock 中显示为「**知境测试版**」，可与正式版区分。
+- 不再区分正式版和测试版，仓库只构建一个 `知境.app`。
+- 不要复制到 `~/Applications`；开发和使用都直接启动项目根目录的 `知境.app`。
+- 每次构建会原地替换这一份应用，确保不会产生多个版本。
 - 每次改完代码记得 `touch` 相关文件后再 build，避免增量编译缓存没更新。
 
 ## 项目信息

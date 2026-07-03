@@ -76,9 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        if Bundle.main.bundleIdentifier != "com.zhijing.app.test" {
-            MarkdownFileAssociation.makeZhijingDefaultEditor()
-        }
+        MarkdownFileAssociation.makeZhijingDefaultEditor()
     }
 
     func connect(store: AppStore) {
