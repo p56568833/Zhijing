@@ -135,6 +135,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private(set) var documentID: String?
         private(set) var contentRevision: Int?
         private var isApplyingExternalContent = false
+        private var presentationWork: DispatchWorkItem?
 
         init(onChange: @escaping (String) -> Void) {
             self.onChange = onChange
@@ -146,6 +147,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 return
             }
             updateLinks(in: textView)
+            schedulePresentationUpdate(for: textView)
             textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
             onChange(textView.string)
         }
@@ -200,6 +202,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 )
             }
             updateLinks(in: textView)
+            MarkdownPresentationHighlighter.apply(to: textView)
         }
 
         private func updateLinks(in textView: MarkdownEditorTextView) {
@@ -207,6 +210,24 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             if let window = textView.window {
                 window.invalidateCursorRects(for: textView)
             }
+        }
+
+        private func schedulePresentationUpdate(
+            for textView: MarkdownEditorTextView
+        ) {
+            presentationWork?.cancel()
+            let expectedText = textView.string
+            let work = DispatchWorkItem { [weak textView] in
+                guard let textView,
+                      textView.string == expectedText,
+                      !textView.hasMarkedText() else { return }
+                MarkdownPresentationHighlighter.apply(to: textView)
+            }
+            presentationWork = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 0.08,
+                execute: work
+            )
         }
 
         private func preserveViewportAndSelection(

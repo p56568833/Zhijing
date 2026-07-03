@@ -193,6 +193,7 @@ import AppKit
             String(character),
             replacementRange: textView.selectedRange()
         )
+        MarkdownPresentationHighlighter.apply(to: textView)
         coordinator.synchronize(
             text: textView.string,
             documentID: "连续输入.md",
@@ -220,6 +221,42 @@ import AppKit
     #expect(textView.markdownLinks.count == 1)
     #expect(textView.markdownLinks.first?.url.absoluteString == "https://openai.com")
     #expect(textView.textStorage?.attribute(.link, at: 1, effectiveRange: nil) == nil)
+}
+
+@MainActor
+@Test func presentationHighlightingUsesOnlyNonMetricTemporaryAttributes() {
+    let source = """
+    # 标题
+    > 引用
+    - 列表
+    **重点**与`代码`
+    [链接](https://example.com)
+    """
+    let textView = MarkdownEditorTextView()
+    textView.isRichText = false
+    textView.string = source
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    MarkdownPresentationHighlighter.apply(to: textView)
+
+    guard let layoutManager = textView.layoutManager else {
+        Issue.record("编辑器缺少布局管理器")
+        return
+    }
+    for index in 0..<source.utf16.count {
+        let attributes = layoutManager.temporaryAttributes(
+            atCharacterIndex: index,
+            effectiveRange: nil
+        )
+        #expect(attributes[.font] == nil)
+        #expect(attributes[.paragraphStyle] == nil)
+        #expect(attributes[.link] == nil)
+    }
+    #expect(
+        layoutManager.temporaryAttributes(
+            atCharacterIndex: 2,
+            effectiveRange: nil
+        )[.foregroundColor] != nil
+    )
 }
 
 @Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {
