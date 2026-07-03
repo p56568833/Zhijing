@@ -143,6 +143,18 @@ import AppKit
     #expect(textView.selectionAffinity == .upstream)
 }
 
+@MainActor
+@Test func markdownLinksDoNotInstallNativeTextViewLinkAttributes() {
+    let source = "[OpenAI](https://openai.com)"
+    let attributed = MarkdownSyntaxHighlighter.attributedString(source)
+
+    #expect(attributed.attribute(.link, at: 1, effectiveRange: nil) == nil)
+    #expect(
+        attributed.attribute(.underlineStyle, at: 1, effectiveRange: nil) as? Int
+            == NSUnderlineStyle.single.rawValue
+    )
+}
+
 @Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {
     let configuration = AIConfiguration(
         apiKey: "test-key",

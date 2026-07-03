@@ -1,16 +1,24 @@
 import AppKit
 import SwiftUI
 
+private struct EditorLink {
+    let range: NSRange
+    let url: URL
+}
+
 private final class EditorTextView: NSTextView {
-    var linkRanges: [NSRange] = []
+    var links: [EditorLink] = []
 
     override func resetCursorRects() {
         super.resetCursorRects()
         guard let lm = layoutManager,
               let tc = textContainer,
-              !linkRanges.isEmpty else { return }
-        for range in linkRanges {
-            let glyphRange = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+              !links.isEmpty else { return }
+        for link in links {
+            let glyphRange = lm.glyphRange(
+                forCharacterRange: link.range,
+                actualCharacterRange: nil
+            )
             let rect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
             if !rect.isEmpty {
                 addCursorRect(rect, cursor: .pointingHand)
@@ -21,16 +29,9 @@ private final class EditorTextView: NSTextView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let index = characterIndexForInsertion(at: point)
-        if index < (textStorage?.length ?? 0) {
-            if let url = textStorage?.attribute(.link, at: index, effectiveRange: nil) as? URL {
-                NSWorkspace.shared.open(url)
-                return
-            }
-            if let urlString = textStorage?.attribute(.link, at: index, effectiveRange: nil) as? String,
-               let url = URL(string: urlString) {
-                NSWorkspace.shared.open(url)
-                return
-            }
+        if let link = links.first(where: { NSLocationInRange(index, $0.range) }) {
+            NSWorkspace.shared.open(link.url)
+            return
         }
         super.mouseDown(with: event)
     }
@@ -83,7 +84,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             MarkdownSyntaxHighlighter.attributedString(text)
         )
         textView.typingAttributes = MarkdownSyntaxHighlighter.baseAttributes
-        textView.linkRanges = MarkdownSyntaxHighlighter.collectLinkRanges(in: text)
+        textView.links = MarkdownSyntaxHighlighter.collectLinks(in: text)
         textView.delegate = context.coordinator
 
         scrollView.documentView = textView
@@ -114,7 +115,6 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         var text: Binding<String>
         var documentID: String
         var onChange: () -> Void
-        var highlightWork: DispatchWorkItem?
         private var isApplyingProgrammaticChange = false
 
         init(
@@ -135,27 +135,11 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 text.wrappedValue = latestText
                 onChange()
             }
-            textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
-            guard !textView.hasMarkedText() else { return }
-            highlightWork?.cancel()
-            let work = DispatchWorkItem { [weak textView] in
-                guard let textView,
-                      textView.string == latestText,
-                      !textView.hasMarkedText() else { return }
-                Self.preserveEditingState(of: textView) {
-                    guard let textStorage = textView.textStorage else { return }
-                    textStorage.beginEditing()
-                    MarkdownSyntaxHighlighter.applyHighlighting(to: textStorage)
-                    textStorage.endEditing()
-                    textView.typingAttributes = MarkdownSyntaxHighlighter.baseAttributes
-                    textView.linkRanges = MarkdownSyntaxHighlighter.collectLinkRanges(
-                        in: textStorage.string
-                    )
-                }
-                textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
+            textView.links = MarkdownSyntaxHighlighter.collectLinks(in: latestText)
+            if let window = textView.window {
+                window.invalidateCursorRects(for: textView)
             }
-            highlightWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+            textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
         }
 
         fileprivate func replaceContents(
@@ -164,7 +148,6 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             documentID newDocumentID: String,
             resetEditingPosition: Bool
         ) {
-            highlightWork?.cancel()
             isApplyingProgrammaticChange = true
             defer { isApplyingProgrammaticChange = false }
 
@@ -173,7 +156,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                     MarkdownSyntaxHighlighter.attributedString(newText)
                 )
                 textView.typingAttributes = MarkdownSyntaxHighlighter.baseAttributes
-                textView.linkRanges = MarkdownSyntaxHighlighter.collectLinkRanges(in: newText)
+                textView.links = MarkdownSyntaxHighlighter.collectLinks(in: newText)
             }
 
             if resetEditingPosition {
@@ -246,33 +229,6 @@ enum MarkdownSyntaxHighlighter {
         return p
     }
 
-    // MARK: - In-place highlighting (no text replacement, no cursor disruption)
-
-    static func applyHighlighting(to ts: NSTextStorage) {
-        let full = NSRange(location: 0, length: ts.length)
-        ts.setAttributes([.font: baseFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraphStyle], range: full)
-        let source = ts.string
-        let string = source as NSString
-        var location = 0
-        var inFence = false
-        while location < string.length {
-            let lineRange = string.lineRange(for: NSRange(location: location, length: 0))
-            let line = string.substring(with: lineRange).trimmingCharacters(in: .newlines)
-            let cr = NSRange(location: lineRange.location, length: (line as NSString).length)
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                inFence.toggle()
-                ts.addAttributes([.foregroundColor: NSColor.systemPurple, .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.07)], range: cr)
-            } else if inFence {
-                ts.addAttributes([.foregroundColor: NSColor.systemTeal, .backgroundColor: NSColor.controlBackgroundColor], range: cr)
-            } else {
-                styleMarkdownLine(line, range: cr, in: ts)
-            }
-            location = NSMaxRange(lineRange)
-        }
-        styleInlineMarkdown(in: ts, source: source)
-    }
-
     // MARK: - Full attributed string (used for initial load / document switch)
 
     static func attributedString(_ source: String) -> NSAttributedString {
@@ -304,15 +260,20 @@ enum MarkdownSyntaxHighlighter {
 
     // MARK: - Shared helpers
 
-    static func collectLinkRanges(in source: String) -> [NSRange] {
+    fileprivate static func collectLinks(in source: String) -> [EditorLink] {
         let pattern = #"\[[^\]\n]+\]\(([^)]+)\)"#
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
-        var ranges: [NSRange] = []
+        let nsSource = source as NSString
+        var links: [EditorLink] = []
         expression.enumerateMatches(in: source, range: NSRange(location: 0, length: (source as NSString).length)) { match, _, _ in
-            guard let match else { return }
-            ranges.append(match.range)
+            guard let match, match.numberOfRanges >= 2 else { return }
+            let urlString = nsSource.substring(with: match.range(at: 1))
+            guard let url = URL(string: urlString) ?? URL(string: "https://\(urlString)") else {
+                return
+            }
+            links.append(EditorLink(range: match.range, url: url))
         }
-        return ranges
+        return links
     }
 
     private static func styleMarkdownLine(
@@ -355,11 +316,13 @@ enum MarkdownSyntaxHighlighter {
         let nsSource = source as NSString
         expression.enumerateMatches(in: source, range: NSRange(location: 0, length: nsSource.length)) { match, _, _ in
             guard let match, match.numberOfRanges >= 2 else { return }
-            let urlString = nsSource.substring(with: match.range(at: 1))
-            let url = URL(string: urlString) ?? URL(string: "https://\(urlString)")
-            var attrs: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]
-            if let url { attrs[.link] = url }
-            result.addAttributes(attrs, range: match.range)
+            result.addAttributes(
+                [
+                    .foregroundColor: NSColor.linkColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                ],
+                range: match.range
+            )
         }
     }
 
