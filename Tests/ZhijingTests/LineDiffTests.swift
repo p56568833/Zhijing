@@ -283,6 +283,7 @@ import AppKit
         Issue.record("无法建立链接布局测试")
         return
     }
+    textView.markdownLinks = [link]
     layoutManager.ensureLayout(for: textContainer)
     let rects = textView.cursorRects(
         for: link.range,
@@ -293,6 +294,13 @@ import AppKit
     #expect(rects.count > 1)
     #expect(rects.allSatisfy { $0.minX >= textView.textContainerOrigin.x })
     #expect(rects.first?.minY == textView.textContainerOrigin.y)
+    if let firstRect = rects.first {
+        #expect(textView.markdownLink(at: NSPoint(
+            x: firstRect.midX,
+            y: firstRect.midY
+        )) == link)
+    }
+    #expect(textView.markdownLink(at: NSPoint(x: 1, y: 1)) == nil)
 }
 
 @Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {

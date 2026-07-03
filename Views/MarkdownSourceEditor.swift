@@ -3,6 +3,28 @@ import SwiftUI
 
 final class MarkdownEditorTextView: NSTextView {
     var markdownLinks: [MarkdownEditorLink] = []
+    private var linkTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let linkTrackingArea {
+            removeTrackingArea(linkTrackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [
+                .inVisibleRect,
+                .activeInKeyWindow,
+                .mouseMoved,
+                .mouseEnteredAndExited,
+                .cursorUpdate
+            ],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        linkTrackingArea = trackingArea
+    }
 
     override func resetCursorRects() {
         super.resetCursorRects()
@@ -55,12 +77,48 @@ final class MarkdownEditorTextView: NSTextView {
         return rects
     }
 
+    func markdownLink(at point: NSPoint) -> MarkdownEditorLink? {
+        guard let layoutManager,
+              let textContainer else { return nil }
+        return markdownLinks.first { link in
+            cursorRects(
+                for: link.range,
+                layoutManager: layoutManager,
+                textContainer: textContainer
+            ).contains { rect in
+                rect.insetBy(dx: -1, dy: 0).contains(point)
+            }
+        }
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        updateCursor(for: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateCursor(for: event)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateCursor(for: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+    }
+
+    private func updateCursor(for event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if markdownLink(at: point) != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.iBeam.set()
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let index = characterIndexForInsertion(at: point)
-        if let link = markdownLinks.first(where: {
-            NSLocationInRange(index, $0.range)
-        }) {
+        if let link = markdownLink(at: point) {
             NSWorkspace.shared.open(link.url)
             return
         }
