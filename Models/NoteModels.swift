@@ -125,4 +125,8 @@ struct EditProposal: Identifiable, Sendable {
     let original: String
     let replacement: String
     let instruction: String
+
+    func canApply(to documentPath: String, currentText: String) -> Bool {
+        self.documentPath == documentPath && original == currentText
+    }
 }

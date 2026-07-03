@@ -78,8 +78,10 @@ final class AppStore {
     private let knowledgeBase = KnowledgeBaseService()
     private let ai = AIService()
     private var saveTask: Task<Void, Never>?
+    private var searchTask: Task<Void, Never>?
     private var loadedText = ""
     private var lastBalanceRefresh: Date?
+    private var libraryRefreshID = UUID()
 
     var currentMessages: [ChatMessage] {
         guard let key = selectedDocument?.relativePath else { return [] }
@@ -146,6 +148,8 @@ final class AppStore {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard flushSave() else { return }
+        clearDocumentSelection()
         libraryURL = url
         defaults.set(url.path, forKey: Keys.libraryPath)
         Task { await refreshLibrary() }
@@ -230,6 +234,8 @@ final class AppStore {
         let relativePath = String(fileURL.path.dropFirst(min(fileURL.path.count, root.path.count + 1)))
 
         if !isInCurrentLibrary {
+            guard flushSave() else { return }
+            clearDocumentSelection()
             libraryURL = root
             defaults.set(root.path, forKey: Keys.libraryPath)
         }
@@ -238,21 +244,41 @@ final class AppStore {
 
     func refreshLibrary(selecting relativePath: String? = nil) async {
         guard let libraryURL else { return }
+        let refreshID = UUID()
+        libraryRefreshID = refreshID
         isIndexing = true
-        defer { isIndexing = false }
+        defer {
+            if libraryRefreshID == refreshID {
+                isIndexing = false
+            }
+        }
         do {
             let excluded = excludedFolders
             let scanned = try await Task.detached {
                 try KnowledgeBaseService().scan(root: libraryURL, excludedFolders: excluded)
             }.value
+            guard libraryRefreshID == refreshID,
+                  self.libraryURL?.standardizedFileURL == libraryURL.standardizedFileURL
+            else { return }
             documents = scanned
             let targetPath = relativePath ?? selectedDocument?.relativePath
             if let targetPath, let target = documents.first(where: { $0.relativePath == targetPath }) {
                 select(target)
-            } else if selectedDocument == nil, let first = documents.first {
-                select(first)
+            } else {
+                if selectedDocument != nil {
+                    saveTask?.cancel()
+                    clearDocumentSelection()
+                    errorMessage = "当前文稿已不在知识库中，可能被其他应用移动或删除。"
+                }
+                if let first = documents.first {
+                    select(first)
+                } else {
+                    defaults.removeObject(forKey: Keys.selectedPath)
+                    saveState = .idle
+                }
             }
         } catch {
+            guard libraryRefreshID == refreshID else { return }
             errorMessage = "无法读取知识库：\(error.localizedDescription)"
         }
     }
@@ -262,7 +288,7 @@ final class AppStore {
             selectedDocument = document
             return
         }
-        flushSave()
+        guard flushSave() else { return }
         do {
             editorText = try knowledgeBase.read(document)
             loadedText = editorText
@@ -282,12 +308,13 @@ final class AppStore {
         saveTask = Task {
             try? await Task.sleep(for: .milliseconds(650))
             guard !Task.isCancelled else { return }
-            saveNow()
+            _ = saveNow()
         }
     }
 
-    func saveNow() {
-        guard let document = selectedDocument, editorText != loadedText else { return }
+    @discardableResult
+    func saveNow() -> Bool {
+        guard let document = selectedDocument, editorText != loadedText else { return true }
         do {
             try knowledgeBase.write(editorText, to: document)
             loadedText = editorText
@@ -301,9 +328,11 @@ final class AppStore {
                     size: newSize
                 )
             }
+            return true
         } catch {
             saveState = .failed(error.localizedDescription)
             errorMessage = "保存失败：\(error.localizedDescription)"
+            return false
         }
     }
 
@@ -334,12 +363,24 @@ final class AppStore {
     func rename(_ document: NoteDocument, to name: String) {
         do {
             let wasSelected = selectedDocument?.id == document.id
-            if wasSelected { flushSave() }
+            if wasSelected, !flushSave() { return }
             let destination = try knowledgeBase.rename(document, to: name)
             guard destination.standardizedFileURL != document.url.standardizedFileURL else { return }
 
             let newRelativePath = relativePath(for: destination)
-            migrateDocumentState(from: document.relativePath, to: newRelativePath)
+            migrateDocumentState(
+                from: document.relativePath,
+                to: newRelativePath,
+                updateSelection: wasSelected
+            )
+            do {
+                try knowledgeBase.migrateRevisions(
+                    from: document.relativePath,
+                    to: newRelativePath
+                )
+            } catch {
+                errorMessage = "文稿已重命名，但历史版本迁移失败：\(error.localizedDescription)"
+            }
             if wasSelected {
                 selectedDocument = nil
             }
@@ -351,9 +392,7 @@ final class AppStore {
 
     func delete(_ document: NoteDocument) {
         do {
-            if selectedDocument == document {
-                flushSave()
-            }
+            if selectedDocument == document, !flushSave() { return }
             try knowledgeBase.trash(document)
             if selectedDocument == document {
                 saveTask?.cancel()
@@ -379,11 +418,24 @@ final class AppStore {
     }
 
     func performSearch() {
-        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        searchTask?.cancel()
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
             searchResults = []
             return
         }
-        searchResults = knowledgeBase.search(query: searchQuery, documents: documents)
+        let documents = documents
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            let results = await Task.detached(priority: .userInitiated) {
+                KnowledgeBaseService().search(query: query, documents: documents)
+            }.value
+            guard !Task.isCancelled,
+                  searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == query
+            else { return }
+            searchResults = results
+        }
     }
 
     func sendMessage(_ text: String) {
@@ -491,8 +543,11 @@ final class AppStore {
 
     func applyProposal() {
         guard let proposal = editProposal, let document = selectedDocument else { return }
-        guard proposal.documentPath == document.relativePath else {
-            errorMessage = "这份修改属于另一篇文稿，请切回原文稿后重试。"
+        guard proposal.canApply(
+            to: document.relativePath,
+            currentText: editorText
+        ) else {
+            errorMessage = "生成建议后文稿已经发生变化。为避免覆盖新内容，请重新生成修改建议。"
             return
         }
         do {
@@ -567,9 +622,18 @@ final class AppStore {
             .filter { !$0.isEmpty }
     }
 
-    private func flushSave() {
+    @discardableResult
+    private func flushSave() -> Bool {
         saveTask?.cancel()
-        saveNow()
+        return saveNow()
+    }
+
+    private func clearDocumentSelection() {
+        selectedDocument = nil
+        editorText = ""
+        loadedText = ""
+        revisions = []
+        editProposal = nil
     }
 
     private func relativePath(for url: URL) -> String {
@@ -580,7 +644,11 @@ final class AppStore {
         return String(path.dropFirst(min(path.count, root.path.count + 1)))
     }
 
-    private func migrateDocumentState(from oldPath: String, to newPath: String) {
+    private func migrateDocumentState(
+        from oldPath: String,
+        to newPath: String,
+        updateSelection: Bool
+    ) {
         if favorites.remove(oldPath) != nil {
             favorites.insert(newPath)
             defaults.set(Array(favorites), forKey: Keys.favorites)
@@ -589,7 +657,9 @@ final class AppStore {
             chats[newPath] = messages
             persistChats()
         }
-        defaults.set(newPath, forKey: Keys.selectedPath)
+        if updateSelection {
+            defaults.set(newPath, forKey: Keys.selectedPath)
+        }
     }
 
     private func persistChats() {

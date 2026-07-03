@@ -190,11 +190,12 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
         }
 
-        private static func preserveEditingState(
+        static func preserveEditingState(
             of textView: NSTextView,
             changes: () -> Void
         ) {
             let selectedRanges = textView.selectedRanges
+            let selectionAffinity = textView.selectionAffinity
             let visibleOrigin = textView.enclosingScrollView?.contentView.bounds.origin
             changes()
 
@@ -205,7 +206,13 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 let length = min(range.length, textLength - location)
                 return NSValue(range: NSRange(location: location, length: length))
             }
-            textView.setSelectedRanges(validRanges, affinity: .downstream, stillSelecting: false)
+            if textView.selectedRanges != validRanges {
+                textView.setSelectedRanges(
+                    validRanges,
+                    affinity: selectionAffinity,
+                    stillSelecting: false
+                )
+            }
 
             if let scrollView = textView.enclosingScrollView, let visibleOrigin {
                 let documentHeight = textView.frame.height

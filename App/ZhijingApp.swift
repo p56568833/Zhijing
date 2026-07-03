@@ -107,7 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        store?.saveNow()
+        guard store?.saveNow() != false else { return .terminateCancel }
         return .terminateNow
     }
 

@@ -193,6 +193,43 @@ struct KnowledgeBaseService {
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
+    func migrateRevisions(from oldPath: String, to newPath: String) throws {
+        guard oldPath != newPath else { return }
+        let versions = try applicationSupportDirectory().appending(
+            path: "Versions",
+            directoryHint: .isDirectory
+        )
+        let source = versions.appending(
+            path: safeFilename(oldPath),
+            directoryHint: .isDirectory
+        )
+        guard fileManager.fileExists(atPath: source.path) else { return }
+
+        let destination = versions.appending(
+            path: safeFilename(newPath),
+            directoryHint: .isDirectory
+        )
+        if !fileManager.fileExists(atPath: destination.path) {
+            try fileManager.moveItem(at: source, to: destination)
+            return
+        }
+
+        let revisions = try fileManager.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: nil
+        )
+        for revision in revisions {
+            var target = destination.appending(path: revision.lastPathComponent)
+            if fileManager.fileExists(atPath: target.path) {
+                target = destination.appending(
+                    path: "\(UUID().uuidString)-\(revision.lastPathComponent)"
+                )
+            }
+            try fileManager.moveItem(at: revision, to: target)
+        }
+        try fileManager.removeItem(at: source)
+    }
+
     private func nearestHeading(in document: NoteDocument, before line: Int) -> String? {
         guard let content = try? read(document) else { return nil }
         let lines = content.components(separatedBy: .newlines)

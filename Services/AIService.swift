@@ -55,9 +55,7 @@ struct AIService: Sendable {
         guard !configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw connectionError("请先填写 API Key。")
         }
-        guard configuration.endpoint.scheme == "https" || configuration.endpoint.scheme == "http" else {
-            throw connectionError("接口地址无效，请检查地址是否以 https:// 开头。")
-        }
+        try validateEndpoint(configuration.endpoint)
         guard !configuration.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw connectionError("请先选择或填写模型。")
         }
@@ -104,6 +102,7 @@ struct AIService: Sendable {
         guard !configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return localAnswer(question: question, sources: sources)
         }
+        try validateEndpoint(configuration.endpoint)
 
         let sourceText = sources.enumerated().map { index, source in
             "[资料\(index + 1)] \(source.fileName) · \(source.heading ?? "第 \(source.line) 行")\n\(source.text)"
@@ -174,6 +173,7 @@ struct AIService: Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "生成修改建议需要先在设置中填写 API Key"]
             )
         }
+        try validateEndpoint(configuration.endpoint)
         let prompt = """
         请按要求修改下面的 Markdown。只返回修改后的完整 Markdown，不要解释，不要加代码围栏。
 
@@ -222,6 +222,17 @@ struct AIService: Sendable {
             usage: nil,
             cost: nil
         )
+    }
+
+    private func validateEndpoint(_ endpoint: URL) throws {
+        if endpoint.scheme?.lowercased() == "https" { return }
+        let localHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
+        if endpoint.scheme?.lowercased() == "http",
+           let host = endpoint.host?.lowercased(),
+           localHosts.contains(host) {
+            return
+        }
+        throw connectionError("为保护 API Key，公网接口必须使用 HTTPS；HTTP 仅允许本机地址。")
     }
 
     private static func mapUsage(_ usage: ChatCompletionResponse.Usage) -> AIUsage {

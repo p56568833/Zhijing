@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AppKit
 @testable import Zhijing
 
 @Test func lineDiffFindsInsertionsAndRemovals() {
@@ -108,6 +109,54 @@ import Foundation
 
     let documents = try KnowledgeBaseService().scan(root: root, excludedFolders: [])
     #expect(documents.map(\.title) == ["长扩展名"])
+}
+
+@Test func staleEditProposalCannotOverwriteNewTyping() {
+    let proposal = EditProposal(
+        documentPath: "文章.md",
+        original: "生成建议时的正文",
+        replacement: "AI 修改后的正文",
+        instruction: "润色"
+    )
+
+    #expect(proposal.canApply(to: "文章.md", currentText: "生成建议时的正文"))
+    #expect(!proposal.canApply(to: "文章.md", currentText: "用户后来输入的新正文"))
+    #expect(!proposal.canApply(to: "另一篇.md", currentText: "生成建议时的正文"))
+}
+
+@MainActor
+@Test func syntaxHighlightingPreservesCaretAffinity() {
+    let textView = NSTextView()
+    textView.string = "一段刚好可能换行的文字"
+    let range = NSRange(location: 5, length: 0)
+    textView.setSelectedRange(range, affinity: .upstream, stillSelecting: false)
+
+    MarkdownSourceEditor.Coordinator.preserveEditingState(of: textView) {
+        textView.textStorage?.addAttribute(
+            .foregroundColor,
+            value: NSColor.labelColor,
+            range: NSRange(location: 0, length: textView.string.utf16.count)
+        )
+    }
+
+    #expect(textView.selectedRange() == range)
+    #expect(textView.selectionAffinity == .upstream)
+}
+
+@Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {
+    let configuration = AIConfiguration(
+        apiKey: "test-key",
+        endpoint: URL(string: "http://example.com/v1/chat/completions")!,
+        model: "test-model",
+        provider: .custom
+    )
+
+    do {
+        try await AIService().testConnection(configuration: configuration)
+        Issue.record("公网 HTTP 地址不应接收 API Key")
+    } catch {
+        #expect(error.localizedDescription.contains("必须使用 HTTPS"))
+    }
 }
 
 @Test func readingModeRemovesMarkdownSourceMarkers() {
