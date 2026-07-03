@@ -259,6 +259,42 @@ import AppKit
     )
 }
 
+@MainActor
+@Test func linkPointerRectsUseTextViewCoordinatesAndFollowWrappedLines() {
+    let source = "[一个很长的可点击链接文字用于换行测试](https://example.com)"
+    let scrollView = NSScrollView(
+        frame: NSRect(x: 0, y: 0, width: 150, height: 160)
+    )
+    let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+    textView.textContainerInset = NSSize(width: 22, height: 24)
+    textView.isHorizontallyResizable = false
+    textView.textContainer?.containerSize = NSSize(
+        width: scrollView.contentSize.width,
+        height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.textContainer?.widthTracksTextView = true
+    textView.string = source
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    scrollView.documentView = textView
+
+    guard let link = MarkdownLinkDetector.links(in: source).first,
+          let layoutManager = textView.layoutManager,
+          let textContainer = textView.textContainer else {
+        Issue.record("无法建立链接布局测试")
+        return
+    }
+    layoutManager.ensureLayout(for: textContainer)
+    let rects = textView.cursorRects(
+        for: link.range,
+        layoutManager: layoutManager,
+        textContainer: textContainer
+    )
+
+    #expect(rects.count > 1)
+    #expect(rects.allSatisfy { $0.minX >= textView.textContainerOrigin.x })
+    #expect(rects.first?.minY == textView.textContainerOrigin.y)
+}
+
 @Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {
     let configuration = AIConfiguration(
         apiKey: "test-key",

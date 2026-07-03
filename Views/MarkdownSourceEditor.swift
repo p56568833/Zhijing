@@ -11,18 +11,48 @@ final class MarkdownEditorTextView: NSTextView {
               !markdownLinks.isEmpty else { return }
 
         for link in markdownLinks {
-            let glyphRange = layoutManager.glyphRange(
-                forCharacterRange: link.range,
-                actualCharacterRange: nil
-            )
-            let rect = layoutManager.boundingRect(
-                forGlyphRange: glyphRange,
-                in: textContainer
-            )
-            if !rect.isEmpty {
-                addCursorRect(rect, cursor: .pointingHand)
+            for rect in cursorRects(
+                for: link.range,
+                layoutManager: layoutManager,
+                textContainer: textContainer
+            ) {
+                addCursorRect(
+                    rect.insetBy(dx: -1, dy: 0),
+                    cursor: .pointingHand
+                )
             }
         }
+    }
+
+    func cursorRects(
+        for characterRange: NSRange,
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer
+    ) -> [NSRect] {
+        let targetGlyphRange = layoutManager.glyphRange(
+            forCharacterRange: characterRange,
+            actualCharacterRange: nil
+        )
+        var rects: [NSRect] = []
+        layoutManager.enumerateLineFragments(
+            forGlyphRange: targetGlyphRange
+        ) { _, _, _, lineGlyphRange, _ in
+            let intersection = NSIntersectionRange(
+                targetGlyphRange,
+                lineGlyphRange
+            )
+            guard intersection.length > 0 else { return }
+            var rect = layoutManager.boundingRect(
+                forGlyphRange: intersection,
+                in: textContainer
+            )
+            rect.origin.x += self.textContainerOrigin.x
+            rect.origin.y += self.textContainerOrigin.y
+            if !rect.isEmpty {
+                rects.append(rect)
+            }
+        }
+        return rects
     }
 
     override func mouseDown(with event: NSEvent) {
