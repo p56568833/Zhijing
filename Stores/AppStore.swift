@@ -31,7 +31,8 @@ final class AppStore {
     var libraryURL: URL?
     var documents: [NoteDocument] = []
     var selectedDocument: NoteDocument?
-    var editorText = ""
+    private(set) var editorText = ""
+    private(set) var editorContentRevision = 0
     var searchQuery = ""
     var searchResults: [SearchHit] = []
     var favorites: Set<String> = []
@@ -230,7 +231,12 @@ final class AppStore {
         let isInCurrentLibrary = currentRoot.map {
             fileURL.path == $0.path || fileURL.path.hasPrefix($0.path + "/")
         } ?? false
-        let root = isInCurrentLibrary ? currentRoot! : fileURL.deletingLastPathComponent()
+        let root: URL
+        if isInCurrentLibrary, let currentRoot {
+            root = currentRoot
+        } else {
+            root = fileURL.deletingLastPathComponent()
+        }
         let relativePath = String(fileURL.path.dropFirst(min(fileURL.path.count, root.path.count + 1)))
 
         if !isInCurrentLibrary {
@@ -290,7 +296,7 @@ final class AppStore {
         }
         guard flushSave() else { return }
         do {
-            editorText = try knowledgeBase.read(document)
+            replaceEditorText(try knowledgeBase.read(document))
             loadedText = editorText
             selectedDocument = document
             defaults.set(document.relativePath, forKey: Keys.selectedPath)
@@ -301,10 +307,15 @@ final class AppStore {
         }
     }
 
-    func editorDidChange() {
-        guard editorText != loadedText, selectedDocument != nil else { return }
-        saveState = .saving
+    func editorDidChange(_ text: String) {
+        guard selectedDocument != nil else { return }
+        editorText = text
         saveTask?.cancel()
+        guard editorText != loadedText else {
+            saveState = .saved(.now)
+            return
+        }
+        saveState = .saving
         saveTask = Task {
             try? await Task.sleep(for: .milliseconds(650))
             guard !Task.isCancelled else { return }
@@ -397,7 +408,7 @@ final class AppStore {
             if selectedDocument == document {
                 saveTask?.cancel()
                 selectedDocument = nil
-                editorText = ""
+                replaceEditorText("")
                 loadedText = ""
             }
             chats[document.relativePath] = nil
@@ -552,7 +563,7 @@ final class AppStore {
         }
         do {
             _ = try knowledgeBase.createSnapshot(text: editorText, document: document)
-            editorText = proposal.replacement
+            replaceEditorText(proposal.replacement)
         } catch {
             errorMessage = "应用修改失败：\(error.localizedDescription)"
             return
@@ -578,7 +589,7 @@ final class AppStore {
         guard let document = selectedDocument else { return }
         do {
             _ = try knowledgeBase.createSnapshot(text: editorText, document: document)
-            editorText = try String(contentsOf: revision.url, encoding: .utf8)
+            replaceEditorText(try String(contentsOf: revision.url, encoding: .utf8))
             saveNow()
             revisions = knowledgeBase.revisions(for: document)
         } catch {
@@ -630,10 +641,15 @@ final class AppStore {
 
     private func clearDocumentSelection() {
         selectedDocument = nil
-        editorText = ""
+        replaceEditorText("")
         loadedText = ""
         revisions = []
         editProposal = nil
+    }
+
+    private func replaceEditorText(_ text: String) {
+        editorText = text
+        editorContentRevision &+= 1
     }
 
     private func relativePath(for url: URL) -> String {

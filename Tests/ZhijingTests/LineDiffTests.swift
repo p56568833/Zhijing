@@ -125,34 +125,101 @@ import AppKit
 }
 
 @MainActor
-@Test func syntaxHighlightingPreservesCaretAffinity() {
-    let textView = NSTextView()
-    textView.string = "一段刚好可能换行的文字"
-    let range = NSRange(location: 5, length: 0)
-    textView.setSelectedRange(range, affinity: .upstream, stillSelecting: false)
+@Test func editorIgnoresObservableFeedbackUntilContentRevisionChanges() {
+    let textView = MarkdownEditorTextView()
+    let coordinator = MarkdownSourceEditor.Coordinator(onChange: { _ in })
+    coordinator.synchronize(
+        text: "初始内容",
+        documentID: "文章.md",
+        contentRevision: 1,
+        to: textView
+    )
+    textView.setSelectedRange(NSRange(location: 2, length: 0))
 
-    MarkdownSourceEditor.Coordinator.preserveEditingState(of: textView) {
-        textView.textStorage?.addAttribute(
-            .foregroundColor,
-            value: NSColor.labelColor,
-            range: NSRange(location: 0, length: textView.string.utf16.count)
-        )
-    }
+    coordinator.synchronize(
+        text: "SwiftUI 回传但不是外部修改",
+        documentID: "文章.md",
+        contentRevision: 1,
+        to: textView
+    )
+    #expect(textView.string == "初始内容")
+    #expect(textView.selectedRange() == NSRange(location: 2, length: 0))
 
-    #expect(textView.selectedRange() == range)
-    #expect(textView.selectionAffinity == .upstream)
+    coordinator.synchronize(
+        text: "明确的外部修改",
+        documentID: "文章.md",
+        contentRevision: 2,
+        to: textView
+    )
+    #expect(textView.string == "明确的外部修改")
+    #expect(textView.selectedRange() == NSRange(location: 2, length: 0))
 }
 
 @MainActor
-@Test func markdownLinksDoNotInstallNativeTextViewLinkAttributes() {
-    let source = "[OpenAI](https://openai.com)"
-    let attributed = MarkdownSyntaxHighlighter.attributedString(source)
-
-    #expect(attributed.attribute(.link, at: 1, effectiveRange: nil) == nil)
-    #expect(
-        attributed.attribute(.underlineStyle, at: 1, effectiveRange: nil) as? Int
-            == NSUnderlineStyle.single.rawValue
+@Test func continuousTypingCannotCreateAParagraphBreakOrMoveTheCaret() {
+    let initial = "这一行正在连续输入："
+    let typed = String(repeating: "连续输入abcdef", count: 20)
+    let scrollView = NSScrollView(
+        frame: NSRect(x: 0, y: 0, width: 260, height: 180)
     )
+    let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+    textView.isRichText = false
+    textView.isVerticallyResizable = true
+    textView.isHorizontallyResizable = false
+    textView.autoresizingMask = [.width]
+    textView.textContainer?.containerSize = NSSize(
+        width: scrollView.contentSize.width,
+        height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.textContainer?.widthTracksTextView = true
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    scrollView.documentView = textView
+    let coordinator = MarkdownSourceEditor.Coordinator(onChange: { _ in })
+    textView.delegate = coordinator
+    coordinator.synchronize(
+        text: initial,
+        documentID: "连续输入.md",
+        contentRevision: 1,
+        to: textView
+    )
+    textView.setSelectedRange(
+        NSRange(location: initial.utf16.count, length: 0)
+    )
+    let initialNewlineCount = textView.string.filter(\.isNewline).count
+
+    for character in typed {
+        let previousLocation = textView.selectedRange().location
+        textView.insertText(
+            String(character),
+            replacementRange: textView.selectedRange()
+        )
+        coordinator.synchronize(
+            text: textView.string,
+            documentID: "连续输入.md",
+            contentRevision: 1,
+            to: textView
+        )
+        textView.layoutManager?.ensureLayout(
+            for: textView.textContainer!
+        )
+        #expect(textView.selectedRange().location == previousLocation + 1)
+        #expect(textView.string.filter(\.isNewline).count == initialNewlineCount)
+    }
+
+    #expect(textView.string == initial + typed)
+    #expect((textView.layoutManager?.numberOfGlyphs ?? 0) == textView.string.utf16.count)
+}
+
+@MainActor
+@Test func markdownLinksStayOutsideTheNativeTextStorage() {
+    let source = "[OpenAI](https://openai.com)"
+    let textView = MarkdownEditorTextView()
+    textView.string = source
+    textView.markdownLinks = MarkdownLinkDetector.links(in: source)
+
+    #expect(textView.markdownLinks.count == 1)
+    #expect(textView.markdownLinks.first?.url.absoluteString == "https://openai.com")
+    #expect(textView.textStorage?.attribute(.link, at: 1, effectiveRange: nil) == nil)
 }
 
 @Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {

@@ -14,11 +14,11 @@ struct EditorView: View {
                         MarkdownReadingView(text: store.editorText)
                     } else {
                         MarkdownSourceEditor(
-                            text: $store.editorText,
-                            documentID: document.id
-                        ) {
-                            store.editorDidChange()
-                        }
+                            text: store.editorText,
+                            documentID: document.id,
+                            contentRevision: store.editorContentRevision,
+                            onChange: store.editorDidChange
+                        )
                             .accessibilityLabel("\(document.title) 编辑器")
                     }
                 } else {
