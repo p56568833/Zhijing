@@ -1,117 +1,313 @@
+import AppKit
 import SwiftUI
 
 struct MarkdownReadingView: View {
     let text: String
 
-    private var blocks: [MarkdownReadingBlock] {
-        MarkdownReadingParser.parse(text)
+    var body: some View {
+        MarkdownSelectableReadingView(text: text)
+    }
+}
+
+private struct MarkdownSelectableReadingView: NSViewRepresentable {
+    let text: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
     }
 
-    var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(blocks) { block in
-                    blockView(block)
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+
+        let textView = MarkdownReadingTextView(
+            frame: scrollView.contentView.bounds
+        )
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.drawsBackground = false
+        textView.allowsUndo = false
+        textView.usesFindBar = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.minSize = NSSize(
+            width: 0,
+            height: scrollView.contentSize.height
+        )
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.lineFragmentPadding = 0
+        scrollView.documentView = textView
+        context.coordinator.render(text, into: textView)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? MarkdownReadingTextView
+        else { return }
+        context.coordinator.render(text, into: textView)
+    }
+
+    @MainActor
+    final class Coordinator {
+        var source: String?
+        private var renderTask: Task<Void, Never>?
+
+        func render(_ text: String, into textView: MarkdownReadingTextView) {
+            guard source != text else { return }
+            source = text
+            renderTask?.cancel()
+
+            let selection = textView.selectedRange()
+            let visibleOrigin = textView.enclosingScrollView?.contentView.bounds.origin
+            renderTask = Task { [weak textView] in
+                let rendered = await Task.detached(priority: .userInitiated) {
+                    SendableAttributedString(
+                        MarkdownReadingRenderCache.shared.render(text)
+                    )
+                }.value
+                guard !Task.isCancelled, source == text, let textView else { return }
+                textView.textStorage?.setAttributedString(rendered.value)
+
+                let length = textView.textStorage?.length ?? 0
+                let location = min(selection.location, length)
+                textView.setSelectedRange(NSRange(
+                    location: location,
+                    length: min(selection.length, length - location)
+                ))
+                if let scrollView = textView.enclosingScrollView, let visibleOrigin {
+                    scrollView.contentView.scroll(to: visibleOrigin)
+                    scrollView.reflectScrolledClipView(scrollView.contentView)
                 }
             }
-            .frame(maxWidth: 820, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, 46)
-            .padding(.vertical, 38)
-        }
-        .textSelection(.enabled)
-    }
-
-    @ViewBuilder
-    private func blockView(_ block: MarkdownReadingBlock) -> some View {
-        switch block.kind {
-        case .heading(let level):
-            Text(MarkdownInlineRenderer.render(block.content))
-                .font(headingFont(level))
-                .foregroundStyle(.blue)
-                .padding(.top, level == 1 ? 4 : 14)
-                .padding(.bottom, level == 1 ? 18 : 9)
-
-        case .paragraph:
-            Text(MarkdownInlineRenderer.render(block.content))
-                .font(.system(size: 16))
-                .lineSpacing(6)
-                .foregroundStyle(.primary)
-                .padding(.bottom, 14)
-
-        case .quote:
-            HStack(alignment: .top, spacing: 12) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(.green.opacity(0.72))
-                    .frame(width: 3)
-                Text(MarkdownInlineRenderer.render(block.content))
-                    .font(.system(size: 16).italic())
-                    .lineSpacing(5)
-                    .foregroundStyle(.green)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.vertical, 10)
-            .padding(.horizontal, 14)
-            .background(.green.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
-            .padding(.bottom, 14)
-
-        case .unorderedList(let indentation):
-            HStack(alignment: .firstTextBaseline, spacing: 11) {
-                Text("•")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(.orange)
-                Text(MarkdownInlineRenderer.render(block.content))
-                    .font(.system(size: 16))
-                    .lineSpacing(5)
-                    .foregroundStyle(.primary)
-            }
-            .padding(.leading, CGFloat(indentation) * 18)
-            .padding(.bottom, 7)
-
-        case .orderedList(let marker, let indentation):
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text(marker)
-                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.orange)
-                Text(MarkdownInlineRenderer.render(block.content))
-                    .font(.system(size: 16))
-                    .lineSpacing(5)
-                    .foregroundStyle(.primary)
-            }
-            .padding(.leading, CGFloat(indentation) * 18)
-            .padding(.bottom, 7)
-
-        case .code:
-            ScrollView(.horizontal) {
-                Text(block.content)
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundStyle(.purple)
-                    .textSelection(.enabled)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-            .padding(.vertical, 6)
-            .padding(.bottom, 12)
-
-        case .divider:
-            Rectangle()
-                .fill(.blue.opacity(0.3))
-                .frame(height: 1)
-                .padding(.vertical, 20)
-
-        case .space:
-            Color.clear.frame(height: 7)
         }
     }
+}
 
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1: .system(size: 29, weight: .bold)
-        case 2: .system(size: 23, weight: .bold)
-        case 3: .system(size: 19, weight: .semibold)
-        default: .system(size: 17, weight: .semibold)
+private struct SendableAttributedString: @unchecked Sendable {
+    let value: NSAttributedString
+
+    init(_ value: NSAttributedString) {
+        self.value = value
+    }
+}
+
+final class MarkdownReadingTextView: NSTextView {
+    private let maximumContentWidth: CGFloat = 820
+    private let minimumHorizontalInset: CGFloat = 46
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        let centeredInset = (newSize.width - maximumContentWidth) / 2
+        textContainerInset = NSSize(
+            width: max(minimumHorizontalInset, centeredInset),
+            height: 38
+        )
+    }
+}
+
+private final class MarkdownReadingRenderCache: @unchecked Sendable {
+    static let shared = MarkdownReadingRenderCache()
+
+    private var values: [String: (source: String, rendered: NSAttributedString)] = [:]
+    private var order: [String] = []
+    private let limit = 10
+    private let lock = NSLock()
+
+    func render(_ markdown: String) -> NSAttributedString {
+        let key = "\(markdown.utf16.count)-\(markdown.hashValue)"
+        lock.lock()
+        if let cached = values[key], cached.source == markdown {
+            lock.unlock()
+            return cached.rendered
         }
+        lock.unlock()
+
+        let rendered = MarkdownReadingAttributedRenderer.render(markdown)
+        lock.lock()
+        values[key] = (markdown, rendered)
+        order.removeAll { $0 == key }
+        order.append(key)
+        while order.count > limit {
+            let removed = order.removeFirst()
+            values[removed] = nil
+        }
+        lock.unlock()
+        return rendered
+    }
+}
+
+enum MarkdownReadingAttributedRenderer {
+    static func render(_ markdown: String) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for block in MarkdownReadingParser.parse(markdown) {
+            switch block.kind {
+            case .heading(let level):
+                let size: CGFloat = switch level {
+                case 1: 29
+                case 2: 23
+                case 3: 19
+                default: 17
+                }
+                append(
+                    block.content,
+                    to: result,
+                    font: .systemFont(
+                        ofSize: size,
+                        weight: level <= 2 ? .bold : .semibold
+                    ),
+                    color: .systemBlue,
+                    spacingBefore: level == 1 ? 4 : 14,
+                    spacingAfter: level == 1 ? 18 : 9
+                )
+            case .paragraph:
+                append(
+                    block.content,
+                    to: result,
+                    font: .systemFont(ofSize: 16),
+                    lineSpacing: 6,
+                    spacingAfter: 14
+                )
+            case .quote:
+                append(
+                    "│  \(block.content)",
+                    to: result,
+                    font: .systemFont(ofSize: 16).italic,
+                    color: .systemGreen,
+                    backgroundColor: .systemGreen.withAlphaComponent(0.055),
+                    leftIndent: 14,
+                    spacingBefore: 10,
+                    spacingAfter: 14
+                )
+            case .unorderedList(let indentation):
+                append(
+                    "•  \(block.content)",
+                    to: result,
+                    font: .systemFont(ofSize: 16),
+                    leftIndent: CGFloat(indentation) * 18 + 20,
+                    firstLineIndent: CGFloat(indentation) * 18,
+                    lineSpacing: 5,
+                    spacingAfter: 7
+                )
+            case .orderedList(let marker, let indentation):
+                append(
+                    "\(marker)  \(block.content)",
+                    to: result,
+                    font: .systemFont(ofSize: 16),
+                    leftIndent: CGFloat(indentation) * 18 + 28,
+                    firstLineIndent: CGFloat(indentation) * 18,
+                    lineSpacing: 5,
+                    spacingAfter: 7
+                )
+            case .code:
+                append(
+                    block.content,
+                    to: result,
+                    font: .monospacedSystemFont(ofSize: 14, weight: .regular),
+                    color: .systemPurple,
+                    backgroundColor: .secondaryLabelColor.withAlphaComponent(0.08),
+                    leftIndent: 14,
+                    lineSpacing: 3,
+                    spacingBefore: 6,
+                    spacingAfter: 12
+                )
+            case .divider:
+                append(
+                    "────────────────────────────────────────",
+                    to: result,
+                    font: .systemFont(ofSize: 10),
+                    color: .systemBlue.withAlphaComponent(0.3),
+                    spacingBefore: 20,
+                    spacingAfter: 20
+                )
+            case .space:
+                result.append(NSAttributedString(string: "\n"))
+            }
+        }
+        return result
+    }
+
+    private static func append(
+        _ source: String,
+        to result: NSMutableAttributedString,
+        font: NSFont,
+        color: NSColor = .labelColor,
+        backgroundColor: NSColor? = nil,
+        leftIndent: CGFloat = 0,
+        firstLineIndent: CGFloat? = nil,
+        lineSpacing: CGFloat = 0,
+        spacingBefore: CGFloat = 0,
+        spacingAfter: CGFloat
+    ) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        paragraph.paragraphSpacingBefore = spacingBefore
+        paragraph.paragraphSpacing = spacingAfter
+        paragraph.headIndent = leftIndent
+        paragraph.firstLineHeadIndent = firstLineIndent ?? leftIndent
+
+        let rendered = inlineMarkdown(source.isEmpty ? " " : source)
+        let range = NSRange(location: 0, length: rendered.length)
+        var attributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: color,
+            .paragraphStyle: paragraph,
+        ]
+        if let backgroundColor {
+            attributes[.backgroundColor] = backgroundColor
+        }
+        rendered.addAttributes(attributes, range: range)
+        rendered.enumerateAttribute(.font, in: range) { value, subrange, _ in
+            if let existing = value as? NSFont {
+                rendered.addAttribute(
+                    .font,
+                    value: NSFontManager.shared.convert(
+                        existing,
+                        toSize: font.pointSize
+                    ),
+                    range: subrange
+                )
+            } else {
+                rendered.addAttribute(.font, value: font, range: subrange)
+            }
+        }
+        if rendered.length > 0,
+           rendered.attribute(.font, at: 0, effectiveRange: nil) == nil {
+            rendered.addAttribute(.font, value: font, range: range)
+        }
+        rendered.enumerateAttribute(.link, in: range) { value, subrange, _ in
+            if value != nil {
+                rendered.addAttribute(
+                    .foregroundColor,
+                    value: NSColor.linkColor,
+                    range: subrange
+                )
+            }
+        }
+        rendered.append(NSAttributedString(string: "\n"))
+        result.append(rendered)
+    }
+
+    private static func inlineMarkdown(
+        _ source: String
+    ) -> NSMutableAttributedString {
+        guard let attributed = try? AttributedString(
+            markdown: source,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) else {
+            return NSMutableAttributedString(string: source)
+        }
+        return NSMutableAttributedString(
+            attributedString: NSAttributedString(attributed)
+        )
     }
 }
 
@@ -278,5 +474,11 @@ enum MarkdownReadingParser {
     private static func isSpace(_ kind: MarkdownReadingBlock.Kind) -> Bool {
         if case .space = kind { return true }
         return false
+    }
+}
+
+private extension NSFont {
+    var italic: NSFont {
+        NSFontManager.shared.convert(self, toHaveTrait: .italicFontMask)
     }
 }

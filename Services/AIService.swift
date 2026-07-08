@@ -15,6 +15,11 @@ struct AIResponse: Sendable {
     let cost: AIUsageCost?
 }
 
+enum AIStreamEvent: Sendable {
+    case delta(String)
+    case finished(AIResponse)
+}
+
 struct AIService: Sendable {
     func fetchDeepSeekBalance(apiKey: String) async throws -> [AIAccountBalance] {
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -94,7 +99,7 @@ struct AIService: Sendable {
 
     func answer(
         question: String,
-        currentText: String,
+        currentContext: String,
         history: [ChatMessage],
         sources: [RetrievedChunk],
         configuration: AIConfiguration
@@ -104,38 +109,14 @@ struct AIService: Sendable {
         }
         try validateEndpoint(configuration.endpoint)
 
-        let sourceText = sources.enumerated().map { index, source in
-            "[资料\(index + 1)] \(source.fileName) · \(source.heading ?? "第 \(source.line) 行")\n\(source.text)"
-        }.joined(separator: "\n\n")
-        let clippedCurrent = String(currentText.prefix(12_000))
-        let system = """
-        你是私人 Markdown 知识库里的写作助手。优先依据用户资料回答，引用资料时使用 [资料1] 格式。
-        清楚区分：用户资料中的事实、你的推断、通用知识。资料冲突时分别陈述，不替用户决定。
-        没有依据时直说。不要声称看过未提供的文件。回答使用简洁自然的中文。
-
-        当用户要求修改当前文稿（如改标题、润色、删减、重组等），不要只给建议。直接输出修改后的完整文稿，
-        用以下格式包裹：
-        ```edit
-        修改后的完整文稿内容
-        ```
-        格式必须严格：```edit 开头单独一行，``` 结尾单独一行，中间是完整的修改后文稿。
-        这样我就能自动帮你应用到编辑器。如果用户只是提问而非要求修改，正常回答即可。
-
-        当前文稿：
-        \(clippedCurrent)
-
-        检索资料：
-        \(sourceText.isEmpty ? "未检索到相关资料。" : sourceText)
-        """
-        var messages: [[String: String]] = [["role": "system", "content": system]]
-        messages += history.suffix(8).map {
-            ["role": $0.role == .user ? "user" : "assistant", "content": $0.text]
-        }
-        messages.append(["role": "user", "content": question])
-
         let body: [String: Any] = [
             "model": configuration.model,
-            "messages": messages
+            "messages": answerMessages(
+                question: question,
+                currentContext: currentContext,
+                history: history,
+                sources: sources
+            )
         ]
         var request = URLRequest(url: configuration.endpoint)
         request.httpMethod = "POST"
@@ -161,6 +142,111 @@ struct AIService: Sendable {
         )
     }
 
+    func answerStream(
+        question: String,
+        currentContext: String,
+        history: [ChatMessage],
+        sources: [RetrievedChunk],
+        configuration: AIConfiguration
+    ) -> AsyncThrowingStream<AIStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard !configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        continuation.yield(.finished(localAnswer(
+                            question: question,
+                            sources: sources
+                        )))
+                        continuation.finish()
+                        return
+                    }
+                    try validateEndpoint(configuration.endpoint)
+
+                    var body: [String: Any] = [
+                        "model": configuration.model,
+                        "messages": answerMessages(
+                            question: question,
+                            currentContext: currentContext,
+                            history: history,
+                            sources: sources
+                        ),
+                        "stream": true
+                    ]
+                    if configuration.provider != .custom {
+                        body["stream_options"] = ["include_usage": true]
+                    }
+
+                    var request = URLRequest(url: configuration.endpoint)
+                    request.httpMethod = "POST"
+                    request.setValue(
+                        "Bearer \(configuration.apiKey)",
+                        forHTTPHeaderField: "Authorization"
+                    )
+                    request.setValue(
+                        "application/json",
+                        forHTTPHeaderField: "Content-Type"
+                    )
+                    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse,
+                          (200..<300).contains(http.statusCode) else {
+                        throw connectionError("模型服务请求失败。")
+                    }
+
+                    var text = ""
+                    var usage: AIUsage?
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        guard line.hasPrefix("data:") else { continue }
+                        let payload = line
+                            .dropFirst(5)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !payload.isEmpty else { continue }
+                        if payload == "[DONE]" { break }
+                        guard let data = payload.data(using: .utf8) else { continue }
+                        let chunk = try JSONDecoder().decode(
+                            ChatCompletionStreamChunk.self,
+                            from: data
+                        )
+                        if let rawUsage = chunk.usage {
+                            usage = Self.mapUsage(rawUsage)
+                        }
+                        for choice in chunk.choices {
+                            guard let delta = choice.delta?.content, !delta.isEmpty else {
+                                continue
+                            }
+                            text += delta
+                            continuation.yield(.delta(delta))
+                        }
+                    }
+
+                    guard !text.isEmpty else {
+                        throw connectionError("模型没有返回内容。")
+                    }
+                    continuation.yield(.finished(AIResponse(
+                        text: text,
+                        sources: sources,
+                        usedGeneralKnowledge: sources.isEmpty,
+                        usage: usage,
+                        cost: usage.flatMap {
+                            Self.estimatedCost(for: $0, configuration: configuration)
+                        }
+                    )))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     func proposeEdit(
         instruction: String,
         currentText: String,
@@ -175,7 +261,17 @@ struct AIService: Sendable {
         }
         try validateEndpoint(configuration.endpoint)
         let prompt = """
-        请按要求修改下面的 Markdown。只返回修改后的完整 Markdown，不要解释，不要加代码围栏。
+        请按要求修改下面的 Markdown。不要输出修改后的完整文稿，只返回确实发生变化的片段。
+
+        严格返回以下 JSON，不要解释，不要加代码围栏：
+        {"edits":[{"old_text":"从原文逐字复制、足以唯一定位的片段","new_text":"修改后的片段"}]}
+
+        规则：
+        1. old_text 必须与原文完全一致，并且在原文中只出现一次。
+        2. 每个 edit 只覆盖需要改变的连续段落；不要返回未修改段落或完整文稿。
+        3. 删除时 new_text 为空字符串。
+        4. 新增时选择相邻的唯一原文作为 old_text，并在 new_text 中保留该原文后加入新内容。
+        5. 保持 Markdown 结构，不要使用行号或省略号代替原文。
 
         修改要求：\(instruction)
 
@@ -199,7 +295,74 @@ struct AIService: Sendable {
         guard let text = decoded.choices.first?.message.content else {
             throw NSError(domain: "AIService", code: 5, userInfo: [NSLocalizedDescriptionKey: "模型没有返回修改内容"])
         }
-        return text
+        return try AIEditPatchProcessor.apply(response: text, to: currentText)
+    }
+
+    func proposeSelectionEdit(
+        instruction: String,
+        currentText: String,
+        selectedText: String,
+        surroundingContext: String,
+        sources: [RetrievedChunk],
+        configuration: AIConfiguration
+    ) async throws -> AIEditPatchApplication {
+        guard !configuration.apiKey.isEmpty else {
+            throw connectionError("修改所选内容需要先在设置中填写 API Key。")
+        }
+        try validateEndpoint(configuration.endpoint)
+        let sourceText = sources.prefix(5).enumerated().map { index, source in
+            "[资料\(index + 1)] \(source.fileName) · \(source.heading ?? "第 \(source.line) 行")\n\(source.text)"
+        }.joined(separator: "\n\n")
+        let prompt = """
+        你是谨慎的 Markdown 编辑。主要修改 <selection> 中的文字，可以阅读上下文和资料，但不要输出上下文。
+        只有在保证衔接、事实一致或逻辑完整确实需要时，才允许连带修改选区外的上下文。
+
+        严格只返回 JSON：
+        {"edits":[{"old_text":"原文中唯一匹配的片段","new_text":"修改后片段","scope":"selection","reason":null}]}
+
+        规则：
+        1. 选区内修改 scope 为 "selection"。
+        2. 选区外连带修改 scope 为 "context"，reason 必须用一句中文说明为什么必须一起改。
+        3. old_text 必须逐字复制原文且唯一；只返回发生改变的片段，绝不返回完整文稿或上下文。
+        4. 默认保护事实、数字、链接、引用来源和 Markdown 结构，不添加无来源的新事实。
+        5. 资料只在相关时使用，由你自行判断；不要为了使用资料而扩大修改。
+
+        修改要求：
+        \(instruction)
+
+        <selection>
+        \(selectedText)
+        </selection>
+
+        <surrounding_context>
+        \(surroundingContext)
+        </surrounding_context>
+
+        <knowledge_sources>
+        \(sourceText.isEmpty ? "无相关资料。" : sourceText)
+        </knowledge_sources>
+        """
+        let body: [String: Any] = [
+            "model": configuration.model,
+            "messages": [["role": "user", "content": prompt]]
+        ]
+        var request = URLRequest(url: configuration.endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw connectionError("模型服务请求失败。")
+        }
+        let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
+        guard let text = decoded.choices.first?.message.content else {
+            throw connectionError("模型没有返回修改内容。")
+        }
+        return try AIEditPatchProcessor.applyDetailed(
+            response: text,
+            to: currentText
+        )
     }
 
     private func localAnswer(question: String, sources: [RetrievedChunk]) -> AIResponse {
@@ -233,6 +396,44 @@ struct AIService: Sendable {
             return
         }
         throw connectionError("为保护 API Key，公网接口必须使用 HTTPS；HTTP 仅允许本机地址。")
+    }
+
+    private func answerMessages(
+        question: String,
+        currentContext: String,
+        history: [ChatMessage],
+        sources: [RetrievedChunk]
+    ) -> [[String: String]] {
+        let sourceText = sources.enumerated().map { index, source in
+            "[资料\(index + 1)] \(source.fileName) · \(source.heading ?? "第 \(source.line) 行")\n\(source.text)"
+        }.joined(separator: "\n\n")
+        let system = """
+        你是私人 Markdown 知识库里的写作助手。优先依据用户资料回答，引用资料时使用 [资料1] 格式。
+        清楚区分：用户资料中的事实、你的推断、通用知识。资料冲突时分别陈述，不替用户决定。
+        没有依据时直说。不要声称看过未提供的文件。回答使用简洁自然的中文。
+
+        当用户要求修改当前文稿（如改标题、润色、删减、重组等），不要输出完整文稿，只返回确实修改过的片段。
+        用以下格式包裹严格 JSON：
+        ```edit-patch
+        {"edits":[{"old_text":"从原文逐字复制、足以唯一定位的片段","new_text":"修改后的片段"}]}
+        ```
+        old_text 必须与原文完全一致且在原文中只出现一次；只包含需要改变的段落，不要包含未修改段落。
+        删除内容时 new_text 使用空字符串。新增内容时，把相邻的唯一原文作为 old_text，并在 new_text 中保留它。
+        不要使用行号定位，不要输出完整文稿，不要在 JSON 之外复述修改后的正文。
+        如果用户只是提问而非要求修改，正常回答即可。
+
+        当前文稿上下文：
+        \(currentContext)
+
+        检索资料：
+        \(sourceText.isEmpty ? "未检索到相关资料。" : sourceText)
+        """
+        var messages: [[String: String]] = [["role": "system", "content": system]]
+        messages += history.suffix(8).map {
+            ["role": $0.role == .user ? "user" : "assistant", "content": $0.text]
+        }
+        messages.append(["role": "user", "content": question])
+        return messages
     }
 
     private static func mapUsage(_ usage: ChatCompletionResponse.Usage) -> AIUsage {
@@ -376,6 +577,19 @@ private struct ChatCompletionResponse: Decodable {
             case cachedTokens = "cached_tokens"
         }
     }
+}
+
+private struct ChatCompletionStreamChunk: Decodable {
+    struct Choice: Decodable {
+        struct Delta: Decodable {
+            let content: String?
+        }
+
+        let delta: Delta?
+    }
+
+    let choices: [Choice]
+    let usage: ChatCompletionResponse.Usage?
 }
 
 private struct ServiceErrorResponse: Decodable {

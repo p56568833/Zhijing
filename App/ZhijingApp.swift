@@ -48,11 +48,42 @@ struct ZhijingApp: App {
                 }
                 .keyboardShortcut("a", modifiers: [.command, .option])
             }
+            CommandGroup(after: .textEditing) {
+                Button("查找…") {
+                    store.showDocumentFind()
+                }
+                .keyboardShortcut("f")
+                Button("查找下一个") {
+                    store.findNext()
+                }
+                .keyboardShortcut("g")
+                Button("查找上一个") {
+                    store.findPrevious()
+                }
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
             CommandMenu("文稿") {
+                Button("AI 修改所选内容…") {
+                    store.requestCustomSelectionEdit()
+                }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
+                Divider()
                 Button("立即保存") { store.saveNow() }
                     .keyboardShortcut("s")
                 Button("创建版本快照") { store.createManualSnapshot() }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
+                Button(store.isComparisonVisible ? "关闭分屏对照" : "打开分屏对照") {
+                    store.toggleComparison()
+                }
+                .keyboardShortcut("\\", modifiers: [.command, .control])
+                Menu("导出") {
+                    Button("导出 PDF…") {
+                        store.exportCurrentDocument(as: .pdf)
+                    }
+                    Button("导出 Word…") {
+                        store.exportCurrentDocument(as: .word)
+                    }
+                }
                 Divider()
                 Button("刷新知识库") {
                     Task { await store.refreshLibrary() }

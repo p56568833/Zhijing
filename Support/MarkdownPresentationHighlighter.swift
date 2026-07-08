@@ -66,13 +66,64 @@ enum MarkdownPresentationHighlighter {
         .underlineStyle
     ]
 
-    static func apply(to textView: NSTextView) {
+    private static let headingExpression = expression(#"^\s*#{1,6}\s+"#)
+    private static let quoteExpression = expression(#"^\s*>\s?"#)
+    private static let horizontalRuleExpression = expression(
+        #"^\s*((-{3,})|(\*{3,})|(_{3,}))\s*$"#
+    )
+    private static let listMarkerExpression = expression(
+        #"^\s*([-+*]|\d+[.)])(?=\s)"#
+    )
+    private static let inlineCodeExpression = expression(#"`[^`\n]+`"#)
+    private static let strongExpression = expression(
+        #"\*\*[^*\n]+\*\*|__[^_\n]+__"#
+    )
+
+    static func apply(
+        to textView: NSTextView,
+        links: [MarkdownEditorLink]? = nil,
+        characterRange requestedRange: NSRange? = nil
+    ) {
         guard let layoutManager = textView.layoutManager else { return }
         let fullRange = NSRange(location: 0, length: textView.string.utf16.count)
-        for key in temporaryKeys {
-            layoutManager.removeTemporaryAttribute(key, forCharacterRange: fullRange)
+        let stylingRange: NSRange
+        if let requestedRange {
+            let safeRange = NSIntersectionRange(requestedRange, fullRange)
+            stylingRange = (textView.string as NSString).lineRange(for: safeRange)
+        } else {
+            stylingRange = fullRange
         }
-        for span in spans(in: textView.string) where span.range.length > 0 {
+        for key in temporaryKeys {
+            layoutManager.removeTemporaryAttribute(key, forCharacterRange: stylingRange)
+        }
+
+        let source: String
+        let baseLocation: Int
+        let startsInsideFence: Bool
+        if stylingRange.location == 0, stylingRange.length == fullRange.length {
+            source = textView.string
+            baseLocation = 0
+            startsInsideFence = false
+        } else {
+            let nsSource = textView.string as NSString
+            source = nsSource.substring(with: stylingRange)
+            baseLocation = stylingRange.location
+            startsInsideFence = isInsideFence(
+                before: stylingRange.location,
+                in: nsSource
+            )
+        }
+
+        let resolvedLinks = links ?? MarkdownLinkDetector.links(in: textView.string)
+        let linksInRange = resolvedLinks.filter {
+            NSIntersectionRange($0.range, stylingRange).length > 0
+        }
+        for span in spans(
+            in: source,
+            baseLocation: baseLocation,
+            links: linksInRange,
+            startsInsideFence: startsInsideFence
+        ) where span.range.length > 0 {
             layoutManager.addTemporaryAttributes(
                 span.style.attributes,
                 forCharacterRange: span.range
@@ -80,11 +131,16 @@ enum MarkdownPresentationHighlighter {
         }
     }
 
-    static func spans(in source: String) -> [MarkdownPresentationSpan] {
+    static func spans(
+        in source: String,
+        baseLocation: Int = 0,
+        links: [MarkdownEditorLink]? = nil,
+        startsInsideFence: Bool = false
+    ) -> [MarkdownPresentationSpan] {
         let string = source as NSString
         var result: [MarkdownPresentationSpan] = []
         var location = 0
-        var inFence = false
+        var inFence = startsInsideFence
 
         while location < string.length {
             let lineRange = string.lineRange(
@@ -93,7 +149,7 @@ enum MarkdownPresentationHighlighter {
             let line = string.substring(with: lineRange)
                 .trimmingCharacters(in: .newlines)
             let contentRange = NSRange(
-                location: lineRange.location,
+                location: baseLocation + lineRange.location,
                 length: (line as NSString).length
             )
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -103,17 +159,14 @@ enum MarkdownPresentationHighlighter {
                 inFence.toggle()
             } else if inFence {
                 result.append(.init(range: contentRange, style: .codeBlock))
-            } else if firstMatch(#"^\s*#{1,6}\s+"#, in: line) != nil {
+            } else if firstMatch(headingExpression, in: line) != nil {
                 result.append(.init(range: contentRange, style: .heading))
-            } else if firstMatch(#"^\s*>\s?"#, in: line) != nil {
+            } else if firstMatch(quoteExpression, in: line) != nil {
                 result.append(.init(range: contentRange, style: .quote))
-            } else if firstMatch(
-                #"^\s*((-{3,})|(\*{3,})|(_{3,}))\s*$"#,
-                in: line
-            ) != nil {
+            } else if firstMatch(horizontalRuleExpression, in: line) != nil {
                 result.append(.init(range: contentRange, style: .horizontalRule))
             } else if let marker = firstMatch(
-                #"^\s*([-+*]|\d+[.)])(?=\s)"#,
+                listMarkerExpression,
                 in: line
             ) {
                 result.append(.init(
@@ -127,44 +180,73 @@ enum MarkdownPresentationHighlighter {
             location = NSMaxRange(lineRange)
         }
 
-        addMatches(#"`[^`\n]+`"#, style: .inlineCode, source: source, to: &result)
         addMatches(
-            #"\*\*[^*\n]+\*\*|__[^_\n]+__"#,
-            style: .strong,
+            inlineCodeExpression,
+            style: .inlineCode,
             source: source,
+            baseLocation: baseLocation,
             to: &result
         )
-        for link in MarkdownLinkDetector.links(in: source) {
+        addMatches(
+            strongExpression,
+            style: .strong,
+            source: source,
+            baseLocation: baseLocation,
+            to: &result
+        )
+        for link in links ?? MarkdownLinkDetector.links(in: source) {
             result.append(.init(range: link.range, style: .link))
         }
         return result
     }
 
     private static func addMatches(
-        _ pattern: String,
+        _ expression: NSRegularExpression?,
         style: MarkdownPresentationStyle,
         source: String,
+        baseLocation: Int,
         to result: inout [MarkdownPresentationSpan]
     ) {
-        guard let expression = try? NSRegularExpression(pattern: pattern) else {
-            return
-        }
+        guard let expression else { return }
         let range = NSRange(location: 0, length: (source as NSString).length)
         for match in expression.matches(in: source, range: range) {
-            result.append(.init(range: match.range, style: style))
+            result.append(.init(
+                range: NSRange(
+                    location: baseLocation + match.range.location,
+                    length: match.range.length
+                ),
+                style: style
+            ))
         }
     }
 
     private static func firstMatch(
-        _ pattern: String,
+        _ expression: NSRegularExpression?,
         in source: String
     ) -> NSTextCheckingResult? {
-        guard let expression = try? NSRegularExpression(pattern: pattern) else {
-            return nil
-        }
+        guard let expression else { return nil }
         return expression.firstMatch(
             in: source,
             range: NSRange(location: 0, length: (source as NSString).length)
         )
+    }
+
+    private static func expression(_ pattern: String) -> NSRegularExpression? {
+        try? NSRegularExpression(pattern: pattern)
+    }
+
+    private static func isInsideFence(before location: Int, in source: NSString) -> Bool {
+        guard location > 0 else { return false }
+        let prefix = source.substring(
+            with: NSRange(location: 0, length: min(location, source.length))
+        )
+        var inside = false
+        for line in prefix.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                inside.toggle()
+            }
+        }
+        return inside
     }
 }

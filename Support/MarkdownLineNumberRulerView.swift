@@ -2,6 +2,8 @@ import AppKit
 
 final class MarkdownLineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
+    private var lineRanges: [NSRange] = []
+    private var cachedStringLength = -1
 
     init(textView: NSTextView) {
         self.textView = textView
@@ -20,6 +22,12 @@ final class MarkdownLineNumberRulerView: NSRulerView {
                 object: clipView
             )
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(textDidChange(_:)),
+            name: NSText.didChangeNotification,
+            object: textView
+        )
     }
 
     required init(coder: NSCoder) {
@@ -34,30 +42,44 @@ final class MarkdownLineNumberRulerView: NSRulerView {
         needsDisplay = true
     }
 
+    @objc private func textDidChange(_ notification: Notification) {
+        lineRanges.removeAll(keepingCapacity: true)
+        cachedStringLength = -1
+        needsDisplay = true
+    }
+
     override func drawHashMarksAndLabels(in rect: NSRect) {
-        guard let textView, let layoutManager = textView.layoutManager else { return }
+        guard let textView,
+              let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer else { return }
         NSColor.windowBackgroundColor.setFill()
         bounds.fill()
-        NSColor.separatorColor.setFill()
-        NSRect(
-            x: bounds.maxX - 1,
-            y: bounds.minY,
-            width: 1,
-            height: bounds.height
-        ).fill()
 
         let visibleRect = textView.visibleRect
         let string = textView.string as NSString
+        let ranges = cachedLineRanges(for: string)
+        guard !ranges.isEmpty else { return }
+
+        let visibleGlyphRange = layoutManager.glyphRange(
+            forBoundingRect: visibleRect,
+            in: textContainer
+        )
+        let visibleCharacterRange = layoutManager.characterRange(
+            forGlyphRange: visibleGlyphRange,
+            actualGlyphRange: nil
+        )
+        let firstLine = max(
+            0,
+            lineIndex(containing: visibleCharacterRange.location, in: ranges) - 1
+        )
+        let visibleUpperBound = NSMaxRange(visibleCharacterRange)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor.tertiaryLabelColor
         ]
-        var lineNumber = 1
-        var location = 0
-        repeat {
-            let lineRange = string.lineRange(
-                for: NSRange(location: min(location, string.length), length: 0)
-            )
+        for index in firstLine..<ranges.count {
+            let lineRange = ranges[index]
+            if lineRange.location > visibleUpperBound { break }
             let glyphRange = layoutManager.glyphRange(
                 forCharacterRange: lineRange,
                 actualCharacterRange: nil
@@ -69,7 +91,7 @@ final class MarkdownLineNumberRulerView: NSRulerView {
                 )
                 let y = fragment.minY + textView.textContainerOrigin.y
                 if y + fragment.height >= visibleRect.minY, y <= visibleRect.maxY {
-                    let label = "\(lineNumber)" as NSString
+                    let label = "\(index + 1)" as NSString
                     let point = convert(NSPoint(x: 0, y: y + 2), from: textView)
                     label.draw(
                         at: NSPoint(
@@ -80,11 +102,43 @@ final class MarkdownLineNumberRulerView: NSRulerView {
                     )
                 }
             }
-            lineNumber += 1
-            if lineRange.length == 0 || NSMaxRange(lineRange) >= string.length {
+        }
+    }
+
+    private func cachedLineRanges(for string: NSString) -> [NSRange] {
+        if cachedStringLength == string.length, !lineRanges.isEmpty {
+            return lineRanges
+        }
+
+        var ranges: [NSRange] = []
+        var location = 0
+        repeat {
+            let range = string.lineRange(
+                for: NSRange(location: min(location, string.length), length: 0)
+            )
+            ranges.append(range)
+            if range.length == 0 || NSMaxRange(range) >= string.length {
                 break
             }
-            location = NSMaxRange(lineRange)
+            location = NSMaxRange(range)
         } while location <= string.length
+
+        lineRanges = ranges
+        cachedStringLength = string.length
+        return ranges
+    }
+
+    private func lineIndex(containing location: Int, in ranges: [NSRange]) -> Int {
+        var lower = 0
+        var upper = ranges.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if NSMaxRange(ranges[middle]) <= location {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return min(lower, max(0, ranges.count - 1))
     }
 }

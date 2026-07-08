@@ -113,6 +113,16 @@ struct AssistantView: View {
                             Text(store.retrievalStatus.isEmpty ? "正在思考…" : store.retrievalStatus)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if store.canCancelGeneration {
+                                Spacer(minLength: 0)
+                                Button {
+                                    store.cancelGeneration()
+                                } label: {
+                                    Label("停止", systemImage: "stop.circle")
+                                }
+                                .buttonStyle(.plain)
+                                .font(.caption)
+                            }
                         }
                         .padding(.horizontal, 14)
                         .id("generating")
@@ -228,6 +238,18 @@ private struct QuickPrompt: View {
 private struct MessageView: View {
     let message: ChatMessage
     let openSource: (RetrievedChunk) -> Void
+    private let renderedMarkdown: AttributedString
+
+    init(
+        message: ChatMessage,
+        openSource: @escaping (RetrievedChunk) -> Void
+    ) {
+        self.message = message
+        self.openSource = openSource
+        renderedMarkdown =
+            (try? AttributedString(markdown: message.text)) ??
+            AttributedString(message.text)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -295,8 +317,5 @@ private struct MessageView: View {
             }
         }
     }
-
-    private var markdown: AttributedString {
-        (try? AttributedString(markdown: message.text)) ?? AttributedString(message.text)
-    }
+    private var markdown: AttributedString { renderedMarkdown }
 }

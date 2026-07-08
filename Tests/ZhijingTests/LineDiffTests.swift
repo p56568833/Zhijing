@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import AppKit
+import PDFKit
 @testable import Zhijing
 
 @Test func lineDiffFindsInsertionsAndRemovals() {
@@ -10,6 +11,153 @@ import AppKit
     )
     #expect(diff.removedOffsets == [1])
     #expect(diff.insertedOffsets == [1])
+}
+
+@Test func lineDiffAppliesOnlySelectedChangeHunks() {
+    let diff = LineDiff(
+        original: "开头\n旧段一\n中间\n旧段二\n结尾",
+        replacement: "开头\n新段一\n中间\n新段二\n结尾"
+    )
+
+    #expect(diff.hunks.count == 2)
+    #expect(
+        diff.applying(acceptedHunkIDs: [diff.hunks[0].id])
+            == "开头\n新段一\n中间\n旧段二\n结尾"
+    )
+    #expect(
+        diff.applying(acceptedHunkIDs: [diff.hunks[1].id])
+            == "开头\n旧段一\n中间\n新段二\n结尾"
+    )
+}
+
+@Test func lineDiffHandlesPureInsertionsAndDeletionsAsSelectableHunks() {
+    let insertion = LineDiff(
+        original: "开头\n结尾",
+        replacement: "开头\n新增\n结尾"
+    )
+    #expect(insertion.hunks.count == 1)
+    #expect(
+        insertion.applying(acceptedHunkIDs: [0])
+            == "开头\n新增\n结尾"
+    )
+    #expect(
+        insertion.applying(acceptedHunkIDs: [])
+            == "开头\n结尾"
+    )
+
+    let deletion = LineDiff(
+        original: "开头\n删除\n结尾",
+        replacement: "开头\n结尾"
+    )
+    #expect(deletion.hunks.count == 1)
+    #expect(
+        deletion.applying(acceptedHunkIDs: [0])
+            == "开头\n结尾"
+    )
+}
+
+@Test func aiEditPatchChangesOnlyReturnedPassages() throws {
+    let original = """
+    # 标题
+
+    第一段保持不变。
+
+    第二段需要润色。
+
+    结尾保持不变。
+    """
+    let response = """
+    {
+      "edits": [
+        {
+          "old_text": "第二段需要润色。",
+          "new_text": "第二段已经写得更清楚。"
+        }
+      ]
+    }
+    """
+
+    let result = try AIEditPatchProcessor.apply(
+        response: response,
+        to: original
+    )
+    #expect(result.contains("第一段保持不变。"))
+    #expect(result.contains("第二段已经写得更清楚。"))
+    #expect(result.contains("结尾保持不变。"))
+    #expect(!result.contains("第二段需要润色。"))
+}
+
+@Test func aiEditPatchSupportsDeletionAndAnchoredInsertion() throws {
+    let original = "开头\n删除这一行\n结尾"
+    let response = """
+    {"edits":[
+      {"old_text":"删除这一行\\n","new_text":""},
+      {"old_text":"结尾","new_text":"新增一行\\n结尾"}
+    ]}
+    """
+
+    #expect(
+        try AIEditPatchProcessor.apply(response: response, to: original)
+            == "开头\n新增一行\n结尾"
+    )
+}
+
+@Test func aiEditPatchRejectsAmbiguousOrOverlappingPassages() {
+    let ambiguous = """
+    {"edits":[{"old_text":"重复","new_text":"替换"}]}
+    """
+    #expect(throws: Error.self) {
+        try AIEditPatchProcessor.apply(
+            response: ambiguous,
+            to: "重复内容，重复出现。"
+        )
+    }
+
+    let overlapping = AIEditPatch(edits: [
+        AITextEdit(oldText: "甲乙", newText: "一"),
+        AITextEdit(oldText: "乙丙", newText: "二"),
+    ])
+    #expect(throws: Error.self) {
+        try AIEditPatchProcessor.apply(
+            patch: overlapping,
+            to: "甲乙丙"
+        )
+    }
+}
+
+@Test func chatEditPatchIsRemovedFromVisibleReplyAndAppliedLocally() throws {
+    let response = """
+    我只调整了第二段。
+
+    ```edit-patch
+    {"edits":[{"old_text":"旧段落","new_text":"新段落"}]}
+    ```
+    """
+    let extracted = try AIEditPatchProcessor.extractFromChat(
+        response,
+        original: "开头\n旧段落\n结尾"
+    )
+
+    #expect(extracted.display == "我只调整了第二段。")
+    #expect(extracted.replacement == "开头\n新段落\n结尾")
+}
+
+@Test func aiEditPatchPreservesScopeAndReasonForConfirmation() throws {
+    let response = """
+    {"edits":[
+      {"old_text":"选区","new_text":"选区修改","scope":"selection","reason":null},
+      {"old_text":"相邻句","new_text":"调整后的相邻句","scope":"context","reason":"需要与新表述保持主语一致"}
+    ]}
+    """
+    let application = try AIEditPatchProcessor.applyDetailed(
+        response: response,
+        to: "选区\n相邻句"
+    )
+
+    #expect(application.edits.count == 2)
+    #expect(application.edits[0].scope == "selection")
+    #expect(application.edits[1].scope == "context")
+    #expect(application.edits[1].reason == "需要与新表述保持主语一致")
 }
 
 @Test func retrievalScopeTitlesRemainStable() {
@@ -111,6 +259,57 @@ import AppKit
     #expect(documents.map(\.title) == ["长扩展名"])
 }
 
+@Test func foldersCanBeRenamedAndDocumentsMovedWithoutChangingContents() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingMove-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let originalFolder = root.appending(path: "原文件夹", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: originalFolder,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    try "保留的正文".write(
+        to: originalFolder.appending(path: "文章.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let service = KnowledgeBaseService()
+    _ = try service.renameFolder(
+        root: root,
+        relativePath: "原文件夹",
+        to: "新文件夹"
+    )
+    let renamedDocument = try #require(
+        service.scan(root: root, excludedFolders: []).first
+    )
+    #expect(renamedDocument.relativePath == "新文件夹/文章.md")
+
+    let movedURL = try service.move(
+        renamedDocument,
+        toFolder: "",
+        root: root
+    )
+    #expect(movedURL.lastPathComponent == "文章.md")
+    #expect(try String(contentsOf: movedURL, encoding: .utf8) == "保留的正文")
+}
+
+@Test func scanFoldersIncludesEmptyAndNestedFolders() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingFolders-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: root.appending(path: "空文件夹/子文件夹", directoryHint: .isDirectory),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let folders = try KnowledgeBaseService().scanFolders(
+        root: root,
+        excludedFolders: []
+    )
+    #expect(folders == ["空文件夹", "空文件夹/子文件夹"])
+}
+
 @Test func staleEditProposalCannotOverwriteNewTyping() {
     let proposal = EditProposal(
         documentPath: "文章.md",
@@ -153,6 +352,94 @@ import AppKit
     )
     #expect(textView.string == "明确的外部修改")
     #expect(textView.selectedRange() == NSRange(location: 2, length: 0))
+}
+
+@MainActor
+@Test func editorTabsRestoreEachDocumentsSelection() {
+    let textView = MarkdownEditorTextView()
+    let coordinator = MarkdownSourceEditor.Coordinator(onChange: { _ in })
+
+    coordinator.synchronize(
+        text: "第一篇文稿内容",
+        documentID: "第一篇.md",
+        contentRevision: 1,
+        to: textView
+    )
+    textView.setSelectedRange(NSRange(location: 4, length: 0))
+
+    coordinator.synchronize(
+        text: "第二篇文稿内容",
+        documentID: "第二篇.md",
+        contentRevision: 1,
+        to: textView
+    )
+    textView.setSelectedRange(NSRange(location: 2, length: 0))
+
+    coordinator.synchronize(
+        text: "第一篇文稿内容",
+        documentID: "第一篇.md",
+        contentRevision: 1,
+        to: textView
+    )
+    #expect(textView.selectedRange() == NSRange(location: 4, length: 0))
+
+    coordinator.synchronize(
+        text: "第二篇文稿内容",
+        documentID: "第二篇.md",
+        contentRevision: 1,
+        to: textView
+    )
+    #expect(textView.selectedRange() == NSRange(location: 2, length: 0))
+}
+
+@MainActor
+@Test func editorNavigationSelectsTheRequestedSourceLine() {
+    let textView = MarkdownEditorTextView()
+    let coordinator = MarkdownSourceEditor.Coordinator(onChange: { _ in })
+    coordinator.synchronize(
+        text: "第一行\n第二行\n需要定位的第三行\n第四行",
+        documentID: "来源.md",
+        contentRevision: 1,
+        to: textView
+    )
+    coordinator.navigate(
+        to: EditorNavigationRequest(
+            documentID: "来源.md",
+            line: 3
+        ),
+        in: textView
+    )
+
+    let selected = (textView.string as NSString).substring(
+        with: textView.selectedRange()
+    )
+    #expect(selected == "需要定位的第三行")
+}
+
+@MainActor
+@Test func editorReportsAConcreteTextSelectionToSwiftUI() {
+    let textView = MarkdownEditorTextView()
+    var reported: EditorTextSelection?
+    let coordinator = MarkdownSourceEditor.Coordinator(
+        onChange: { _ in },
+        onSelectionChange: { reported = $0 }
+    )
+    textView.delegate = coordinator
+    coordinator.synchronize(
+        text: "前文\n需要修改的文字\n后文",
+        documentID: "文章.md",
+        contentRevision: 1,
+        to: textView
+    )
+    let range = (textView.string as NSString).range(of: "需要修改的文字")
+    textView.setSelectedRange(range)
+    coordinator.textViewDidChangeSelection(
+        Notification(name: NSTextView.didChangeSelectionNotification, object: textView)
+    )
+
+    #expect(reported?.documentID == "文章.md")
+    #expect(reported?.range == range)
+    #expect(reported?.text == "需要修改的文字")
 }
 
 @MainActor
@@ -342,4 +629,166 @@ import AppKit
     #expect(!visibleText.contains("**"))
     #expect(!visibleText.contains(">"))
     #expect(!visibleText.contains("https://"))
+}
+
+@Test func namedSnapshotsPersistMetadataAndRemainUnique() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingVersions-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let library = root.appending(path: "Library", directoryHint: .isDirectory)
+    let support = root.appending(path: "Support", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let noteURL = library.appending(path: "计划.md")
+    try "第一版".write(to: noteURL, atomically: true, encoding: .utf8)
+    let document = NoteDocument(
+        url: noteURL,
+        relativePath: "计划.md",
+        modifiedAt: .now,
+        size: 9
+    )
+    let service = KnowledgeBaseService(supportDirectoryOverride: support)
+
+    _ = try service.createSnapshot(
+        text: "第一版",
+        document: document,
+        name: "完成初稿"
+    )
+    _ = try service.createSnapshot(
+        text: "第二版",
+        document: document,
+        name: "结构调整"
+    )
+
+    let revisions = service.revisions(for: document)
+    #expect(revisions.count == 2)
+    #expect(Set(revisions.compactMap(\.name)) == ["完成初稿", "结构调整"])
+    #expect(Set(try revisions.map(service.revisionText)) == ["第一版", "第二版"])
+    #expect(Set(revisions.map(\.url)).count == 2)
+}
+
+@Test func externalFileChangesAreReconciledWithoutOverwritingEitherSide() {
+    #expect(
+        ExternalFileReconciler.evaluate(
+            loadedText: "基线",
+            editorText: "本地修改",
+            diskText: "基线"
+        ) == .localChangesOnly
+    )
+    #expect(
+        ExternalFileReconciler.evaluate(
+            loadedText: "基线",
+            editorText: "基线",
+            diskText: "外部修改"
+        ) == .reloadFromDisk("外部修改")
+    )
+    #expect(
+        ExternalFileReconciler.evaluate(
+            loadedText: "基线",
+            editorText: "本地修改",
+            diskText: "外部修改"
+        ) == .conflict("外部修改")
+    )
+    #expect(
+        ExternalFileReconciler.evaluate(
+            loadedText: "基线",
+            editorText: "本地修改",
+            diskText: nil
+        ) == .removedWithLocalChanges
+    )
+}
+
+@Test func documentMetricsIgnoreMarkdownMarkers() {
+    let short = DocumentMetrics(markdown: "# 标题\n\n你好 **world**")
+    #expect(short.count == 5)
+
+    let long = DocumentMetrics(markdown: String(repeating: "知", count: 501))
+    #expect(long.count == 501)
+}
+
+@Test func documentFindMatchesCaseAndWholeWordOptions() {
+    let source = "Alpha alpha alphabet\n中文中文 alpha_2 alpha"
+
+    let insensitive = DocumentFindMatcher.matches(
+        in: source,
+        options: DocumentFindOptions(query: "alpha")
+    )
+    #expect(insensitive.count == 5)
+
+    let caseSensitive = DocumentFindMatcher.matches(
+        in: source,
+        options: DocumentFindOptions(query: "alpha", matchCase: true)
+    )
+    #expect(caseSensitive.count == 4)
+
+    let wholeWord = DocumentFindMatcher.matches(
+        in: source,
+        options: DocumentFindOptions(query: "alpha", wholeWord: true)
+    )
+    #expect(wholeWord.count == 3)
+    #expect(wholeWord.allSatisfy {
+        (source as NSString)
+            .substring(with: $0)
+            .localizedCaseInsensitiveCompare("alpha") == .orderedSame
+    })
+}
+
+@MainActor
+@Test func pdfAndWordExportsProduceReadableDocuments() throws {
+    let requestedDirectory = ProcessInfo.processInfo.environment["ZHIJING_EXPORT_QA_DIR"]
+    let root = requestedDirectory.map {
+        URL(filePath: $0, directoryHint: .isDirectory)
+    } ?? URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingExports-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        if requestedDirectory == nil {
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    let repeatedSections = (1...24).map { index in
+        """
+        ## 分页测试 \(index)
+
+        这一段用于验证长文档能够跨页导出，并且后续页面仍然保留稳定的边距、字号和行距。
+        """
+    }.joined(separator: "\n\n")
+    let markdown = """
+    # 导出测试
+
+    这是用于验证中文排版的正文，包含 **重点内容** 与 [链接](https://example.com)。
+
+    > 引用内容应该保持清晰的层级。
+
+    - 第一项
+    - 第二项
+
+    ```swift
+    let message = "hello"
+    ```
+
+    \(repeatedSections)
+    """
+    let pdfURL = root.appending(path: "知境导出测试.pdf")
+    let wordURL = root.appending(path: "知境导出测试.docx")
+    let exporter = DocumentExportService()
+
+    try exporter.export(
+        title: "知境导出测试",
+        markdown: markdown,
+        format: .pdf,
+        to: pdfURL
+    )
+    try exporter.export(
+        title: "知境导出测试",
+        markdown: markdown,
+        format: .word,
+        to: wordURL
+    )
+
+    #expect((try Data(contentsOf: pdfURL)).starts(with: Data("%PDF".utf8)))
+    #expect(PDFDocument(url: pdfURL)?.pageCount ?? 0 >= 2)
+    #expect((try Data(contentsOf: wordURL)).starts(with: Data([0x50, 0x4B])))
+    #expect((try wordURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) > 1_000)
 }

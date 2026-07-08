@@ -1,9 +1,15 @@
 import Foundation
 
-struct KnowledgeBaseService {
+struct KnowledgeBaseService: Sendable {
     private var fileManager: FileManager { .default }
     private let allowedExtensions: Set<String> = ["md", "markdown", "txt"]
     private let contentCache = ContentCache()
+    private let searchIndex = KnowledgeSearchIndex()
+    private let supportDirectoryOverride: URL?
+
+    init(supportDirectoryOverride: URL? = nil) {
+        self.supportDirectoryOverride = supportDirectoryOverride
+    }
 
     func scan(root: URL, excludedFolders: [String]) throws -> [NoteDocument] {
         let keys: [URLResourceKey] = [
@@ -42,6 +48,31 @@ struct KnowledgeBaseService {
         }
     }
 
+    func scanFolders(root: URL, excludedFolders: [String]) throws -> [String] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isHiddenKey]
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+
+        var folders: [String] = []
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: Set(keys))
+            guard values.isDirectory == true else { continue }
+            let relative = relativePath(of: url, root: root)
+            let components = relative.split(separator: "/").map(String.init)
+            if components.contains(where: { excludedFolders.contains($0) }) {
+                enumerator.skipDescendants()
+                continue
+            }
+            folders.append(relative)
+        }
+        return folders.sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
+    }
+
     func read(_ document: NoteDocument) throws -> String {
         try String(contentsOf: document.url, encoding: .utf8)
     }
@@ -49,6 +80,7 @@ struct KnowledgeBaseService {
     func write(_ text: String, to document: NoteDocument) throws {
         try text.write(to: document.url, atomically: true, encoding: .utf8)
         contentCache.set(document.relativePath, text)
+        searchIndex.invalidate(document.relativePath)
     }
 
     func createNote(root: URL, folder: String? = nil) throws -> URL {
@@ -76,8 +108,7 @@ struct KnowledgeBaseService {
     }
 
     func rename(_ document: NoteDocument, to rawName: String) throws -> URL {
-        let cleaned = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "/", with: "-")
+        let cleaned = cleanedFilename(rawName)
         guard !cleaned.isEmpty else { return document.url }
         let ext = document.url.pathExtension
         let filename = cleaned.hasSuffix(".\(ext)") ? cleaned : "\(cleaned).\(ext)"
@@ -85,14 +116,72 @@ struct KnowledgeBaseService {
         guard destination.standardizedFileURL != document.url.standardizedFileURL else {
             return document.url
         }
+        try ensureDestinationIsAvailable(destination)
         try fileManager.moveItem(at: document.url, to: destination)
         contentCache.remove(document.relativePath)
+        searchIndex.invalidate(document.relativePath)
         return destination
+    }
+
+    func move(
+        _ document: NoteDocument,
+        toFolder relativeFolder: String,
+        root: URL
+    ) throws -> URL {
+        let directory = relativeFolder.isEmpty
+            ? root
+            : root.appending(path: relativeFolder, directoryHint: .isDirectory)
+        try ensureContained(directory, in: root)
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let destination = directory.appending(path: document.url.lastPathComponent)
+        guard destination.standardizedFileURL != document.url.standardizedFileURL else {
+            return document.url
+        }
+        try ensureDestinationIsAvailable(destination)
+        try fileManager.moveItem(at: document.url, to: destination)
+        contentCache.remove(document.relativePath)
+        searchIndex.invalidate(document.relativePath)
+        return destination
+    }
+
+    func renameFolder(
+        root: URL,
+        relativePath: String,
+        to rawName: String
+    ) throws -> URL {
+        let cleaned = cleanedFilename(rawName)
+        guard !cleaned.isEmpty, !relativePath.isEmpty else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        let source = root.appending(path: relativePath, directoryHint: .isDirectory)
+        try ensureContained(source, in: root)
+        let destination = source.deletingLastPathComponent()
+            .appending(path: cleaned, directoryHint: .isDirectory)
+        guard destination.standardizedFileURL != source.standardizedFileURL else {
+            return source
+        }
+        try ensureDestinationIsAvailable(destination)
+        try fileManager.moveItem(at: source, to: destination)
+        return destination
+    }
+
+    func trashFolder(root: URL, relativePath: String) throws {
+        guard !relativePath.isEmpty else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let folder = root.appending(path: relativePath, directoryHint: .isDirectory)
+        try ensureContained(folder, in: root)
+        try fileManager.trashItem(at: folder, resultingItemURL: nil)
     }
 
     func trash(_ document: NoteDocument) throws {
         try fileManager.trashItem(at: document.url, resultingItemURL: nil)
         contentCache.remove(document.relativePath)
+        searchIndex.invalidate(document.relativePath)
     }
 
     func search(
@@ -107,36 +196,13 @@ struct KnowledgeBaseService {
             documents.filter { $0.folder == folder || $0.folder.hasPrefix(folder + "/") }
         } ?? documents
 
-        var hits: [SearchHit] = []
-        for document in candidates {
-            let content: String
-            if let cached = contentCache.get(document.relativePath) {
-                content = cached
-            } else if let read = try? read(document) {
-                content = read
-                contentCache.set(document.relativePath, content)
-            } else {
-                continue
-            }
-            let lines = content.components(separatedBy: .newlines)
-            for (index, line) in lines.enumerated() {
-                let bodyScore = matchScore(terms: terms, in: line)
-                let titleScore = matchScore(terms: terms, in: document.title) * 2.4
-                let score = bodyScore + titleScore
-                guard score > 0 else { continue }
-                let lower = max(0, index - 1)
-                let upper = min(lines.count, index + 2)
-                let excerpt = lines[lower..<upper].joined(separator: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                hits.append(SearchHit(
-                    document: document,
-                    excerpt: excerpt,
-                    line: index + 1,
-                    score: score
-                ))
-            }
+        return searchIndex.search(
+            query: query,
+            documents: candidates,
+            limit: limit
+        ) { document in
+            cachedOrRead(document)
         }
-        return hits.sorted { $0.score > $1.score }.prefix(limit).map { $0 }
     }
 
     func retrieve(
@@ -164,17 +230,36 @@ struct KnowledgeBaseService {
         }.prefix(limit).map { $0 }
     }
 
-    func createSnapshot(text: String, document: NoteDocument) throws -> URL {
+    func createSnapshot(
+        text: String,
+        document: NoteDocument,
+        name: String? = nil
+    ) throws -> URL {
         let base = try applicationSupportDirectory().appending(
             path: "Versions/\(safeFilename(document.relativePath))",
             directoryHint: .isDirectory
         )
         try fileManager.createDirectory(at: base, withIntermediateDirectories: true)
+        let createdAt = Date.now
         let formatter = ISO8601DateFormatter()
-        let filename = formatter.string(from: .now).replacingOccurrences(of: ":", with: "-") + ".md"
+        let timestamp = formatter.string(from: createdAt)
+            .replacingOccurrences(of: ":", with: "-")
+        let filename = "\(timestamp)-\(UUID().uuidString.prefix(8)).md"
         let url = base.appending(path: filename)
         try text.write(to: url, atomically: true, encoding: .utf8)
+        let cleanedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let metadata = RevisionMetadata(
+            createdAt: createdAt,
+            name: cleanedName?.isEmpty == false ? cleanedName : nil
+        )
+        let metadataURL = url.deletingPathExtension().appendingPathExtension("json")
+        let data = try JSONEncoder().encode(metadata)
+        try data.write(to: metadataURL, options: .atomic)
         return url
+    }
+
+    func revisionText(_ revision: Revision) throws -> String {
+        try String(contentsOf: revision.url, encoding: .utf8)
     }
 
     func revisions(for document: NoteDocument) -> [Revision] {
@@ -188,8 +273,18 @@ struct KnowledgeBaseService {
             options: [.skipsHiddenFiles]
         )) ?? []
         return urls.compactMap { url in
-            let date = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            return Revision(url: url, createdAt: date)
+            guard url.pathExtension.lowercased() == "md" else { return nil }
+            let metadataURL = url.deletingPathExtension().appendingPathExtension("json")
+            let metadata: RevisionMetadata?
+            if let data = try? Data(contentsOf: metadataURL) {
+                metadata = try? JSONDecoder().decode(RevisionMetadata.self, from: data)
+            } else {
+                metadata = nil
+            }
+            let createdAt = metadata?.createdAt
+                ?? (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate)
+                ?? .distantPast
+            return Revision(url: url, createdAt: createdAt, name: metadata?.name)
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
@@ -231,30 +326,13 @@ struct KnowledgeBaseService {
     }
 
     private func nearestHeading(in document: NoteDocument, before line: Int) -> String? {
-        guard let content = try? read(document) else { return nil }
-        let lines = content.components(separatedBy: .newlines)
-        for value in lines.prefix(max(0, line)).reversed() where value.hasPrefix("#") {
-            return value.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+        searchIndex.heading(in: document, before: line) { document in
+            cachedOrRead(document)
         }
-        return nil
     }
 
     private func tokenize(_ value: String) -> [String] {
-        let components = value.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-        return components.flatMap { component in
-            let characters = Array(component)
-            let containsCJK = characters.contains { character in
-                character.unicodeScalars.contains {
-                    (0x4E00...0x9FFF).contains(Int($0.value))
-                }
-            }
-            guard containsCJK, characters.count > 2 else { return [component] }
-            return (0..<(characters.count - 1)).map {
-                String(characters[$0...($0 + 1)])
-            }
-        }
+        SearchTokenization.tokenize(value)
     }
 
     private func matchScore(terms: [String], in value: String) -> Double {
@@ -264,10 +342,39 @@ struct KnowledgeBaseService {
         }
     }
 
+    private func cachedOrRead(_ document: NoteDocument) -> String? {
+        if let cached = contentCache.get(document.relativePath) {
+            return cached
+        }
+        guard let content = try? read(document) else { return nil }
+        contentCache.set(document.relativePath, content)
+        return content
+    }
+
     private func relativePath(of url: URL, root: URL) -> String {
         let rootPath = root.standardizedFileURL.path
         let path = url.standardizedFileURL.path
         return String(path.dropFirst(min(path.count, rootPath.count + 1)))
+    }
+
+    private func cleanedFilename(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+    }
+
+    private func ensureDestinationIsAvailable(_ destination: URL) throws {
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+    }
+
+    private func ensureContained(_ url: URL, in root: URL) throws {
+        let rootPath = root.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        guard path == rootPath || path.hasPrefix(rootPath + "/") else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
     }
 
     private func safeFilename(_ value: String) -> String {
@@ -275,7 +382,19 @@ struct KnowledgeBaseService {
             .replacingOccurrences(of: "/", with: "_")
     }
 
+    private struct RevisionMetadata: Codable {
+        let createdAt: Date
+        let name: String?
+    }
+
     private func applicationSupportDirectory() throws -> URL {
+        if let supportDirectoryOverride {
+            try fileManager.createDirectory(
+                at: supportDirectoryOverride,
+                withIntermediateDirectories: true
+            )
+            return supportDirectoryOverride
+        }
         let base = try fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,

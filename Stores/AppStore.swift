@@ -30,9 +30,21 @@ enum AppColorScheme: String, CaseIterable {
 final class AppStore {
     var libraryURL: URL?
     var documents: [NoteDocument] = []
+    var folders: [String] = []
+    private(set) var folderGroups: [LibraryFolderGroup] = []
+    private(set) var recentDocuments: [NoteDocument] = []
+    private(set) var favoriteDocuments: [NoteDocument] = []
     var selectedDocument: NoteDocument?
     private(set) var editorText = ""
     private(set) var editorContentRevision = 0
+    private(set) var editorNavigationRequest: EditorNavigationRequest?
+    private(set) var editorSelection: EditorTextSelection?
+    private(set) var documentWordCount = 0
+    var isDocumentFindVisible = false
+    var documentFindOptions = DocumentFindOptions()
+    private(set) var documentFindResult = DocumentFindResult()
+    private(set) var documentFindNavigationRequest: DocumentFindNavigationRequest?
+    var selectionEditRequest: SelectionEditRequest?
     var searchQuery = ""
     var searchResults: [SearchHit] = []
     var favorites: Set<String> = []
@@ -58,6 +70,11 @@ final class AppStore {
     var accountBalances: [AIAccountBalance] = []
     var balanceError: String?
     var isRefreshingBalance = false
+    var externalConflict: ExternalFileConflict?
+    private(set) var openDocumentPaths: [String] = []
+    var isComparisonVisible = false
+    private(set) var comparisonDocumentPath: String?
+    private(set) var comparisonText = ""
 
     var model = "gpt-4.1-mini" {
         didSet { defaults.set(model, forKey: Keys.model) }
@@ -78,9 +95,16 @@ final class AppStore {
     private let defaults = UserDefaults.standard
     private let knowledgeBase = KnowledgeBaseService()
     private let ai = AIService()
+    private let libraryWatcher = LibraryWatcher()
+    private let documentExporter = DocumentExportService()
+    private var generationTask: Task<Void, Never>?
     private var saveTask: Task<Void, Never>?
+    private var wordCountTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    private var externalRefreshTask: Task<Void, Never>?
+    private var pendingLibraryChangeURLs: Set<URL> = []
     private var loadedText = ""
+    private var documentByPath: [String: NoteDocument] = [:]
     private var lastBalanceRefresh: Date?
     private var libraryRefreshID = UUID()
 
@@ -103,12 +127,23 @@ final class AppStore {
         )
     }
 
-    var recentDocuments: [NoteDocument] {
-        documents.sorted { $0.modifiedAt > $1.modifiedAt }.prefix(8).map { $0 }
+    var canCancelGeneration: Bool {
+        generationTask != nil
     }
 
-    var favoriteDocuments: [NoteDocument] {
-        documents.filter { favorites.contains($0.relativePath) }
+    var openDocuments: [NoteDocument] {
+        openDocumentPaths.compactMap { path in
+            documentByPath[path]
+        }
+    }
+
+    var comparisonDocument: NoteDocument? {
+        guard let comparisonDocumentPath else { return nil }
+        return documentByPath[comparisonDocumentPath]
+    }
+
+    var comparisonCandidates: [NoteDocument] {
+        documents.filter { $0.id != selectedDocument?.id }
     }
 
     init() {
@@ -124,7 +159,9 @@ final class AppStore {
         isAssistantVisible = defaults.object(forKey: Keys.assistantVisible) as? Bool ?? true
         isSidebarVisible = defaults.object(forKey: Keys.sidebarVisible) as? Bool ?? true
         colorScheme = AppColorScheme(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
-
+        openDocumentPaths = defaults.stringArray(forKey: Keys.openDocumentPaths) ?? []
+        isComparisonVisible = defaults.object(forKey: Keys.comparisonVisible) as? Bool ?? false
+        comparisonDocumentPath = defaults.string(forKey: Keys.comparisonDocumentPath)
         if let presetEndpoint = provider.endpoint {
             endpoint = presetEndpoint
             if !provider.models.contains(where: { $0.id == model }) {
@@ -151,6 +188,7 @@ final class AppStore {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard flushSave() else { return }
         clearDocumentSelection()
+        resetWorkspaceNavigation()
         libraryURL = url
         defaults.set(url.path, forKey: Keys.libraryPath)
         Task { await refreshLibrary() }
@@ -242,6 +280,7 @@ final class AppStore {
         if !isInCurrentLibrary {
             guard flushSave() else { return }
             clearDocumentSelection()
+            resetWorkspaceNavigation()
             libraryURL = root
             defaults.set(root.path, forKey: Keys.libraryPath)
         }
@@ -261,20 +300,39 @@ final class AppStore {
         do {
             let excluded = excludedFolders
             let scanned = try await Task.detached {
-                try KnowledgeBaseService().scan(root: libraryURL, excludedFolders: excluded)
+                let service = KnowledgeBaseService()
+                return (
+                    documents: try service.scan(
+                        root: libraryURL,
+                        excludedFolders: excluded
+                    ),
+                    folders: try service.scanFolders(
+                        root: libraryURL,
+                        excludedFolders: excluded
+                    )
+                )
             }.value
             guard libraryRefreshID == refreshID,
                   self.libraryURL?.standardizedFileURL == libraryURL.standardizedFileURL
             else { return }
-            documents = scanned
+            documents = scanned.documents
+            folders = scanned.folders
+            refreshDerivedLibraryState()
+            reconcileOpenDocuments()
+            reloadComparisonDocument()
+            startWatchingLibrary()
             let targetPath = relativePath ?? selectedDocument?.relativePath
-            if let targetPath, let target = documents.first(where: { $0.relativePath == targetPath }) {
+            if let targetPath, let target = documentByPath[targetPath] {
                 select(target)
             } else {
                 if selectedDocument != nil {
-                    saveTask?.cancel()
-                    clearDocumentSelection()
-                    errorMessage = "当前文稿已不在知识库中，可能被其他应用移动或删除。"
+                    if externalConflict?.document.id != selectedDocument?.id {
+                        saveTask?.cancel()
+                        clearDocumentSelection()
+                        errorMessage = "当前文稿已不在知识库中，可能被其他应用移动或删除。"
+                    } else {
+                        return
+                    }
                 }
                 if let first = documents.first {
                     select(first)
@@ -299,6 +357,8 @@ final class AppStore {
             replaceEditorText(try knowledgeBase.read(document))
             loadedText = editorText
             selectedDocument = document
+            addOpenDocument(document)
+            ensureComparisonDiffersFromSelection()
             defaults.set(document.relativePath, forKey: Keys.selectedPath)
             revisions = knowledgeBase.revisions(for: document)
             saveState = .saved(.now)
@@ -310,22 +370,118 @@ final class AppStore {
     func editorDidChange(_ text: String) {
         guard selectedDocument != nil else { return }
         editorText = text
+        scheduleWordCount(for: text)
         saveTask?.cancel()
         guard editorText != loadedText else {
             saveState = .saved(.now)
             return
         }
-        saveState = .saving
-        saveTask = Task {
-            try? await Task.sleep(for: .milliseconds(650))
-            guard !Task.isCancelled else { return }
-            _ = saveNow()
+        if externalConflict?.document.id == selectedDocument?.id {
+            saveState = .failed("等待处理外部修改")
+        } else {
+            scheduleAutosave()
+        }
+    }
+
+    func editorSelectionDidChange(_ selection: EditorTextSelection?) {
+        editorSelection = selection
+    }
+
+    func handleSelectionEditAction(_ action: AISelectionEditAction) {
+        guard let selection = validEditorSelection() else {
+            errorMessage = "请先在编辑器中选中要修改的文字。"
+            return
+        }
+        if action == .custom {
+            selectionEditRequest = SelectionEditRequest(selection: selection)
+        } else if let instruction = action.instruction {
+            proposeSelectionEdit(instruction: instruction, selection: selection)
+        }
+    }
+
+    func requestCustomSelectionEdit() {
+        handleSelectionEditAction(.custom)
+    }
+
+    func proposeSelectionEdit(
+        instruction: String,
+        selection: EditorTextSelection
+    ) {
+        guard let document = selectedDocument,
+              selection.documentID == document.id,
+              validEditorSelection(selection) != nil,
+              !isGenerating else { return }
+        let originalText = editorText
+        let selectionLineRange = Self.lineRange(
+            for: selection.range,
+            in: originalText
+        )
+        let context = Self.surroundingContext(
+            in: originalText,
+            selection: selection.range
+        )
+        let query = "\(instruction)\n\(selection.text)"
+        let documents = documents
+        let config = configuration
+        let service = knowledgeBase
+        isGenerating = true
+        retrievalStatus = "正在理解选区并判断所需上下文…"
+
+        Task {
+            let chunks = await Task.detached(priority: .userInitiated) {
+                service.retrieve(
+                    query: query,
+                    documents: documents,
+                    currentDocument: document,
+                    scope: .library,
+                    limit: 5
+                )
+            }.value
+            retrievalStatus = chunks.isEmpty
+                ? "未使用知识库资料"
+                : "AI 已自行筛选 \(Set(chunks.map(\.filePath)).count) 篇相关资料"
+            do {
+                let application = try await ai.proposeSelectionEdit(
+                    instruction: instruction,
+                    currentText: originalText,
+                    selectedText: selection.text,
+                    surroundingContext: context,
+                    sources: chunks,
+                    configuration: config
+                )
+                let outsideEdits = application.edits.filter {
+                    !Self.contains(selection.range, range: $0.range)
+                }
+                let reasons = outsideEdits.compactMap(\.reason)
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                if selectedDocument?.relativePath == document.relativePath {
+                    editProposal = EditProposal(
+                        documentPath: document.relativePath,
+                        original: originalText,
+                        replacement: application.replacement,
+                        instruction: instruction,
+                        selectionLineRange: selectionLineRange,
+                        selectionRange: selection.range,
+                        outsideSelectionReason: reasons.isEmpty && !outsideEdits.isEmpty
+                            ? "为保证上下文衔接，AI 建议同时调整这部分。"
+                            : reasons.joined(separator: "；")
+                    )
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isGenerating = false
         }
     }
 
     @discardableResult
-    func saveNow() -> Bool {
+    func saveNow(ignoringExternalConflict: Bool = false) -> Bool {
         guard let document = selectedDocument, editorText != loadedText else { return true }
+        if !ignoringExternalConflict,
+           externalConflict?.document.id == document.id {
+            saveState = .failed("等待处理外部修改")
+            return false
+        }
         do {
             try knowledgeBase.write(editorText, to: document)
             loadedText = editorText
@@ -338,6 +494,7 @@ final class AppStore {
                     modifiedAt: .now,
                     size: newSize
                 )
+                refreshDerivedLibraryState()
             }
             return true
         } catch {
@@ -401,6 +558,119 @@ final class AppStore {
         }
     }
 
+    func move(_ document: NoteDocument, toFolder folder: String) {
+        guard let root = libraryURL, document.folder != folder else { return }
+        do {
+            let wasSelected = selectedDocument?.id == document.id
+            if wasSelected, !flushSave() { return }
+            let destination = try knowledgeBase.move(
+                document,
+                toFolder: folder,
+                root: root
+            )
+            let newRelativePath = relativePath(for: destination)
+            migrateDocumentState(
+                from: document.relativePath,
+                to: newRelativePath,
+                updateSelection: wasSelected
+            )
+            do {
+                try knowledgeBase.migrateRevisions(
+                    from: document.relativePath,
+                    to: newRelativePath
+                )
+            } catch {
+                errorMessage = "文稿已移动，但历史版本迁移失败：\(error.localizedDescription)"
+            }
+            if wasSelected {
+                clearDocumentSelection()
+            }
+            Task { await refreshLibrary(selecting: wasSelected ? newRelativePath : nil) }
+        } catch {
+            errorMessage = "移动文稿失败：\(error.localizedDescription)"
+        }
+    }
+
+    func renameFolder(_ folder: String, to name: String) {
+        guard let root = libraryURL, !folder.isEmpty else { return }
+        let affectedDocuments = documents.filter {
+            $0.folder == folder || $0.folder.hasPrefix(folder + "/")
+        }
+        let selectedPath = selectedDocument?.relativePath
+        let selectedIsAffected = selectedPath.map {
+            $0.hasPrefix(folder + "/")
+        } ?? false
+
+        do {
+            if selectedIsAffected, !flushSave() { return }
+            let destination = try knowledgeBase.renameFolder(
+                root: root,
+                relativePath: folder,
+                to: name
+            )
+            let newFolder = relativePath(for: destination)
+            guard newFolder != folder else { return }
+
+            var migratedSelection: String?
+            for document in affectedDocuments {
+                let suffix = String(document.relativePath.dropFirst(folder.count))
+                let newPath = newFolder + suffix
+                let isSelected = document.relativePath == selectedPath
+                migrateDocumentState(
+                    from: document.relativePath,
+                    to: newPath,
+                    updateSelection: isSelected
+                )
+                try? knowledgeBase.migrateRevisions(
+                    from: document.relativePath,
+                    to: newPath
+                )
+                if isSelected {
+                    migratedSelection = newPath
+                }
+            }
+            if selectedIsAffected {
+                clearDocumentSelection()
+            }
+            Task { await refreshLibrary(selecting: migratedSelection) }
+        } catch {
+            errorMessage = "重命名文件夹失败：\(error.localizedDescription)"
+        }
+    }
+
+    func deleteFolder(_ folder: String) {
+        guard let root = libraryURL, !folder.isEmpty else { return }
+        let affectedPaths = documents
+            .filter { $0.folder == folder || $0.folder.hasPrefix(folder + "/") }
+            .map(\.relativePath)
+        let selectedIsAffected = selectedDocument.map {
+            affectedPaths.contains($0.relativePath)
+        } ?? false
+
+        do {
+            if selectedIsAffected, !flushSave() { return }
+            try knowledgeBase.trashFolder(root: root, relativePath: folder)
+            favorites.subtract(affectedPaths)
+            defaults.set(Array(favorites), forKey: Keys.favorites)
+            for path in affectedPaths {
+                chats[path] = nil
+            }
+            openDocumentPaths.removeAll { affectedPaths.contains($0) }
+            persistOpenDocuments()
+            if let comparisonDocumentPath,
+               affectedPaths.contains(comparisonDocumentPath) {
+                setComparisonDocument(nil)
+            }
+            persistChats()
+            if selectedIsAffected {
+                clearDocumentSelection()
+            }
+            Task { await refreshLibrary() }
+        } catch {
+            errorMessage = "删除文件夹失败：\(error.localizedDescription)"
+        }
+    }
+
     func delete(_ document: NoteDocument) {
         do {
             if selectedDocument == document, !flushSave() { return }
@@ -410,6 +680,11 @@ final class AppStore {
                 selectedDocument = nil
                 replaceEditorText("")
                 loadedText = ""
+            }
+            openDocumentPaths.removeAll { $0 == document.relativePath }
+            persistOpenDocuments()
+            if comparisonDocumentPath == document.relativePath {
+                setComparisonDocument(nil)
             }
             chats[document.relativePath] = nil
             persistChats()
@@ -426,6 +701,7 @@ final class AppStore {
             favorites.insert(document.relativePath)
         }
         defaults.set(Array(favorites), forKey: Keys.favorites)
+        refreshDerivedLibraryState()
     }
 
     func performSearch() {
@@ -436,11 +712,12 @@ final class AppStore {
             return
         }
         let documents = documents
+        let service = knowledgeBase
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(180))
             guard !Task.isCancelled else { return }
             let results = await Task.detached(priority: .userInitiated) {
-                KnowledgeBaseService().search(query: query, documents: documents)
+                service.search(query: query, documents: documents)
             }.value
             guard !Task.isCancelled,
                   searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == query
@@ -461,51 +738,117 @@ final class AppStore {
         retrievalStatus = "正在搜索知识库…"
 
         let currentText = editorText
+        let currentSelection = validEditorSelection()
         let history = chats[key] ?? []
         let config = configuration
         let scope = retrievalScope
         let allDocuments = documents
+        let service = knowledgeBase
+        let assistantMessageID = UUID()
 
-        Task {
+        generationTask = Task {
             let chunks = await Task.detached {
-                KnowledgeBaseService().retrieve(
+                service.retrieve(
                     query: question,
                     documents: allDocuments,
                     currentDocument: document,
                     scope: scope
                 )
             }.value
+            guard !Task.isCancelled else {
+                isGenerating = false
+                retrievalStatus = "已停止生成"
+                return
+            }
             retrievalStatus = "搜索了 \(Set(chunks.map(\.filePath)).count) 篇笔记，引用了 \(chunks.count) 个片段"
+            let currentContext = Self.answerContext(
+                question: question,
+                document: document,
+                text: currentText,
+                selection: currentSelection
+            )
+            var streamedText = ""
+            var didCreateAssistantMessage = false
             do {
-                let response = try await ai.answer(
+                let stream = ai.answerStream(
                     question: question,
-                    currentText: currentText,
+                    currentContext: currentContext,
                     history: history,
                     sources: chunks,
                     configuration: config
                 )
-                let (displayText, extractedEdit) = Self.extractEdit(from: response.text)
-                chats[key, default: []].append(ChatMessage(
-                    role: .assistant,
-                    text: displayText,
-                    sources: response.sources,
-                    isGeneralKnowledge: response.usedGeneralKnowledge,
-                    usage: response.usage,
-                    cost: response.cost
-                ))
-                persistChats()
-                if let editText = extractedEdit {
-                    if selectedDocument?.relativePath == key {
-                        editProposal = EditProposal(
-                            documentPath: key,
-                            original: currentText,
-                            replacement: editText,
-                            instruction: question
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    switch event {
+                    case .delta(let delta):
+                        streamedText += delta
+                        if !didCreateAssistantMessage {
+                            chats[key, default: []].append(ChatMessage(
+                                id: assistantMessageID,
+                                role: .assistant,
+                                text: streamedText,
+                                sources: chunks
+                            ))
+                            didCreateAssistantMessage = true
+                        } else {
+                            updateAssistantMessage(
+                                id: assistantMessageID,
+                                documentPath: key,
+                                text: streamedText,
+                                sources: chunks
+                            )
+                        }
+                    case .finished(let response):
+                        let (displayText, extractedEdit) = try AIEditPatchProcessor.extractFromChat(
+                            response.text,
+                            original: currentText
                         )
+                        if didCreateAssistantMessage {
+                            updateAssistantMessage(
+                                id: assistantMessageID,
+                                documentPath: key,
+                                text: displayText,
+                                sources: response.sources,
+                                isGeneralKnowledge: response.usedGeneralKnowledge,
+                                usage: response.usage,
+                                cost: response.cost
+                            )
+                        } else {
+                            chats[key, default: []].append(ChatMessage(
+                                id: assistantMessageID,
+                                role: .assistant,
+                                text: displayText,
+                                sources: response.sources,
+                                isGeneralKnowledge: response.usedGeneralKnowledge,
+                                usage: response.usage,
+                                cost: response.cost
+                            ))
+                        }
+                        persistChats()
+                        if let editText = extractedEdit {
+                            if selectedDocument?.relativePath == key {
+                                editProposal = EditProposal(
+                                    documentPath: key,
+                                    original: currentText,
+                                    replacement: editText,
+                                    instruction: question
+                                )
+                            }
+                        }
                     }
                 }
                 if provider == .deepSeek {
                     await refreshAccountBalance(force: true)
+                }
+            } catch is CancellationError {
+                retrievalStatus = "已停止生成"
+                if didCreateAssistantMessage {
+                    updateAssistantMessage(
+                        id: assistantMessageID,
+                        documentPath: key,
+                        text: streamedText.isEmpty ? "已停止生成。" : streamedText
+                    )
+                    persistChats()
                 }
             } catch {
                 chats[key, default: []].append(ChatMessage(
@@ -515,7 +858,15 @@ final class AppStore {
                 persistChats()
             }
             isGenerating = false
+            generationTask = nil
         }
+    }
+
+    func cancelGeneration() {
+        generationTask?.cancel()
+        generationTask = nil
+        isGenerating = false
+        retrievalStatus = "已停止生成"
     }
 
     func clearCurrentChat() {
@@ -552,7 +903,7 @@ final class AppStore {
         }
     }
 
-    func applyProposal() {
+    func applyProposal(replacement: String? = nil) {
         guard let proposal = editProposal, let document = selectedDocument else { return }
         guard proposal.canApply(
             to: document.relativePath,
@@ -561,9 +912,19 @@ final class AppStore {
             errorMessage = "生成建议后文稿已经发生变化。为避免覆盖新内容，请重新生成修改建议。"
             return
         }
+        let finalReplacement = replacement ?? proposal.replacement
         do {
             _ = try knowledgeBase.createSnapshot(text: editorText, document: document)
-            replaceEditorText(proposal.replacement)
+            replaceEditorText(finalReplacement)
+            if proposal.selectionRange != nil {
+                editorNavigationRequest = EditorNavigationRequest(
+                    documentID: document.id,
+                    selectionRange: Self.changedRange(
+                        original: proposal.original,
+                        replacement: finalReplacement
+                    )
+                )
+            }
         } catch {
             errorMessage = "应用修改失败：\(error.localizedDescription)"
             return
@@ -575,20 +936,32 @@ final class AppStore {
         revisions = knowledgeBase.revisions(for: document)
     }
 
-    func createManualSnapshot() {
+    func createManualSnapshot(name: String? = nil) {
         guard let document = selectedDocument else { return }
         do {
-            _ = try knowledgeBase.createSnapshot(text: editorText, document: document)
+            _ = try knowledgeBase.createSnapshot(
+                text: editorText,
+                document: document,
+                name: name
+            )
             revisions = knowledgeBase.revisions(for: document)
         } catch {
             errorMessage = "创建版本失败：\(error.localizedDescription)"
         }
     }
 
+    func revisionText(_ revision: Revision) -> String {
+        (try? knowledgeBase.revisionText(revision)) ?? ""
+    }
+
     func restore(_ revision: Revision) {
         guard let document = selectedDocument else { return }
         do {
-            _ = try knowledgeBase.createSnapshot(text: editorText, document: document)
+            _ = try knowledgeBase.createSnapshot(
+                text: editorText,
+                document: document,
+                name: "恢复前自动备份"
+            )
             replaceEditorText(try String(contentsOf: revision.url, encoding: .utf8))
             saveNow()
             revisions = knowledgeBase.revisions(for: document)
@@ -600,11 +973,91 @@ final class AppStore {
     func openSource(_ source: RetrievedChunk) {
         if let document = documents.first(where: { $0.relativePath == source.filePath }) {
             select(document)
+            isPreviewMode = false
+            editorNavigationRequest = EditorNavigationRequest(
+                documentID: document.id,
+                line: source.line
+            )
         }
     }
 
     func revealInFinder(_ document: NoteDocument) {
         NSWorkspace.shared.activateFileViewerSelecting([document.url])
+    }
+
+    func closeDocumentTab(_ document: NoteDocument) {
+        let closingSelectedDocument = selectedDocument?.id == document.id
+        if closingSelectedDocument, !flushSave() { return }
+
+        let closingIndex = openDocumentPaths.firstIndex(of: document.relativePath) ?? 0
+        openDocumentPaths.removeAll { $0 == document.relativePath }
+        persistOpenDocuments()
+
+        if comparisonDocumentPath == document.relativePath {
+            comparisonDocumentPath = nil
+            comparisonText = ""
+        }
+
+        guard closingSelectedDocument else { return }
+        let remaining = openDocuments
+        if !remaining.isEmpty {
+            let nextIndex = min(closingIndex, remaining.count - 1)
+            selectedDocument = nil
+            select(remaining[nextIndex])
+        } else {
+            clearDocumentSelection()
+            isComparisonVisible = false
+            defaults.set(false, forKey: Keys.comparisonVisible)
+        }
+    }
+
+    func toggleComparison() {
+        if isComparisonVisible {
+            isComparisonVisible = false
+            defaults.set(false, forKey: Keys.comparisonVisible)
+            return
+        }
+        guard !comparisonCandidates.isEmpty else {
+            errorMessage = "知识库里需要至少两篇文稿才能分屏对照。"
+            return
+        }
+        if comparisonDocument == nil || comparisonDocument?.id == selectedDocument?.id {
+            let preferred = openDocuments.first {
+                $0.id != selectedDocument?.id
+            } ?? comparisonCandidates[0]
+            setComparisonDocument(preferred.relativePath)
+        } else {
+            reloadComparisonDocument()
+        }
+        isComparisonVisible = true
+        defaults.set(true, forKey: Keys.comparisonVisible)
+    }
+
+    func setComparisonDocument(_ relativePath: String?) {
+        guard let relativePath,
+              relativePath != selectedDocument?.relativePath,
+              documents.contains(where: { $0.relativePath == relativePath }) else {
+            comparisonDocumentPath = nil
+            comparisonText = ""
+            defaults.removeObject(forKey: Keys.comparisonDocumentPath)
+            return
+        }
+        comparisonDocumentPath = relativePath
+        defaults.set(relativePath, forKey: Keys.comparisonDocumentPath)
+        reloadComparisonDocument()
+    }
+
+    func exportCurrentDocument(as format: DocumentExportFormat) {
+        guard let document = selectedDocument, flushSave() else { return }
+        do {
+            _ = try documentExporter.presentExport(
+                title: document.title,
+                markdown: editorText,
+                format: format
+            )
+        } catch {
+            errorMessage = "导出 \(format.displayName) 失败：\(error.localizedDescription)"
+        }
     }
 
     func toggleAssistant() {
@@ -615,6 +1068,133 @@ final class AppStore {
     func toggleSidebar() {
         isSidebarVisible.toggle()
         defaults.set(isSidebarVisible, forKey: Keys.sidebarVisible)
+    }
+
+    func showDocumentFind() {
+        guard selectedDocument != nil else { return }
+        isPreviewMode = false
+        isDocumentFindVisible = true
+    }
+
+    func hideDocumentFind() {
+        isDocumentFindVisible = false
+        documentFindOptions.query = ""
+        documentFindResult = DocumentFindResult()
+        documentFindNavigationRequest = nil
+    }
+
+    func findNext() {
+        guard selectedDocument != nil else { return }
+        isPreviewMode = false
+        isDocumentFindVisible = true
+        documentFindNavigationRequest = DocumentFindNavigationRequest(
+            direction: .next
+        )
+    }
+
+    func findPrevious() {
+        guard selectedDocument != nil else { return }
+        isPreviewMode = false
+        isDocumentFindVisible = true
+        documentFindNavigationRequest = DocumentFindNavigationRequest(
+            direction: .previous
+        )
+    }
+
+    func handleDocumentFindCommand(_ command: DocumentFindCommand) {
+        switch command {
+        case .show:
+            showDocumentFind()
+        case .previous:
+            findPrevious()
+        case .next:
+            findNext()
+        }
+    }
+
+    func updateDocumentFindResult(_ result: DocumentFindResult) {
+        guard documentFindResult != result else { return }
+        documentFindResult = result
+    }
+
+    private func updateAssistantMessage(
+        id: UUID,
+        documentPath: String,
+        text: String,
+        sources: [RetrievedChunk]? = nil,
+        isGeneralKnowledge: Bool? = nil,
+        usage: AIUsage? = nil,
+        cost: AIUsageCost? = nil
+    ) {
+        guard let index = chats[documentPath]?.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let old = chats[documentPath]?[index]
+        chats[documentPath]?[index] = ChatMessage(
+            id: id,
+            role: .assistant,
+            text: text,
+            createdAt: old?.createdAt ?? .now,
+            sources: sources ?? old?.sources ?? [],
+            isGeneralKnowledge: isGeneralKnowledge ?? old?.isGeneralKnowledge ?? false,
+            usage: usage ?? old?.usage,
+            cost: cost ?? old?.cost
+        )
+    }
+
+    private static func answerContext(
+        question: String,
+        document: NoteDocument,
+        text: String,
+        selection: EditorTextSelection?
+    ) -> String {
+        let limit = 12_000
+        guard text.utf16.count > limit else { return text }
+
+        let nsText = text as NSString
+        var sections: [String] = []
+        sections.append("文稿：\(document.relativePath)")
+        sections.append("[开头]\n\(String(text.prefix(2_200)))")
+
+        if let selection, !selection.isEmpty {
+            sections.append("[当前选区]\n\(selection.text)")
+        }
+
+        let queryTerms = Set(SearchTokenization.tokenize(question))
+        let lines = text.components(separatedBy: .newlines)
+        let scoredLines = lines.enumerated().compactMap { index, line -> (Int, Double)? in
+            let terms = Set(SearchTokenization.tokenize(line))
+            let score = Double(queryTerms.intersection(terms).count)
+            return score > 0 ? (index, score) : nil
+        }
+        .sorted {
+            if $0.1 == $1.1 { return $0.0 < $1.0 }
+            return $0.1 > $1.1
+        }
+        .prefix(8)
+
+        var usedRanges: [Range<Int>] = []
+        for (index, _) in scoredLines {
+            let range = max(0, index - 2)..<min(lines.count, index + 3)
+            guard !usedRanges.contains(where: { rangesOverlap($0, range) }) else {
+                continue
+            }
+            usedRanges.append(range)
+            let snippet = lines[range].joined(separator: "\n")
+            sections.append("[相关片段 · 第 \(range.lowerBound + 1) 行]\n\(snippet)")
+        }
+
+        let tailStart = max(0, nsText.length - 1_600)
+        let tailRange = nsText.rangeOfComposedCharacterSequences(
+            for: NSRange(location: tailStart, length: nsText.length - tailStart)
+        )
+        sections.append("[结尾]\n\(nsText.substring(with: tailRange))")
+
+        return sections.joined(separator: "\n\n---\n\n")
+    }
+
+    private static func rangesOverlap(_ lhs: Range<Int>, _ rhs: Range<Int>) -> Bool {
+        lhs.lowerBound < rhs.upperBound && rhs.lowerBound < lhs.upperBound
     }
 
     private var configuration: AIConfiguration {
@@ -633,23 +1213,339 @@ final class AppStore {
             .filter { !$0.isEmpty }
     }
 
+    func keepLocalVersionAfterConflict() {
+        guard let conflict = externalConflict,
+              selectedDocument?.id == conflict.document.id else { return }
+        do {
+            if let diskText = conflict.diskText {
+                _ = try knowledgeBase.createSnapshot(
+                    text: diskText,
+                    document: conflict.document,
+                    name: "外部修改（冲突备份）"
+                )
+            }
+            try knowledgeBase.write(editorText, to: conflict.document)
+            loadedText = editorText
+            externalConflict = nil
+            saveState = .saved(.now)
+            revisions = knowledgeBase.revisions(for: conflict.document)
+            Task { await refreshLibrary(selecting: conflict.document.relativePath) }
+        } catch {
+            errorMessage = "保留本地版本失败：\(error.localizedDescription)"
+        }
+    }
+
+    func loadExternalVersionAfterConflict() {
+        guard let conflict = externalConflict,
+              let diskText = conflict.diskText,
+              selectedDocument?.id == conflict.document.id else { return }
+        do {
+            _ = try knowledgeBase.createSnapshot(
+                text: editorText,
+                document: conflict.document,
+                name: "冲突前的本地版本"
+            )
+            replaceEditorText(diskText)
+            loadedText = diskText
+            externalConflict = nil
+            saveState = .saved(.now)
+            revisions = knowledgeBase.revisions(for: conflict.document)
+            Task { await refreshLibrary(selecting: conflict.document.relativePath) }
+        } catch {
+            errorMessage = "载入外部版本失败：\(error.localizedDescription)"
+        }
+    }
+
+    func discardLocalVersionAfterExternalRemoval() {
+        guard externalConflict?.fileWasRemoved == true else { return }
+        externalConflict = nil
+        clearDocumentSelection()
+        Task { await refreshLibrary() }
+    }
+
     @discardableResult
     private func flushSave() -> Bool {
         saveTask?.cancel()
         return saveNow()
     }
 
+    private func refreshDerivedLibraryState() {
+        documentByPath = Dictionary(
+            uniqueKeysWithValues: documents.map { ($0.relativePath, $0) }
+        )
+        recentDocuments = Array(
+            documents.sorted { $0.modifiedAt > $1.modifiedAt }.prefix(8)
+        )
+        favoriteDocuments = documents.filter {
+            favorites.contains($0.relativePath)
+        }
+
+        let groups = Dictionary(grouping: documents, by: \.folder)
+        let folderNames = Set(folders)
+            .union(groups.keys)
+            .union([""])
+        folderGroups = folderNames.map {
+            LibraryFolderGroup(name: $0, documents: groups[$0] ?? [])
+        }.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
     private func clearDocumentSelection() {
         selectedDocument = nil
+        editorSelection = nil
+        hideDocumentFind()
+        wordCountTask?.cancel()
+        documentWordCount = 0
         replaceEditorText("")
         loadedText = ""
         revisions = []
         editProposal = nil
+        externalConflict = nil
+    }
+
+    private func scheduleAutosave() {
+        saveState = .saving
+        guard let document = selectedDocument else { return }
+        let text = editorText
+        saveTask = Task {
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled else { return }
+            await autosave(text: text, document: document)
+        }
+    }
+
+    private func autosave(text: String, document: NoteDocument) async {
+        guard selectedDocument?.id == document.id else { return }
+        guard editorText == text else { return }
+        if externalConflict?.document.id == document.id {
+            saveState = .failed("等待处理外部修改")
+            return
+        }
+
+        do {
+            let newSize = try await writeInBackground(text, to: document)
+            guard selectedDocument?.id == document.id, editorText == text else { return }
+            loadedText = text
+            saveState = .saved(.now)
+            if let idx = documents.firstIndex(where: { $0.relativePath == document.relativePath }) {
+                documents[idx] = NoteDocument(
+                    url: document.url,
+                    relativePath: document.relativePath,
+                    modifiedAt: .now,
+                    size: newSize
+                )
+                refreshDerivedLibraryState()
+            }
+        } catch {
+            guard selectedDocument?.id == document.id, editorText == text else { return }
+            saveState = .failed(error.localizedDescription)
+            errorMessage = "保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func writeInBackground(
+        _ text: String,
+        to document: NoteDocument
+    ) async throws -> Int {
+        let service = knowledgeBase
+        return try await Task.detached(priority: .utility) {
+            try service.write(text, to: document)
+            return (try? document.url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+                ?? document.size
+        }.value
+    }
+
+    private func scheduleWordCount(
+        for text: String,
+        delay: Duration = .milliseconds(280)
+    ) {
+        wordCountTask?.cancel()
+        wordCountTask = Task {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            let count = await Task.detached(priority: .utility) {
+                DocumentMetrics(markdown: text).count
+            }.value
+            guard !Task.isCancelled, editorText == text else { return }
+            documentWordCount = count
+        }
+    }
+
+    private func startWatchingLibrary() {
+        guard let libraryURL else {
+            libraryWatcher.stop()
+            return
+        }
+        libraryWatcher.start(
+            root: libraryURL,
+            excludedFolders: excludedFolders
+        ) { [weak self] changedURLs in
+            Task { @MainActor [weak self] in
+                self?.libraryDidChange(changedURLs)
+            }
+        }
+    }
+
+    private func libraryDidChange(_ changedURLs: [URL]) {
+        pendingLibraryChangeURLs.formUnion(changedURLs.map(\.standardizedFileURL))
+        externalRefreshTask?.cancel()
+        externalRefreshTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            let changedURLs = pendingLibraryChangeURLs
+            pendingLibraryChangeURLs.removeAll()
+            await reconcileExternalChanges(changedURLs: changedURLs)
+        }
+    }
+
+    private func reconcileExternalChanges(changedURLs: Set<URL>) async {
+        guard let document = selectedDocument else {
+            await refreshLibrary()
+            return
+        }
+
+        saveTask?.cancel()
+        if shouldCheckSelectedDocument(document, changedURLs: changedURLs) {
+            let fileExists = FileManager.default.fileExists(atPath: document.url.path)
+            let diskText: String?
+            do {
+                diskText = fileExists ? try knowledgeBase.read(document) : nil
+            } catch {
+                errorMessage = "无法读取外部修改：\(error.localizedDescription)"
+                return
+            }
+
+            switch ExternalFileReconciler.evaluate(
+                loadedText: loadedText,
+                editorText: editorText,
+                diskText: diskText
+            ) {
+            case .unchanged:
+                break
+            case .localChangesOnly:
+                scheduleAutosave()
+            case .synchronized(let text):
+                loadedText = text
+                saveState = .saved(.now)
+            case .reloadFromDisk(let text):
+                replaceEditorText(text)
+                loadedText = text
+                saveState = .saved(.now)
+            case .conflict(let text):
+                externalConflict = ExternalFileConflict(
+                    document: document,
+                    localText: editorText,
+                    diskText: text,
+                    detectedAt: .now
+                )
+                saveState = .failed("检测到外部修改")
+            case .removedCleanly:
+                break
+            case .removedWithLocalChanges:
+                externalConflict = ExternalFileConflict(
+                    document: document,
+                    localText: editorText,
+                    diskText: nil,
+                    detectedAt: .now
+                )
+                saveState = .failed("文稿已被外部移除")
+            }
+        }
+
+        await refreshLibrary(selecting: document.relativePath)
+    }
+
+    private func shouldCheckSelectedDocument(
+        _ document: NoteDocument,
+        changedURLs: Set<URL>
+    ) -> Bool {
+        guard !changedURLs.isEmpty else { return true }
+        let documentPath = document.url.standardizedFileURL.path
+        let parentPath = document.url.deletingLastPathComponent().standardizedFileURL.path
+        return changedURLs.contains { url in
+            let path = url.standardizedFileURL.path
+            return path == documentPath || path == parentPath
+        }
     }
 
     private func replaceEditorText(_ text: String) {
         editorText = text
         editorContentRevision &+= 1
+        scheduleWordCount(for: text, delay: .zero)
+    }
+
+    private func validEditorSelection(
+        _ candidate: EditorTextSelection? = nil
+    ) -> EditorTextSelection? {
+        guard let selection = candidate ?? editorSelection,
+              let document = selectedDocument,
+              selection.documentID == document.id,
+              selection.range.length > 0 else { return nil }
+        let source = editorText as NSString
+        guard NSMaxRange(selection.range) <= source.length,
+              source.substring(with: selection.range) == selection.text else {
+            return nil
+        }
+        return selection
+    }
+
+    private static func contains(_ container: NSRange, range: NSRange) -> Bool {
+        range.location >= container.location &&
+            NSMaxRange(range) <= NSMaxRange(container)
+    }
+
+    private static func lineRange(
+        for range: NSRange,
+        in text: String
+    ) -> Range<Int> {
+        let source = text as NSString
+        let start = min(range.location, source.length)
+        let end = min(max(start, NSMaxRange(range) - 1), max(0, source.length - 1))
+        let startLine = source.substring(to: start)
+            .reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
+        let endLine = source.substring(to: min(source.length, end + 1))
+            .reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
+        return startLine..<max(startLine + 1, endLine + 1)
+    }
+
+    private static func surroundingContext(
+        in text: String,
+        selection: NSRange
+    ) -> String {
+        let source = text as NSString
+        let padding = 2_400
+        let lower = max(0, selection.location - padding)
+        let upper = min(source.length, NSMaxRange(selection) + padding)
+        let safeRange = source.rangeOfComposedCharacterSequences(
+            for: NSRange(location: lower, length: upper - lower)
+        )
+        return source.substring(with: safeRange)
+    }
+
+    private static func changedRange(
+        original: String,
+        replacement: String
+    ) -> NSRange {
+        let old = original as NSString
+        let new = replacement as NSString
+        let sharedLimit = min(old.length, new.length)
+        var prefix = 0
+        while prefix < sharedLimit,
+              old.character(at: prefix) == new.character(at: prefix) {
+            prefix += 1
+        }
+        var suffix = 0
+        while suffix < old.length - prefix,
+              suffix < new.length - prefix,
+              old.character(at: old.length - suffix - 1) ==
+                new.character(at: new.length - suffix - 1) {
+            suffix += 1
+        }
+        return NSRange(
+            location: prefix,
+            length: max(0, new.length - prefix - suffix)
+        )
     }
 
     private func relativePath(for url: URL) -> String {
@@ -673,8 +1569,78 @@ final class AppStore {
             chats[newPath] = messages
             persistChats()
         }
+        if let index = openDocumentPaths.firstIndex(of: oldPath) {
+            openDocumentPaths[index] = newPath
+            persistOpenDocuments()
+        }
+        if comparisonDocumentPath == oldPath {
+            comparisonDocumentPath = newPath
+            defaults.set(newPath, forKey: Keys.comparisonDocumentPath)
+        }
         if updateSelection {
             defaults.set(newPath, forKey: Keys.selectedPath)
+        }
+    }
+
+    private func addOpenDocument(_ document: NoteDocument) {
+        guard !openDocumentPaths.contains(document.relativePath) else { return }
+        openDocumentPaths.append(document.relativePath)
+        persistOpenDocuments()
+    }
+
+    private func reconcileOpenDocuments() {
+        let validPaths = Set(documents.map(\.relativePath))
+        var seen: Set<String> = []
+        openDocumentPaths = openDocumentPaths.filter { path in
+            validPaths.contains(path) && seen.insert(path).inserted
+        }
+        persistOpenDocuments()
+    }
+
+    private func persistOpenDocuments() {
+        defaults.set(openDocumentPaths, forKey: Keys.openDocumentPaths)
+    }
+
+    private func resetWorkspaceNavigation() {
+        openDocumentPaths = []
+        comparisonDocumentPath = nil
+        comparisonText = ""
+        isComparisonVisible = false
+        defaults.removeObject(forKey: Keys.openDocumentPaths)
+        defaults.removeObject(forKey: Keys.comparisonDocumentPath)
+        defaults.set(false, forKey: Keys.comparisonVisible)
+    }
+
+    private func ensureComparisonDiffersFromSelection() {
+        guard comparisonDocumentPath == selectedDocument?.relativePath else {
+            reloadComparisonDocument()
+            return
+        }
+        if let alternative = openDocuments.first(where: {
+            $0.id != selectedDocument?.id
+        }) ?? comparisonCandidates.first {
+            setComparisonDocument(alternative.relativePath)
+        } else {
+            setComparisonDocument(nil)
+            isComparisonVisible = false
+            defaults.set(false, forKey: Keys.comparisonVisible)
+        }
+    }
+
+    private func reloadComparisonDocument() {
+        guard let document = comparisonDocument else {
+            comparisonText = ""
+            if comparisonDocumentPath != nil {
+                comparisonDocumentPath = nil
+                defaults.removeObject(forKey: Keys.comparisonDocumentPath)
+            }
+            return
+        }
+        do {
+            comparisonText = try knowledgeBase.read(document)
+        } catch {
+            comparisonText = ""
+            errorMessage = "无法打开对照文稿：\(error.localizedDescription)"
         }
     }
 
@@ -697,20 +1663,6 @@ final class AppStore {
         return .custom
     }
 
-    private static func extractEdit(from text: String) -> (display: String, edit: String?) {
-        let marker = "```edit\n"
-        let endMarker = "\n```"
-        guard let start = text.range(of: marker) else { return (text, nil) }
-        let after = text[start.upperBound...]
-        guard let end = after.range(of: endMarker) else { return (text, nil) }
-        let editContent = String(after[..<end.lowerBound])
-        let suffix = after[end.upperBound...]
-        var display = String(text[..<start.lowerBound]) + String(suffix)
-        display = display.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        if display.isEmpty { display = text }
-        return (display, editContent.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines))
-    }
-
     private enum Keys {
         static let libraryPath = "libraryPath"
         static let selectedPath = "selectedPath"
@@ -723,5 +1675,8 @@ final class AppStore {
         static let assistantVisible = "assistantVisible"
         static let sidebarVisible = "sidebarVisible"
         static let colorScheme = "colorScheme"
+        static let openDocumentPaths = "openDocumentPaths"
+        static let comparisonVisible = "comparisonVisible"
+        static let comparisonDocumentPath = "comparisonDocumentPath"
     }
 }
