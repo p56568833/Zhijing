@@ -143,9 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func open(_ urls: [URL]) {
-        guard let url = urls.first(where: {
-            ["md", "markdown", "txt"].contains($0.pathExtension.lowercased())
-        }) else { return }
+        guard let url = urls.first(where: NoteDocument.isSupportedFile) else { return }
         store?.openDocument(at: url)
     }
 }

@@ -15,7 +15,20 @@ struct NoteDocument: Identifiable, Hashable, Codable, Sendable {
         return value == "." ? "" : value
     }
     var kindIcon: String {
-        url.pathExtension.lowercased() == "md" ? "doc.richtext" : "doc.text"
+        switch url.pathExtension.lowercased() {
+        case "md", "markdown":
+            "doc.richtext"
+        case "srt":
+            "captions.bubble"
+        default:
+            "doc.text"
+        }
+    }
+
+    static let supportedFileExtensions: Set<String> = ["md", "markdown", "txt", "srt"]
+
+    static func isSupportedFile(_ url: URL) -> Bool {
+        supportedFileExtensions.contains(url.pathExtension.lowercased())
     }
 }
 

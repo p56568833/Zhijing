@@ -180,8 +180,8 @@ final class AppStore {
 
     func chooseLibrary() {
         let panel = NSOpenPanel()
-        panel.title = "选择 Markdown 知识库"
-        panel.message = "知境只会读取此文件夹中的 Markdown 与纯文本文件"
+        panel.title = "选择知识库"
+        panel.message = "知境会读取此文件夹中的 Markdown、纯文本与 SRT 字幕文件"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -259,9 +259,8 @@ final class AppStore {
 
     func openDocument(at url: URL) {
         let fileURL = url.standardizedFileURL
-        let supportedExtensions = ["md", "markdown", "txt"]
-        guard supportedExtensions.contains(fileURL.pathExtension.lowercased()) else {
-            errorMessage = "知境目前只能打开 Markdown 或纯文本文件。"
+        guard NoteDocument.isSupportedFile(fileURL) else {
+            errorMessage = "知境目前只能打开 Markdown、纯文本或 SRT 字幕文件。"
             return
         }
 

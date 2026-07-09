@@ -2,7 +2,7 @@ import Foundation
 
 struct KnowledgeBaseService: Sendable {
     private var fileManager: FileManager { .default }
-    private let allowedExtensions: Set<String> = ["md", "markdown", "txt"]
+    private let allowedExtensions = NoteDocument.supportedFileExtensions
     private let contentCache = ContentCache()
     private let searchIndex = KnowledgeSearchIndex()
     private let supportDirectoryOverride: URL?

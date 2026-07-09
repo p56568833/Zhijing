@@ -259,6 +259,25 @@ import PDFKit
     #expect(documents.map(\.title) == ["长扩展名"])
 }
 
+@Test func scanIncludesSRTSubtitles() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingSRT-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try """
+    1
+    00:00:01,000 --> 00:00:03,000
+    你好，知境。
+    """.write(
+        to: root.appending(path: "字幕.srt"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let documents = try KnowledgeBaseService().scan(root: root, excludedFolders: [])
+    #expect(documents.map(\.relativePath) == ["字幕.srt"])
+}
+
 @Test func foldersCanBeRenamedAndDocumentsMovedWithoutChangingContents() throws {
     let root = URL(filePath: NSTemporaryDirectory())
         .appending(path: "ZhijingMove-\(UUID().uuidString)", directoryHint: .isDirectory)

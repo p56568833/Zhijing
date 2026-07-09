@@ -73,6 +73,18 @@ cat >"$INFO_PLIST" <<PLIST
         <string>net.daringfireball.markdown</string>
       </array>
     </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>SRT 字幕文件</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.zhijing.srt</string>
+      </array>
+    </dict>
   </array>
   <key>UTImportedTypeDeclarations</key>
   <array>
@@ -94,6 +106,23 @@ cat >"$INFO_PLIST" <<PLIST
         </array>
         <key>public.mime-type</key>
         <string>text/markdown</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>com.zhijing.srt</string>
+      <key>UTTypeDescription</key>
+      <string>SRT 字幕文件</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.plain-text</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <string>srt</string>
+        <key>public.mime-type</key>
+        <string>application/x-subrip</string>
       </dict>
     </dict>
   </array>

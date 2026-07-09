@@ -26,6 +26,7 @@ final class LibraryWatcher: @unchecked Sendable {
         )
         let flags = FSEventStreamCreateFlags(
             kFSEventStreamCreateFlagFileEvents |
+            kFSEventStreamCreateFlagUseCFTypes |
             kFSEventStreamCreateFlagNoDefer
         )
         let paths = [root.path] as CFArray
