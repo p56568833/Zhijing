@@ -29,10 +29,26 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
     private var documents: [String: IndexedDocument] = [:]
     private var inverted: [String: Set<LineKey>] = [:]
 
-    func invalidate(_ relativePath: String) {
+    func invalidate(_ document: NoteDocument) {
         lock.lock()
         defer { lock.unlock() }
-        removeLocked(relativePath)
+        removeLocked(key(for: document))
+    }
+
+    func prepare(
+        documents candidates: [NoteDocument],
+        loadContent: (NoteDocument) -> String?
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        reconcileLocked(with: candidates)
+        updateLocked(documents: candidates, loadContent: loadContent)
+    }
+
+    func reconcile(documents candidates: [NoteDocument]) {
+        lock.lock()
+        defer { lock.unlock() }
+        reconcileLocked(with: candidates)
     }
 
     func search(
@@ -47,9 +63,9 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
         lock.lock()
         updateLocked(documents: candidates, loadContent: loadContent)
 
-        let allowedPaths = Set(candidates.map(\.relativePath))
+        let allowedPaths = Set(candidates.map(key(for:)))
         let candidateByPath = Dictionary(
-            uniqueKeysWithValues: candidates.map { ($0.relativePath, $0) }
+            uniqueKeysWithValues: candidates.map { (key(for: $0), $0) }
         )
         var scores: [LineKey: Double] = [:]
 
@@ -61,10 +77,10 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
             }
 
             for document in candidates {
-                guard let indexed = documents[document.relativePath] else { continue }
+                guard let indexed = documents[key(for: document)] else { continue }
                 if indexed.titleTerms.contains(term) ||
                     indexed.title.localizedStandardContains(term) {
-                    scores[LineKey(path: document.relativePath, line: 1), default: 0] += 2.4
+                    scores[LineKey(path: key(for: document), line: 1), default: 0] += 2.4
                 }
             }
         }
@@ -72,8 +88,9 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
         let hits = scores.compactMap { key, score -> SearchHit? in
             guard let document = candidateByPath[key.path],
                   let indexed = documents[key.path],
-                  let line = indexed.lines.first(where: { $0.number == key.line })
+                  indexed.lines.indices.contains(key.line - 1)
             else { return nil }
+            let line = indexed.lines[key.line - 1]
             return SearchHit(
                 document: document,
                 excerpt: line.excerpt,
@@ -103,7 +120,7 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
     ) -> String? {
         lock.lock()
         updateLocked(documents: [document], loadContent: loadContent)
-        let heading = documents[document.relativePath]?.headings
+        let heading = documents[key(for: document)]?.headings
             .last { $0.line <= line }?
             .title
         lock.unlock()
@@ -115,15 +132,16 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
         loadContent: (NoteDocument) -> String?
     ) {
         for document in candidates {
+            let documentKey = key(for: document)
             let signature = Signature(
                 modifiedAt: document.modifiedAt.timeIntervalSinceReferenceDate,
                 size: document.size
             )
-            if documents[document.relativePath]?.signature == signature {
+            if documents[documentKey]?.signature == signature {
                 continue
             }
             guard let content = loadContent(document) else {
-                removeLocked(document.relativePath)
+                removeLocked(documentKey)
                 continue
             }
             replaceLocked(
@@ -139,7 +157,8 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
         signature: Signature,
         content: String
     ) {
-        removeLocked(document.relativePath)
+        let documentKey = key(for: document)
+        removeLocked(documentKey)
 
         let rawLines = content.components(separatedBy: .newlines)
         let indexedLines = rawLines.enumerated().map { index, line in
@@ -159,7 +178,7 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
             let title = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
             return title.isEmpty ? nil : (index + 1, title)
         }
-        documents[document.relativePath] = IndexedDocument(
+        documents[documentKey] = IndexedDocument(
             signature: signature,
             title: document.title.lowercased(),
             titleTerms: Set(SearchTokenization.tokenize(document.title)),
@@ -168,17 +187,24 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
         )
 
         for line in indexedLines {
-            let key = LineKey(path: document.relativePath, line: line.number)
+            let key = LineKey(path: documentKey, line: line.number)
             for term in line.terms {
                 inverted[term, default: []].insert(key)
             }
         }
     }
 
-    private func removeLocked(_ relativePath: String) {
-        guard let indexed = documents.removeValue(forKey: relativePath) else { return }
+    private func reconcileLocked(with candidates: [NoteDocument]) {
+        let validKeys = Set(candidates.map(key(for:)))
+        for staleKey in Array(documents.keys) where !validKeys.contains(staleKey) {
+            removeLocked(staleKey)
+        }
+    }
+
+    private func removeLocked(_ documentKey: String) {
+        guard let indexed = documents.removeValue(forKey: documentKey) else { return }
         for line in indexed.lines {
-            let key = LineKey(path: relativePath, line: line.number)
+            let key = LineKey(path: documentKey, line: line.number)
             for term in line.terms {
                 inverted[term]?.remove(key)
                 if inverted[term]?.isEmpty == true {
@@ -186,6 +212,10 @@ final class KnowledgeSearchIndex: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    private func key(for document: NoteDocument) -> String {
+        document.url.standardizedFileURL.path
     }
 }
 

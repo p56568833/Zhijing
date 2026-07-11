@@ -97,6 +97,8 @@ final class AppStore {
     private let ai = AIService()
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
+    private let documentWriter = DocumentWriteCoordinator()
+    private let chatPersistence = ChatPersistenceService()
     private var generationTask: Task<Void, Never>?
     private var saveTask: Task<Void, Never>?
     private var wordCountTask: Task<Void, Never>?
@@ -155,7 +157,16 @@ final class AppStore {
         excludedFoldersText = defaults.string(forKey: Keys.excludedFolders) ?? ".git, node_modules"
         apiKey = KeychainStore.read(account: "openai-api-key")
         favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
-        chats = Self.loadChats(defaults: defaults)
+        let legacyChats = defaults.data(forKey: Keys.chats)
+        chats = chatPersistence.load(legacyData: legacyChats)
+        if legacyChats != nil {
+            do {
+                try chatPersistence.saveSynchronously(chats)
+                defaults.removeObject(forKey: Keys.chats)
+            } catch {
+                errorMessage = "迁移对话记录失败：\(error.localizedDescription)"
+            }
+        }
         isAssistantVisible = defaults.object(forKey: Keys.assistantVisible) as? Bool ?? true
         isSidebarVisible = defaults.object(forKey: Keys.sidebarVisible) as? Bool ?? true
         colorScheme = AppColorScheme(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
@@ -226,7 +237,7 @@ final class AppStore {
         defer { isTestingConnection = false }
 
         do {
-            try await ai.testConnection(configuration: configuration)
+            try await ai.testConnection(configuration: try resolvedConfiguration())
             connectionTestSucceeded = true
             if provider == .deepSeek {
                 await refreshAccountBalance(force: true)
@@ -258,24 +269,27 @@ final class AppStore {
     }
 
     func openDocument(at url: URL) {
-        let fileURL = url.standardizedFileURL
-        guard NoteDocument.isSupportedFile(fileURL) else {
-            errorMessage = "知境目前只能打开 Markdown、纯文本或 SRT 字幕文件。"
+        openDocuments(at: [url])
+    }
+
+    func openDocuments(at urls: [URL]) {
+        let request: DocumentOpenRequest
+        do {
+            guard let resolved = try DocumentOpenRequestResolver.resolve(
+                urls: urls,
+                currentLibrary: libraryURL
+            ) else {
+                errorMessage = "知境目前只能打开 Markdown、纯文本或 SRT 字幕文件。"
+                return
+            }
+            request = resolved
+        } catch {
+            errorMessage = error.localizedDescription
             return
         }
 
-        let currentRoot = libraryURL?.standardizedFileURL
-        let isInCurrentLibrary = currentRoot.map {
-            fileURL.path == $0.path || fileURL.path.hasPrefix($0.path + "/")
-        } ?? false
-        let root: URL
-        if isInCurrentLibrary, let currentRoot {
-            root = currentRoot
-        } else {
-            root = fileURL.deletingLastPathComponent()
-        }
-        let relativePath = String(fileURL.path.dropFirst(min(fileURL.path.count, root.path.count + 1)))
-
+        let root = request.root
+        let isInCurrentLibrary = libraryURL?.standardizedFileURL == root
         if !isInCurrentLibrary {
             guard flushSave() else { return }
             clearDocumentSelection()
@@ -283,10 +297,18 @@ final class AppStore {
             libraryURL = root
             defaults.set(root.path, forKey: Keys.libraryPath)
         }
-        Task { await refreshLibrary(selecting: relativePath) }
+        Task {
+            await refreshLibrary(
+                selecting: request.relativePaths.first,
+                opening: request.relativePaths
+            )
+        }
     }
 
-    func refreshLibrary(selecting relativePath: String? = nil) async {
+    func refreshLibrary(
+        selecting relativePath: String? = nil,
+        opening relativePaths: [String] = []
+    ) async {
         guard let libraryURL else { return }
         let refreshID = UUID()
         libraryRefreshID = refreshID
@@ -317,6 +339,11 @@ final class AppStore {
             documents = scanned.documents
             folders = scanned.folders
             refreshDerivedLibraryState()
+            let service = knowledgeBase
+            let indexedDocuments = scanned.documents
+            Task.detached(priority: .utility) {
+                service.prepareSearchIndex(documents: indexedDocuments)
+            }
             reconcileOpenDocuments()
             reloadComparisonDocument()
             startWatchingLibrary()
@@ -338,6 +365,11 @@ final class AppStore {
                 } else {
                     defaults.removeObject(forKey: Keys.selectedPath)
                     saveState = .idle
+                }
+            }
+            for path in relativePaths where path != selectedDocument?.relativePath {
+                if let document = documentByPath[path] {
+                    addOpenDocument(document)
                 }
             }
         } catch {
@@ -421,7 +453,13 @@ final class AppStore {
         )
         let query = "\(instruction)\n\(selection.text)"
         let documents = documents
-        let config = configuration
+        let config: AIConfiguration
+        do {
+            config = try resolvedConfiguration()
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
         let service = knowledgeBase
         isGenerating = true
         retrievalStatus = "正在理解选区并判断所需上下文…"
@@ -482,11 +520,14 @@ final class AppStore {
             return false
         }
         do {
-            try knowledgeBase.write(editorText, to: document)
+            let newSize = try documentWriter.writeSynchronously(
+                editorText,
+                to: document,
+                using: knowledgeBase
+            )
             loadedText = editorText
             saveState = .saved(.now)
             if let idx = documents.firstIndex(where: { $0.relativePath == document.relativePath }) {
-                let newSize = (try? document.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? document.size
                 documents[idx] = NoteDocument(
                     url: document.url,
                     relativePath: document.relativePath,
@@ -499,6 +540,17 @@ final class AppStore {
         } catch {
             saveState = .failed(error.localizedDescription)
             errorMessage = "保存失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func prepareForTermination() -> Bool {
+        guard saveNow() else { return false }
+        do {
+            try chatPersistence.saveSynchronously(chats)
+            return true
+        } catch {
+            errorMessage = "保存对话记录失败：\(error.localizedDescription)"
             return false
         }
     }
@@ -729,7 +781,15 @@ final class AppStore {
         guard let document = selectedDocument else { return }
         let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty, !isGenerating else { return }
+        let config: AIConfiguration
+        do {
+            config = try resolvedConfiguration()
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
         let key = document.relativePath
+        let history = chats[key] ?? []
         let userMessage = ChatMessage(role: .user, text: question)
         chats[key, default: []].append(userMessage)
         persistChats()
@@ -738,8 +798,6 @@ final class AppStore {
 
         let currentText = editorText
         let currentSelection = validEditorSelection()
-        let history = chats[key] ?? []
-        let config = configuration
         let scope = retrievalScope
         let allDocuments = documents
         let service = knowledgeBase
@@ -878,6 +936,13 @@ final class AppStore {
         guard let documentPath = selectedDocument?.relativePath,
               !editorText.isEmpty,
               editProposal == nil else { return }
+        let config: AIConfiguration
+        do {
+            config = try resolvedConfiguration()
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
         let originalText = editorText
         isGenerating = true
         Task {
@@ -885,7 +950,7 @@ final class AppStore {
                 let replacement = try await ai.proposeEdit(
                     instruction: instruction,
                     currentText: originalText,
-                    configuration: configuration
+                    configuration: config
                 )
                 if selectedDocument?.relativePath == documentPath {
                     editProposal = EditProposal(
@@ -1196,11 +1261,29 @@ final class AppStore {
         lhs.lowerBound < rhs.upperBound && rhs.lowerBound < lhs.upperBound
     }
 
-    private var configuration: AIConfiguration {
-        AIConfiguration(
+    private func resolvedConfiguration() throws -> AIConfiguration {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedKey.isEmpty {
+            // AIService returns a local retrieval response before it reads the endpoint.
+            return AIConfiguration(
+                apiKey: apiKey,
+                endpoint: URL(fileURLWithPath: "/"),
+                model: model,
+                provider: provider
+            )
+        }
+        guard let endpoint = AIEndpointResolver.chatCompletionsURL(from: endpoint) else {
+            throw NSError(
+                domain: "AIConfiguration",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "基础地址无效。请输入包含 http:// 或 https:// 的完整接口地址。"
+                ]
+            )
+        }
+        return AIConfiguration(
             apiKey: apiKey,
-            endpoint: AIEndpointResolver.chatCompletionsURL(from: endpoint)
-                ?? URL(string: "https://api.openai.com/v1/chat/completions")!,
+            endpoint: endpoint,
             model: model,
             provider: provider
         )
@@ -1223,7 +1306,11 @@ final class AppStore {
                     name: "外部修改（冲突备份）"
                 )
             }
-            try knowledgeBase.write(editorText, to: conflict.document)
+            _ = try documentWriter.writeSynchronously(
+                editorText,
+                to: conflict.document,
+                using: knowledgeBase
+            )
             loadedText = editorText
             externalConflict = nil
             saveState = .saved(.now)
@@ -1323,7 +1410,11 @@ final class AppStore {
         }
 
         do {
-            let newSize = try await writeInBackground(text, to: document)
+            let newSize = try await documentWriter.write(
+                text,
+                to: document,
+                using: knowledgeBase
+            )
             guard selectedDocument?.id == document.id, editorText == text else { return }
             loadedText = text
             saveState = .saved(.now)
@@ -1341,18 +1432,6 @@ final class AppStore {
             saveState = .failed(error.localizedDescription)
             errorMessage = "保存失败：\(error.localizedDescription)"
         }
-    }
-
-    private func writeInBackground(
-        _ text: String,
-        to document: NoteDocument
-    ) async throws -> Int {
-        let service = knowledgeBase
-        return try await Task.detached(priority: .utility) {
-            try service.write(text, to: document)
-            return (try? document.url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                ?? document.size
-        }.value
     }
 
     private func scheduleWordCount(
@@ -1644,15 +1723,8 @@ final class AppStore {
     }
 
     private func persistChats() {
-        guard let data = try? JSONEncoder().encode(chats) else { return }
-        defaults.set(data, forKey: Keys.chats)
-    }
-
-    private static func loadChats(defaults: UserDefaults) -> [String: [ChatMessage]] {
-        guard let data = defaults.data(forKey: Keys.chats),
-              let value = try? JSONDecoder().decode([String: [ChatMessage]].self, from: data)
-        else { return [:] }
-        return value
+        chatPersistence.save(chats)
+        defaults.removeObject(forKey: Keys.chats)
     }
 
     private static func inferProvider(from endpoint: String?) -> AIProviderPreset {

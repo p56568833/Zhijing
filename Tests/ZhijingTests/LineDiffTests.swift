@@ -187,6 +187,35 @@ import PDFKit
             from: "https://example.com/v1/chat/completions"
         )?.absoluteString == "https://example.com/v1/chat/completions"
     )
+    #expect(AIEndpointResolver.chatCompletionsURL(from: "not a URL") == nil)
+}
+
+@Test func documentOpenRequestKeepsEverySelectedFileInTheCurrentLibrary() throws {
+    let root = URL(filePath: "/tmp/ZhijingOpenLibrary", directoryHint: .isDirectory)
+    let resolved = try DocumentOpenRequestResolver.resolve(
+        urls: [
+            root.appending(path: "第一篇.md"),
+            root.appending(path: "资料/第二篇.txt"),
+            root.appending(path: "第一篇.md"),
+        ],
+        currentLibrary: root
+    )
+    let request = try #require(resolved)
+
+    #expect(request.root == root.standardizedFileURL)
+    #expect(request.relativePaths == ["第一篇.md", "资料/第二篇.txt"])
+}
+
+@Test func documentOpenRequestRejectsFilesFromDifferentExternalFolders() {
+    #expect(throws: DocumentOpenRequestError.self) {
+        try DocumentOpenRequestResolver.resolve(
+            urls: [
+                URL(filePath: "/tmp/ZhijingOne/第一篇.md"),
+                URL(filePath: "/tmp/ZhijingTwo/第二篇.md"),
+            ],
+            currentLibrary: nil
+        )
+    }
 }
 
 @Test func connectionTestRejectsMissingKeyBeforeNetworking() async {
@@ -242,6 +271,102 @@ import PDFKit
     let documents = try service.scan(root: root, excludedFolders: [])
     let hits = service.search(query: "检索", documents: documents)
     #expect(Set(hits.map(\.document.title)) == ["相关"])
+}
+
+@Test func searchReloadsContentAfterAnExternalFileChange() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingExternalSearch-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let noteURL = root.appending(path: "笔记.md")
+    try "旧关键词只在这里出现".write(to: noteURL, atomically: true, encoding: .utf8)
+    let service = KnowledgeBaseService()
+    let originalDocuments = try service.scan(root: root, excludedFolders: [])
+    #expect(!service.search(query: "旧关键词", documents: originalDocuments).isEmpty)
+
+    try "新的检索词已经写入外部版本，长度也不同。".write(
+        to: noteURL,
+        atomically: true,
+        encoding: .utf8
+    )
+    let refreshedDocuments = try service.scan(root: root, excludedFolders: [])
+    #expect(!service.search(query: "新的检索词", documents: refreshedDocuments).isEmpty)
+    #expect(service.search(query: "旧关键词", documents: refreshedDocuments).isEmpty)
+}
+
+@Test func searchCacheDoesNotLeakAcrossLibrariesWithMatchingFileSignatures() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingLibraries-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let firstLibrary = root.appending(path: "First", directoryHint: .isDirectory)
+    let secondLibrary = root.appending(path: "Second", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: firstLibrary, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondLibrary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let firstURL = firstLibrary.appending(path: "笔记.md")
+    let secondURL = secondLibrary.appending(path: "笔记.md")
+    try "甲库内容".write(to: firstURL, atomically: true, encoding: .utf8)
+    try "乙库内容".write(to: secondURL, atomically: true, encoding: .utf8)
+    let matchingDate = Date(timeIntervalSince1970: 1_700_000_000)
+    try FileManager.default.setAttributes([.modificationDate: matchingDate], ofItemAtPath: firstURL.path)
+    try FileManager.default.setAttributes([.modificationDate: matchingDate], ofItemAtPath: secondURL.path)
+
+    let service = KnowledgeBaseService()
+    let firstDocuments = try service.scan(root: firstLibrary, excludedFolders: [])
+    #expect(!service.search(query: "甲库", documents: firstDocuments).isEmpty)
+
+    let secondDocuments = try service.scan(root: secondLibrary, excludedFolders: [])
+    #expect(service.search(query: "甲库", documents: secondDocuments).isEmpty)
+    #expect(!service.search(query: "乙库", documents: secondDocuments).isEmpty)
+}
+
+@Test func currentQuestionAppearsOnlyOnceInAIRequestMessages() {
+    let question = "这次问题"
+    let history = [
+        ChatMessage(role: .user, text: "上一次问题"),
+        ChatMessage(role: .assistant, text: "上一次回答"),
+        ChatMessage(role: .user, text: question),
+    ]
+    let messages = AIService().answerMessages(
+        question: question,
+        currentContext: "正文",
+        history: history,
+        sources: []
+    )
+    #expect(messages.filter { $0["role"] == "user" && $0["content"] == question }.count == 1)
+}
+
+@Test func libraryWatcherFiltersExcludedFolderEvents() {
+    let root = "/tmp/ZhijingWatch"
+    #expect(LibraryWatcher.shouldInclude(
+        URL(filePath: root + "/文章.md"),
+        rootPath: root,
+        excludedFolders: [".git", "node_modules"]
+    ))
+    #expect(!LibraryWatcher.shouldInclude(
+        URL(filePath: root + "/node_modules/pkg/index.txt"),
+        rootPath: root,
+        excludedFolders: [".git", "node_modules"]
+    ))
+    #expect(!LibraryWatcher.shouldInclude(
+        URL(filePath: "/tmp/Other/文章.md"),
+        rootPath: root,
+        excludedFolders: [".git", "node_modules"]
+    ))
+}
+
+@Test func chatsPersistOutsideUserDefaultsAndKeepLatestSnapshot() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingChats-\(UUID().uuidString)", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let persistence = ChatPersistenceService(directoryOverride: root)
+    persistence.save(["文章.md": [ChatMessage(role: .user, text: "旧消息")]])
+    let latest = ["文章.md": [ChatMessage(role: .user, text: "新消息")]]
+    try persistence.saveSynchronously(latest)
+
+    let loaded = persistence.load()
+    #expect(loaded["文章.md"]?.map(\.text) == ["新消息"])
 }
 
 @Test func scanIncludesLongMarkdownExtension() throws {

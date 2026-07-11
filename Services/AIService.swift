@@ -398,7 +398,7 @@ struct AIService: Sendable {
         throw connectionError("为保护 API Key，公网接口必须使用 HTTPS；HTTP 仅允许本机地址。")
     }
 
-    private func answerMessages(
+    func answerMessages(
         question: String,
         currentContext: String,
         history: [ChatMessage],
@@ -429,7 +429,10 @@ struct AIService: Sendable {
         \(sourceText.isEmpty ? "未检索到相关资料。" : sourceText)
         """
         var messages: [[String: String]] = [["role": "system", "content": system]]
-        messages += history.suffix(8).map {
+        let priorHistory = history.last.map {
+            $0.role == .user && $0.text == question ? history.dropLast() : history[...]
+        } ?? history[...]
+        messages += priorHistory.suffix(8).map {
             ["role": $0.role == .user ? "user" : "assistant", "content": $0.text]
         }
         messages.append(["role": "user", "content": question])

@@ -32,6 +32,61 @@ struct NoteDocument: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
+struct DocumentOpenRequest: Equatable, Sendable {
+    let root: URL
+    let relativePaths: [String]
+}
+
+enum DocumentOpenRequestError: LocalizedError {
+    case multipleExternalFolders
+
+    var errorDescription: String? {
+        switch self {
+        case .multipleExternalFolders:
+            "一次只能打开同一文件夹中的文稿；若文件已在当前知识库内，则可以跨子文件夹同时打开。"
+        }
+    }
+}
+
+enum DocumentOpenRequestResolver {
+    static func resolve(
+        urls: [URL],
+        currentLibrary: URL?
+    ) throws -> DocumentOpenRequest? {
+        var seenPaths: Set<String> = []
+        let documents = urls.map(\.standardizedFileURL).filter {
+            NoteDocument.isSupportedFile($0) && seenPaths.insert($0.path).inserted
+        }
+        guard let first = documents.first else { return nil }
+
+        let currentRoot = currentLibrary?.standardizedFileURL
+        let root: URL
+        if let currentRoot, documents.allSatisfy({ isContained($0, in: currentRoot) }) {
+            root = currentRoot
+        } else {
+            let parent = first.deletingLastPathComponent().standardizedFileURL
+            guard documents.allSatisfy({
+                $0.deletingLastPathComponent().standardizedFileURL == parent
+            }) else {
+                throw DocumentOpenRequestError.multipleExternalFolders
+            }
+            root = parent
+        }
+
+        let rootPath = root.path
+        let relativePaths = documents.map { url in
+            String(url.path.dropFirst(rootPath.count + 1))
+        }
+        return DocumentOpenRequest(root: root, relativePaths: relativePaths)
+    }
+
+    private static func isContained(_ url: URL, in root: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let rootPath = root.standardizedFileURL.path
+        return path.hasPrefix(rootPath + "/")
+    }
+}
+
 struct SearchHit: Identifiable, Hashable, Sendable {
     let id = UUID()
     let document: NoteDocument

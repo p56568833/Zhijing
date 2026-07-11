@@ -79,8 +79,8 @@ struct KnowledgeBaseService: Sendable {
 
     func write(_ text: String, to document: NoteDocument) throws {
         try text.write(to: document.url, atomically: true, encoding: .utf8)
-        contentCache.set(document.relativePath, text)
-        searchIndex.invalidate(document.relativePath)
+        contentCache.set(document, text)
+        searchIndex.invalidate(document)
     }
 
     func createNote(root: URL, folder: String? = nil) throws -> URL {
@@ -118,8 +118,8 @@ struct KnowledgeBaseService: Sendable {
         }
         try ensureDestinationIsAvailable(destination)
         try fileManager.moveItem(at: document.url, to: destination)
-        contentCache.remove(document.relativePath)
-        searchIndex.invalidate(document.relativePath)
+        contentCache.remove(document)
+        searchIndex.invalidate(document)
         return destination
     }
 
@@ -143,8 +143,8 @@ struct KnowledgeBaseService: Sendable {
         }
         try ensureDestinationIsAvailable(destination)
         try fileManager.moveItem(at: document.url, to: destination)
-        contentCache.remove(document.relativePath)
-        searchIndex.invalidate(document.relativePath)
+        contentCache.remove(document)
+        searchIndex.invalidate(document)
         return destination
     }
 
@@ -180,8 +180,8 @@ struct KnowledgeBaseService: Sendable {
 
     func trash(_ document: NoteDocument) throws {
         try fileManager.trashItem(at: document.url, resultingItemURL: nil)
-        contentCache.remove(document.relativePath)
-        searchIndex.invalidate(document.relativePath)
+        contentCache.remove(document)
+        searchIndex.invalidate(document)
     }
 
     func search(
@@ -192,6 +192,8 @@ struct KnowledgeBaseService: Sendable {
     ) -> [SearchHit] {
         let terms = tokenize(query)
         guard !terms.isEmpty else { return [] }
+        contentCache.reconcile(documents)
+        searchIndex.reconcile(documents: documents)
         let candidates = currentFolder.map { folder in
             documents.filter { $0.folder == folder || $0.folder.hasPrefix(folder + "/") }
         } ?? documents
@@ -201,6 +203,13 @@ struct KnowledgeBaseService: Sendable {
             documents: candidates,
             limit: limit
         ) { document in
+            cachedOrRead(document)
+        }
+    }
+
+    func prepareSearchIndex(documents: [NoteDocument]) {
+        contentCache.reconcile(documents)
+        searchIndex.prepare(documents: documents) { document in
             cachedOrRead(document)
         }
     }
@@ -343,11 +352,11 @@ struct KnowledgeBaseService: Sendable {
     }
 
     private func cachedOrRead(_ document: NoteDocument) -> String? {
-        if let cached = contentCache.get(document.relativePath) {
+        if let cached = contentCache.get(document) {
             return cached
         }
         guard let content = try? read(document) else { return nil }
-        contentCache.set(document.relativePath, content)
+        contentCache.set(document, content)
         return content
     }
 
@@ -409,22 +418,55 @@ struct KnowledgeBaseService: Sendable {
     // MARK: - Content cache
 
     private final class ContentCache: @unchecked Sendable {
-        private var storage: [String: String] = [:]
+        private struct Entry {
+            let modifiedAt: TimeInterval
+            let size: Int
+            let text: String
+
+            init(document: NoteDocument, text: String) {
+                modifiedAt = document.modifiedAt.timeIntervalSinceReferenceDate
+                size = document.size
+                self.text = text
+            }
+
+            func matches(_ document: NoteDocument) -> Bool {
+                modifiedAt == document.modifiedAt.timeIntervalSinceReferenceDate &&
+                    size == document.size
+            }
+        }
+
+        private var storage: [String: Entry] = [:]
         private let lock = NSLock()
 
-        func get(_ key: String) -> String? {
+        func get(_ document: NoteDocument) -> String? {
             lock.lock(); defer { lock.unlock() }
-            return storage[key]
+            let key = Self.key(for: document)
+            guard let entry = storage[key] else { return nil }
+            guard entry.matches(document) else {
+                storage[key] = nil
+                return nil
+            }
+            return entry.text
         }
 
-        func set(_ key: String, _ value: String) {
+        func set(_ document: NoteDocument, _ value: String) {
             lock.lock(); defer { lock.unlock() }
-            storage[key] = value
+            storage[Self.key(for: document)] = Entry(document: document, text: value)
         }
 
-        func remove(_ key: String) {
+        func remove(_ document: NoteDocument) {
             lock.lock(); defer { lock.unlock() }
-            storage[key] = nil
+            storage[Self.key(for: document)] = nil
+        }
+
+        func reconcile(_ documents: [NoteDocument]) {
+            let validKeys = Set(documents.map(Self.key(for:)))
+            lock.lock(); defer { lock.unlock() }
+            storage = storage.filter { validKeys.contains($0.key) }
+        }
+
+        private static func key(for document: NoteDocument) -> String {
+            document.url.standardizedFileURL.path
         }
     }
 }

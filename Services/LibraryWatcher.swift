@@ -15,7 +15,20 @@ final class LibraryWatcher: @unchecked Sendable {
         onChange: @escaping @Sendable ([URL]) -> Void
     ) {
         stop()
-        self.onChange = onChange
+        let rootPath = root.standardizedFileURL.path
+        let exclusions = Set(excludedFolders)
+        self.onChange = { urls in
+            let filtered = urls.filter {
+                Self.shouldInclude(
+                    $0,
+                    rootPath: rootPath,
+                    excludedFolders: exclusions
+                )
+            }
+            if !filtered.isEmpty {
+                onChange(filtered)
+            }
+        }
 
         var context = FSEventStreamContext(
             version: 0,
@@ -68,5 +81,18 @@ final class LibraryWatcher: @unchecked Sendable {
             URL(filePath: $0).standardizedFileURL
         }
         watcher.onChange?(urls)
+    }
+
+    static func shouldInclude(
+        _ url: URL,
+        rootPath: String,
+        excludedFolders: Set<String>
+    ) -> Bool {
+        let path = url.standardizedFileURL.path
+        guard path == rootPath || path.hasPrefix(rootPath + "/") else { return false }
+        guard path != rootPath else { return true }
+        let relative = path.dropFirst(rootPath.count + 1)
+        let components = relative.split(separator: "/").map(String.init)
+        return components.allSatisfy { !excludedFolders.contains($0) }
     }
 }

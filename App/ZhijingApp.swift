@@ -138,13 +138,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard store?.saveNow() != false else { return .terminateCancel }
+        guard store?.prepareForTermination() != false else { return .terminateCancel }
         return .terminateNow
     }
 
     private func open(_ urls: [URL]) {
-        guard let url = urls.first(where: NoteDocument.isSupportedFile) else { return }
-        store?.openDocument(at: url)
+        store?.openDocuments(at: urls)
     }
 }
 

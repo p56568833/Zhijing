@@ -85,6 +85,18 @@ cat >"$INFO_PLIST" <<PLIST
         <string>com.zhijing.srt</string>
       </array>
     </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>纯文本文稿</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.zhijing.txt</string>
+      </array>
+    </dict>
   </array>
   <key>UTImportedTypeDeclarations</key>
   <array>
@@ -123,6 +135,23 @@ cat >"$INFO_PLIST" <<PLIST
         <string>srt</string>
         <key>public.mime-type</key>
         <string>application/x-subrip</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>com.zhijing.txt</string>
+      <key>UTTypeDescription</key>
+      <string>纯文本文稿</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.plain-text</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <string>txt</string>
+        <key>public.mime-type</key>
+        <string>text/plain</string>
       </dict>
     </dict>
   </array>
