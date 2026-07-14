@@ -56,6 +56,31 @@ import PDFKit
     )
 }
 
+@Test func inlineDiffPresentationKeepsContextAndPlacesChangesInDocumentOrder() throws {
+    let presentation = InlineDiffPresentation(diff: LineDiff(
+        original: "开头\n旧段落\n结尾",
+        replacement: "开头\n新段落\n结尾"
+    ))
+
+    #expect(presentation.text == "开头\n旧段落\n新段落\n结尾")
+    #expect(presentation.decorations.count == 2)
+    #expect(presentation.decorations.map(\.kind) == [.removed, .inserted])
+    let source = presentation.text as NSString
+    #expect(source.substring(with: presentation.decorations[0].range) == "旧段落")
+    #expect(source.substring(with: presentation.decorations[1].range) == "新段落")
+}
+
+@Test func inlineDiffPresentationPreservesUnchangedDocumentWithoutDecorations() {
+    let presentation = InlineDiffPresentation(diff: LineDiff(
+        original: "第一行\n\n最后一行\n",
+        replacement: "第一行\n\n最后一行\n"
+    ))
+
+    #expect(presentation.text == "第一行\n\n最后一行\n")
+    #expect(presentation.decorations.isEmpty)
+    #expect(presentation.firstChangeRange == nil)
+}
+
 @Test func aiEditPatchChangesOnlyReturnedPassages() throws {
     let original = """
     # 标题

@@ -119,3 +119,68 @@ struct LineDiff {
         return result
     }
 }
+
+enum InlineDiffLineKind: Equatable {
+    case unchanged
+    case removed
+    case inserted
+}
+
+struct InlineDiffDecoration: Equatable {
+    let range: NSRange
+    let kind: InlineDiffLineKind
+}
+
+struct InlineDiffPresentation {
+    let text: String
+    let decorations: [InlineDiffDecoration]
+
+    var firstChangeRange: NSRange? {
+        decorations.first?.range
+    }
+
+    init(diff: LineDiff) {
+        var rows: [(text: String, kind: InlineDiffLineKind)] = []
+        var originalCursor = 0
+
+        for hunk in diff.hunks {
+            if originalCursor < hunk.originalRange.lowerBound {
+                rows.append(contentsOf: diff.originalLines[
+                    originalCursor..<hunk.originalRange.lowerBound
+                ].map { ($0, .unchanged) })
+            }
+            rows.append(contentsOf: hunk.originalLines.map { ($0, .removed) })
+            rows.append(contentsOf: hunk.replacementLines.map { ($0, .inserted) })
+            originalCursor = hunk.originalRange.upperBound
+        }
+
+        if originalCursor < diff.originalLines.count {
+            rows.append(contentsOf: diff.originalLines[originalCursor...].map {
+                ($0, .unchanged)
+            })
+        }
+
+        var renderedText = ""
+        var renderedDecorations: [InlineDiffDecoration] = []
+        var utf16Location = 0
+
+        for (index, row) in rows.enumerated() {
+            if index > 0 {
+                renderedText.append("\n")
+                utf16Location += 1
+            }
+            let length = row.text.utf16.count
+            if row.kind != .unchanged {
+                renderedDecorations.append(InlineDiffDecoration(
+                    range: NSRange(location: utf16Location, length: length),
+                    kind: row.kind
+                ))
+            }
+            renderedText.append(row.text)
+            utf16Location += length
+        }
+
+        text = renderedText
+        decorations = renderedDecorations
+    }
+}

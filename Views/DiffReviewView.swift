@@ -4,7 +4,7 @@ struct DiffReviewView: View {
     let store: AppStore
     let proposal: EditProposal
     private let diff: LineDiff
-    @State private var acceptedHunkIDs: Set<LineDiffHunk.ID>
+    private let presentation: InlineDiffPresentation
 
     init(store: AppStore, proposal: EditProposal) {
         self.store = store
@@ -14,102 +14,56 @@ struct DiffReviewView: View {
             replacement: proposal.replacement
         )
         self.diff = diff
-        _acceptedHunkIDs = State(
-            initialValue: Set(diff.hunks.filter {
-                !Self.isOutsideSelection(
-                    hunk: $0,
-                    selectionLineRange: proposal.selectionLineRange
-                )
-            }.map(\.id))
-        )
+        presentation = InlineDiffPresentation(diff: diff)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 14) {
-                    ForEach(diff.hunks) { hunk in
-                        DiffHunkView(
-                            hunk: hunk,
-                            isOutsideSelection: isOutsideSelection(hunk),
-                            outsideReason: proposal.outsideSelectionReason,
-                            isAccepted: Binding(
-                                get: { acceptedHunkIDs.contains(hunk.id) },
-                                set: { accepted in
-                                    if accepted {
-                                        acceptedHunkIDs.insert(hunk.id)
-                                    } else {
-                                        acceptedHunkIDs.remove(hunk.id)
-                                    }
-                                }
-                            )
-                        )
-                    }
-                }
+        ZStack(alignment: .bottomTrailing) {
+            InlineDiffSourceEditor(
+                presentation: presentation,
+                proposalID: proposal.id
+            )
+            reviewActions
                 .padding(18)
-            }
-            Divider()
-            footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor))
     }
 
-    private func isOutsideSelection(_ hunk: LineDiffHunk) -> Bool {
-        Self.isOutsideSelection(
-            hunk: hunk,
-            selectionLineRange: proposal.selectionLineRange
-        )
-    }
-
-    private static func isOutsideSelection(
-        hunk: LineDiffHunk,
-        selectionLineRange: Range<Int>?
-    ) -> Bool {
-        guard let selectionLineRange else { return false }
-        if hunk.originalRange.isEmpty {
-            return !selectionLineRange.contains(hunk.originalRange.lowerBound)
-        }
-        return hunk.originalRange.lowerBound < selectionLineRange.lowerBound ||
-            hunk.originalRange.upperBound > selectionLineRange.upperBound
-    }
-
-    private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 3) {
-                Label(reviewTitle, systemImage: reviewIcon)
-                    .font(.title2.weight(.semibold))
-                Text(proposal.instruction)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+    private var reviewActions: some View {
+        HStack(spacing: 10) {
+            Label(reviewTitle, systemImage: reviewIcon)
+                .font(.callout.weight(.medium))
+            Text("−\(diff.removedOffsets.count)  +\(diff.insertedOffsets.count)")
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            Divider()
+                .frame(height: 20)
+            Button("不同意") {
+                store.cancelEditProposal()
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 6) {
-                Text("-\(diff.removedOffsets.count)  +\(diff.insertedOffsets.count)")
-                    .font(.system(.callout, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    Button("全部保留") {
-                        acceptedHunkIDs.removeAll()
-                    }
-                    Button("全部接受") {
-                        acceptedHunkIDs = Set(diff.hunks.map(\.id))
-                    }
-                }
-                .font(.caption)
-                .buttonStyle(.link)
+            .keyboardShortcut(.cancelAction)
+            Button("同意") {
+                store.applyProposal()
             }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
         }
-        .padding(18)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(.separator.opacity(0.7), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
+        .help(reviewHelp)
     }
 
     private var reviewTitle: String {
         switch proposal.source {
-        case .assistant: "审阅 AI 修改"
-        case .externalFile: "审阅外部文件修改"
+        case .assistant: "AI 修改"
+        case .externalFile: "外部修改"
         }
     }
 
@@ -120,169 +74,12 @@ struct DiffReviewView: View {
         }
     }
 
-    private var footer: some View {
-        HStack {
-            Label(footerMessage, systemImage: "clock.arrow.circlepath")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Spacer()
-            Text("已选择 \(acceptedHunkIDs.count) / \(diff.hunks.count) 段")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Button("取消") {
-                store.cancelEditProposal()
-            }
-            Button("同意所选修改") {
-                store.applyProposal(
-                    replacement: diff.applying(
-                        acceptedHunkIDs: acceptedHunkIDs
-                    )
-                )
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(acceptedHunkIDs.isEmpty)
-        }
-        .padding(14)
-    }
-
-    private var footerMessage: String {
+    private var reviewHelp: String {
         switch proposal.source {
         case .assistant:
-            "应用前会自动保存一个版本快照"
+            "红色为原文，绿色为 AI 修改；同意前会保存版本快照。"
         case .externalFile:
-            "外部修改已完成；取消时会保存外部版本后恢复原稿"
+            "红色为原文，绿色为外部修改；不同意时会保存外部版本后恢复原稿。"
         }
-    }
-}
-
-private struct DiffHunkView: View {
-    let hunk: LineDiffHunk
-    let isOutsideSelection: Bool
-    let outsideReason: String?
-    @Binding var isAccepted: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("变更段 \(hunk.id + 1)")
-                    .font(.headline)
-                Text("-\(hunk.removedCount)  +\(hunk.insertedCount)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                if isOutsideSelection {
-                    Label("连带修改", systemImage: "arrow.triangle.branch")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.orange)
-                }
-                Spacer()
-                Picker("处理方式", selection: $isAccepted) {
-                    Text("保留原文").tag(false)
-                    Text("接受修改").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 44)
-
-            if isOutsideSelection {
-                HStack(alignment: .top, spacing: 7) {
-                    Image(systemName: "info.circle")
-                    Text(outsideReason ?? "AI 认为这部分需要一起调整；请确认理由后再接受。")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 10)
-            }
-
-            Divider()
-
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 0) {
-                    originalColumn.frame(minWidth: 300)
-                    Divider()
-                    replacementColumn.frame(minWidth: 300)
-                }
-                VStack(spacing: 0) {
-                    originalColumn
-                    Divider()
-                    replacementColumn
-                }
-            }
-        }
-        .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(
-                    isAccepted ? Color.accentColor.opacity(0.45) : Color.secondary.opacity(0.18),
-                    lineWidth: 1
-                )
-        }
-    }
-
-    private var originalColumn: some View {
-        DiffHunkColumn(
-            title: "原文",
-            lines: hunk.originalLines,
-            startingLine: hunk.originalRange.lowerBound + 1,
-            tint: .red
-        )
-    }
-
-    private var replacementColumn: some View {
-        DiffHunkColumn(
-            title: "修改后",
-            lines: hunk.replacementLines,
-            startingLine: hunk.replacementRange.lowerBound + 1,
-            tint: .green
-        )
-    }
-}
-
-private struct DiffHunkColumn: View {
-    let title: String
-    let lines: [String]
-    let startingLine: Int
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .frame(height: 32)
-            Divider()
-            if lines.isEmpty {
-                Text("（无内容）")
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .padding(12)
-                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
-            } else {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { offset, line in
-                        HStack(alignment: .top, spacing: 10) {
-                            Text("\(startingLine + offset)")
-                                .foregroundStyle(.tertiary)
-                                .frame(width: 34, alignment: .trailing)
-                            Text(line.isEmpty ? " " : line)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .font(.system(size: 13, design: .monospaced))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(tint.opacity(0.10))
-                    }
-                }
-                .padding(.vertical, 6)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }
