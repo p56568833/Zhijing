@@ -56,6 +56,53 @@ import PDFKit
     )
 }
 
+@Test func lineDiffResolvesOneHunkImmediatelyAndKeepsTheOthersPending() throws {
+    let diff = LineDiff(
+        original: "开头\n旧一\n中间一\n旧二\n中间二\n旧三\n中间三\n旧四\n结尾",
+        replacement: "开头\n新一\n中间一\n新二\n中间二\n新三\n中间三\n新四\n结尾"
+    )
+    #expect(diff.hunks.count == 4)
+
+    let acceptedSecond = try #require(diff.resolving(
+        hunkID: diff.hunks[1].id,
+        accepted: true
+    ))
+    #expect(
+        acceptedSecond.settledText
+            == "开头\n旧一\n中间一\n新二\n中间二\n旧三\n中间三\n旧四\n结尾"
+    )
+
+    let remainingText = try #require(acceptedSecond.remainingReplacement)
+    let remainingDiff = LineDiff(
+        original: acceptedSecond.settledText,
+        replacement: remainingText
+    )
+    #expect(remainingDiff.hunks.count == 3)
+
+    let rejectedFirst = try #require(remainingDiff.resolving(
+        hunkID: remainingDiff.hunks[0].id,
+        accepted: false
+    ))
+    #expect(rejectedFirst.settledText == acceptedSecond.settledText)
+    #expect(
+        rejectedFirst.remainingReplacement
+            == "开头\n旧一\n中间一\n新二\n中间二\n新三\n中间三\n新四\n结尾"
+    )
+}
+
+@Test func lineDiffFinishesAsSoonAsItsLastHunkIsResolved() throws {
+    let diff = LineDiff(original: "开头\n旧内容\n结尾", replacement: "开头\n新内容\n结尾")
+
+    let accepted = try #require(diff.resolving(hunkID: 0, accepted: true))
+    #expect(accepted.settledText == "开头\n新内容\n结尾")
+    #expect(accepted.remainingReplacement == nil)
+    #expect(accepted.settledLine == 2)
+
+    let rejected = try #require(diff.resolving(hunkID: 0, accepted: false))
+    #expect(rejected.settledText == "开头\n旧内容\n结尾")
+    #expect(rejected.remainingReplacement == nil)
+}
+
 @Test func inlineDiffPresentationKeepsContextAndPlacesChangesInDocumentOrder() throws {
     let presentation = InlineDiffPresentation(diff: LineDiff(
         original: "开头\n旧段落\n结尾",

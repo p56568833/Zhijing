@@ -67,6 +67,29 @@ struct LineDiff {
         return result.joined(separator: "\n")
     }
 
+    func resolving(
+        hunkID: LineDiffHunk.ID,
+        accepted: Bool
+    ) -> LineDiffResolution? {
+        guard let hunk = hunks.first(where: { $0.id == hunkID }) else {
+            return nil
+        }
+        let remainingHunkIDs = Set(hunks.map(\.id)).subtracting([hunkID])
+        let settledText = applying(
+            acceptedHunkIDs: accepted ? [hunkID] : []
+        )
+        let replacementHunkIDs = remainingHunkIDs.union(
+            accepted ? [hunkID] : []
+        )
+        return LineDiffResolution(
+            settledText: settledText,
+            remainingReplacement: remainingHunkIDs.isEmpty
+                ? nil
+                : applying(acceptedHunkIDs: replacementHunkIDs),
+            settledLine: hunk.originalRange.lowerBound + 1
+        )
+    }
+
     private static func makeHunks(
         originalLines: [String],
         replacementLines: [String],
@@ -118,6 +141,12 @@ struct LineDiff {
         }
         return result
     }
+}
+
+struct LineDiffResolution: Equatable {
+    let settledText: String
+    let remainingReplacement: String?
+    let settledLine: Int
 }
 
 enum InlineDiffLineKind: Equatable {

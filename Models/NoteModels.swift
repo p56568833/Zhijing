@@ -194,12 +194,19 @@ struct EditorNavigationRequest: Equatable, Sendable {
     let documentID: String
     let line: Int?
     let selectionRange: NSRange?
+    let verticalFraction: Double?
 
-    init(id: UUID = UUID(), documentID: String, line: Int) {
+    init(
+        id: UUID = UUID(),
+        documentID: String,
+        line: Int,
+        verticalFraction: Double? = nil
+    ) {
         self.id = id
         self.documentID = documentID
         self.line = line
         self.selectionRange = nil
+        self.verticalFraction = verticalFraction
     }
 
     init(id: UUID = UUID(), documentID: String, selectionRange: NSRange) {
@@ -207,6 +214,7 @@ struct EditorNavigationRequest: Equatable, Sendable {
         self.documentID = documentID
         self.line = nil
         self.selectionRange = selectionRange
+        self.verticalFraction = nil
     }
 }
 
@@ -384,7 +392,7 @@ enum EditProposalSource: Equatable, Sendable {
 }
 
 struct EditProposal: Identifiable, Sendable {
-    let id = UUID()
+    let id: UUID
     let documentPath: String
     let original: String
     let replacement: String
@@ -393,8 +401,10 @@ struct EditProposal: Identifiable, Sendable {
     let selectionRange: NSRange?
     let outsideSelectionReason: String?
     let source: EditProposalSource
+    let expectedDiskText: String?
 
     init(
+        id: UUID = UUID(),
         documentPath: String,
         original: String,
         replacement: String,
@@ -402,8 +412,10 @@ struct EditProposal: Identifiable, Sendable {
         selectionLineRange: Range<Int>? = nil,
         selectionRange: NSRange? = nil,
         outsideSelectionReason: String? = nil,
-        source: EditProposalSource = .assistant
+        source: EditProposalSource = .assistant,
+        expectedDiskText: String? = nil
     ) {
+        self.id = id
         self.documentPath = documentPath
         self.original = original
         self.replacement = replacement
@@ -412,6 +424,7 @@ struct EditProposal: Identifiable, Sendable {
         self.selectionRange = selectionRange
         self.outsideSelectionReason = outsideSelectionReason
         self.source = source
+        self.expectedDiskText = expectedDiskText
     }
 
     func canApply(to documentPath: String, currentText: String) -> Bool {

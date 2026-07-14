@@ -484,10 +484,47 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 length: visibleLength
             )
             textView.setSelectedRange(selection)
-            textView.scrollRangeToVisible(selection)
-            textView.centerSelectionInVisibleArea(nil)
+            if let verticalFraction = request.verticalFraction {
+                position(
+                    selection,
+                    at: verticalFraction,
+                    in: textView
+                )
+            } else {
+                textView.scrollRangeToVisible(selection)
+                textView.centerSelectionInVisibleArea(nil)
+            }
             textView.showFindIndicator(for: selection)
             textView.window?.makeFirstResponder(textView)
+        }
+
+        private func position(
+            _ characterRange: NSRange,
+            at verticalFraction: Double,
+            in textView: NSTextView
+        ) {
+            guard let scrollView = textView.enclosingScrollView,
+                  let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+            layoutManager.ensureLayout(for: textContainer)
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: characterRange,
+                actualCharacterRange: nil
+            )
+            let lineRect = layoutManager.boundingRect(
+                forGlyphRange: glyphRange,
+                in: textContainer
+            )
+            let visibleBounds = scrollView.contentView.bounds
+            let fraction = max(0, min(1, verticalFraction))
+            let targetY = textView.textContainerOrigin.y + lineRect.midY
+                - visibleBounds.height * fraction
+            let maximumY = max(0, textView.frame.height - visibleBounds.height)
+            scrollView.contentView.scroll(to: NSPoint(
+                x: visibleBounds.minX,
+                y: max(0, min(targetY, maximumY))
+            ))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
 
         static func applyPlainTextAppearance(to textView: NSTextView) {

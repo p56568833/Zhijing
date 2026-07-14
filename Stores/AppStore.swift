@@ -112,6 +112,7 @@ final class AppStore {
     private var externalRefreshTask: Task<Void, Never>?
     private var pendingLibraryChangeURLs: Set<URL> = []
     private var loadedText = ""
+    private var snapshottedProposalIDs: Set<UUID> = []
     private var documentByPath: [String: NoteDocument] = [:]
     private var lastBalanceRefresh: Date?
     private var libraryRefreshID = UUID()
@@ -1031,87 +1032,93 @@ final class AppStore {
         }
     }
 
-    func applyProposal(replacement: String? = nil) {
-        guard let proposal = editProposal, let document = selectedDocument else { return }
+    func resolveProposalHunk(
+        hunkID: LineDiffHunk.ID,
+        accepted: Bool,
+        viewportFraction: Double
+    ) {
+        guard let proposal = editProposal,
+              let document = selectedDocument else { return }
         guard proposal.canApply(
             to: document.relativePath,
             currentText: editorText
         ) else {
-            errorMessage = "生成建议后文稿已经发生变化。为避免覆盖新内容，请重新生成修改建议。"
+            errorMessage = "文稿已在审阅期间发生变化，无法安全处理这处修改。"
             return
         }
-        guard validateExternalProposal(proposal, document: document) else { return }
-        let finalReplacement = replacement ?? proposal.replacement
+        guard validateExternalProposal(proposal, document: document) else {
+            return
+        }
+
+        let diff = LineDiff(
+            original: proposal.original,
+            replacement: proposal.replacement
+        )
+        guard let resolution = diff.resolving(
+            hunkID: hunkID,
+            accepted: accepted
+        ) else { return }
+
         do {
-            _ = try knowledgeBase.createSnapshot(
-                text: editorText,
-                document: document,
-                name: proposal.source == .externalFile ? "应用外部修改前" : nil
-            )
-            if proposal.source == .externalFile,
-               finalReplacement != proposal.replacement {
+            if !snapshottedProposalIDs.contains(proposal.id) {
                 _ = try knowledgeBase.createSnapshot(
-                    text: proposal.replacement,
+                    text: proposal.original,
                     document: document,
-                    name: "外部修改完整版本"
+                    name: proposal.source == .externalFile
+                        ? "应用外部修改前"
+                        : nil
                 )
-            }
-            replaceEditorText(finalReplacement)
-            if proposal.selectionRange != nil {
-                editorNavigationRequest = EditorNavigationRequest(
-                    documentID: document.id,
-                    selectionRange: Self.changedRange(
-                        original: proposal.original,
-                        replacement: finalReplacement
+                if proposal.source == .externalFile {
+                    _ = try knowledgeBase.createSnapshot(
+                        text: proposal.replacement,
+                        document: document,
+                        name: "外部修改完整版本"
                     )
-                )
+                }
+                snapshottedProposalIDs.insert(proposal.id)
             }
-        } catch {
-            errorMessage = "应用修改失败：\(error.localizedDescription)"
-            return
-        }
-        saveNow()
-        if case .saved = saveState {
-            editProposal = nil
-        }
-        revisions = knowledgeBase.revisions(for: document)
-    }
 
-    func cancelEditProposal() {
-        guard let proposal = editProposal else { return }
-        guard proposal.source == .externalFile else {
-            editProposal = nil
-            return
-        }
-        guard let document = selectedDocument,
-              proposal.canApply(
-                  to: document.relativePath,
-                  currentText: editorText
-              ) else {
-            errorMessage = "当前文稿已变化，无法安全取消这次外部修改。"
-            return
-        }
-        guard validateExternalProposal(proposal, document: document) else { return }
-
-        do {
-            _ = try knowledgeBase.createSnapshot(
-                text: proposal.replacement,
-                document: document,
-                name: "已取消的外部修改"
-            )
+            saveTask?.cancel()
             let refreshed = try documentWriter.writeSynchronously(
-                proposal.original,
+                resolution.settledText,
                 to: document,
                 using: knowledgeBase
             )
-            replaceEditorText(proposal.original)
-            loadedText = proposal.original
+            replaceEditorText(resolution.settledText)
+            loadedText = resolution.settledText
             updateDocumentMetadata(refreshed)
-            editProposal = nil
             saveState = .saved(.now)
+
+            if let remainingReplacement = resolution.remainingReplacement {
+                editProposal = EditProposal(
+                    id: proposal.id,
+                    documentPath: proposal.documentPath,
+                    original: resolution.settledText,
+                    replacement: remainingReplacement,
+                    instruction: proposal.instruction,
+                    selectionLineRange: proposal.selectionLineRange,
+                    selectionRange: proposal.selectionRange,
+                    outsideSelectionReason: proposal.outsideSelectionReason,
+                    source: proposal.source,
+                    expectedDiskText: proposal.source == .externalFile
+                        ? resolution.settledText
+                        : nil
+                )
+                if proposal.source == .externalFile {
+                    saveState = .reviewingExternalChange
+                }
+            } else {
+                editProposal = nil
+                snapshottedProposalIDs.remove(proposal.id)
+                editorNavigationRequest = EditorNavigationRequest(
+                    documentID: document.id,
+                    line: resolution.settledLine,
+                    verticalFraction: viewportFraction
+                )
+            }
             revisions = knowledgeBase.revisions(for: document)
         } catch {
-            errorMessage = "取消外部修改失败：\(error.localizedDescription)"
+            errorMessage = "处理这处修改失败：\(error.localizedDescription)"
         }
     }
 
@@ -1122,7 +1129,10 @@ final class AppStore {
         guard proposal.source == .externalFile else { return true }
         do {
             let latestDiskText = try knowledgeBase.read(document)
-            guard latestDiskText != proposal.replacement else { return true }
+            let expectedDiskText = proposal.expectedDiskText
+                ?? proposal.replacement
+            guard latestDiskText != expectedDiskText else { return true }
+            snapshottedProposalIDs.remove(proposal.id)
             editProposal = EditProposal(
                 documentPath: document.relativePath,
                 original: editorText,
@@ -1890,31 +1900,6 @@ final class AppStore {
             for: NSRange(location: lower, length: upper - lower)
         )
         return source.substring(with: safeRange)
-    }
-
-    private static func changedRange(
-        original: String,
-        replacement: String
-    ) -> NSRange {
-        let old = original as NSString
-        let new = replacement as NSString
-        let sharedLimit = min(old.length, new.length)
-        var prefix = 0
-        while prefix < sharedLimit,
-              old.character(at: prefix) == new.character(at: prefix) {
-            prefix += 1
-        }
-        var suffix = 0
-        while suffix < old.length - prefix,
-              suffix < new.length - prefix,
-              old.character(at: old.length - suffix - 1) ==
-                new.character(at: new.length - suffix - 1) {
-            suffix += 1
-        }
-        return NSRange(
-            location: prefix,
-            length: max(0, new.length - prefix - suffix)
-        )
     }
 
     private func relativePath(for url: URL) -> String {

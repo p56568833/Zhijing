@@ -3,7 +3,7 @@ import SwiftUI
 
 final class InlineDiffDecisionControl: NSView {
     let hunkID: LineDiffHunk.ID
-    var onDecision: ((LineDiffHunk.ID, Bool) -> Void)?
+    var onDecision: ((LineDiffHunk.ID, Bool, Double) -> Void)?
 
     private let rejectButton = NSButton()
     private let acceptButton = NSButton()
@@ -24,7 +24,7 @@ final class InlineDiffDecisionControl: NSView {
         )
         addSubview(rejectButton)
         addSubview(acceptButton)
-        toolTip = "只处理这一处修改；所有变更都决定后会自动保存"
+        toolTip = "只处理这一处修改，并立即保存"
     }
 
     required init?(coder: NSCoder) {
@@ -74,12 +74,24 @@ final class InlineDiffDecisionControl: NSView {
 
     @objc private func rejectChange() {
         setDecision(false)
-        onDecision?(hunkID, false)
+        onDecision?(hunkID, false, viewportFraction())
     }
 
     @objc private func acceptChange() {
         setDecision(true)
-        onDecision?(hunkID, true)
+        onDecision?(hunkID, true, viewportFraction())
+    }
+
+    private func viewportFraction() -> Double {
+        guard let scrollView = enclosingScrollView,
+              let documentView = scrollView.documentView else { return 0.5 }
+        let visibleBounds = scrollView.contentView.bounds
+        guard visibleBounds.height > 0 else { return 0.5 }
+        let controlBounds = convert(bounds, to: documentView)
+        return Double(max(
+            0,
+            min(1, (controlBounds.midY - visibleBounds.minY) / visibleBounds.height)
+        ))
     }
 }
 
@@ -149,8 +161,7 @@ final class InlineDiffTextView: NSTextView {
 
     func configureDecisionControls(
         anchors: [InlineDiffControlAnchor],
-        decisions: [LineDiffHunk.ID: Bool],
-        onDecision: @escaping (LineDiffHunk.ID, Bool) -> Void
+        onDecision: @escaping (LineDiffHunk.ID, Bool, Double) -> Void
     ) {
         controlAnchors = anchors
         let activeIDs = Set(anchors.map(\.hunkID))
@@ -168,7 +179,7 @@ final class InlineDiffTextView: NSTextView {
                 return control
             }()
             control.onDecision = onDecision
-            control.setDecision(decisions[anchor.hunkID])
+            control.setDecision(nil)
         }
         needsLayout = true
     }
@@ -212,8 +223,7 @@ final class InlineDiffTextView: NSTextView {
 struct InlineDiffSourceEditor: NSViewRepresentable {
     let presentation: InlineDiffPresentation
     let proposalID: UUID
-    let decisions: [LineDiffHunk.ID: Bool]
-    let onDecision: (LineDiffHunk.ID, Bool) -> Void
+    let onDecision: (LineDiffHunk.ID, Bool, Double) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -257,7 +267,6 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         context.coordinator.apply(
             presentation,
             proposalID: proposalID,
-            decisions: decisions,
             onDecision: onDecision,
             to: textView,
             scrollView: scrollView,
@@ -273,7 +282,6 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         context.coordinator.apply(
             presentation,
             proposalID: proposalID,
-            decisions: decisions,
             onDecision: onDecision,
             to: textView,
             scrollView: scrollView,
@@ -288,14 +296,16 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         func apply(
             _ presentation: InlineDiffPresentation,
             proposalID: UUID,
-            decisions: [LineDiffHunk.ID: Bool],
-            onDecision: @escaping (LineDiffHunk.ID, Bool) -> Void,
+            onDecision: @escaping (LineDiffHunk.ID, Bool, Double) -> Void,
             to textView: InlineDiffTextView,
             scrollView: NSScrollView,
             revealFirstChange: Bool
         ) {
             let contentChanged = self.proposalID != proposalID
                 || textView.string != presentation.text
+            let preservedVisibleOrigin = contentChanged && !revealFirstChange
+                ? scrollView.contentView.bounds.origin
+                : nil
             self.proposalID = proposalID
 
             if contentChanged {
@@ -313,17 +323,44 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
 
             textView.configureDecisionControls(
                 anchors: presentation.controlAnchors,
-                decisions: decisions,
                 onDecision: onDecision
             )
 
-            if contentChanged, revealFirstChange,
+            if let preservedVisibleOrigin {
+                DispatchQueue.main.async { [weak textView, weak scrollView] in
+                    guard let textView, let scrollView else { return }
+                    self.restoreViewport(
+                        preservedVisibleOrigin,
+                        in: textView,
+                        scrollView: scrollView
+                    )
+                }
+            } else if contentChanged, revealFirstChange,
                let range = presentation.firstChangeRange {
                 DispatchQueue.main.async { [weak textView, weak scrollView] in
                     guard let textView, let scrollView else { return }
                     self.reveal(range, in: textView, scrollView: scrollView)
                 }
             }
+        }
+
+        private func restoreViewport(
+            _ origin: NSPoint,
+            in textView: NSTextView,
+            scrollView: NSScrollView
+        ) {
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+            layoutManager.ensureLayout(for: textContainer)
+            let maximumY = max(
+                0,
+                textView.frame.height - scrollView.contentView.bounds.height
+            )
+            scrollView.contentView.scroll(to: NSPoint(
+                x: origin.x,
+                y: min(origin.y, maximumY)
+            ))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
 
         private func applyControlLineSpacing(
