@@ -97,51 +97,6 @@ struct AIService: Sendable {
         }
     }
 
-    func answer(
-        question: String,
-        currentContext: String,
-        history: [ChatMessage],
-        sources: [RetrievedChunk],
-        configuration: AIConfiguration
-    ) async throws -> AIResponse {
-        guard !configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return localAnswer(question: question, sources: sources)
-        }
-        try validateEndpoint(configuration.endpoint)
-
-        let body: [String: Any] = [
-            "model": configuration.model,
-            "messages": answerMessages(
-                question: question,
-                currentContext: currentContext,
-                history: history,
-                sources: sources
-            )
-        ]
-        var request = URLRequest(url: configuration.endpoint)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "模型服务请求失败"
-            throw NSError(domain: "AIService", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-        }
-        let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
-        guard let text = decoded.choices.first?.message.content, !text.isEmpty else {
-            throw NSError(domain: "AIService", code: 2, userInfo: [NSLocalizedDescriptionKey: "模型没有返回内容"])
-        }
-        let usage = decoded.usage.map(Self.mapUsage)
-        return AIResponse(
-            text: text,
-            sources: sources,
-            usedGeneralKnowledge: sources.isEmpty,
-            usage: usage,
-            cost: usage.flatMap { Self.estimatedCost(for: $0, configuration: configuration) }
-        )
-    }
-
     func answerStream(
         question: String,
         currentContext: String,

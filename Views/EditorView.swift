@@ -4,8 +4,11 @@ struct EditorView: View {
     @Bindable var store: AppStore
     @State private var showVersions = false
     @AppStorage("comparisonPaneWidth") private var savedComparisonPaneWidth = 420.0
-    @State private var comparisonPaneWidth =
-        UserDefaults.standard.object(forKey: "comparisonPaneWidth") as? Double ?? 420.0
+    @State private var comparisonPaneWidth = PaneWidthPreference.load(
+        key: "comparisonPaneWidth",
+        default: 420,
+        range: 340...700
+    )
 
     var body: some View {
         VStack(spacing: 0) {

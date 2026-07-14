@@ -118,24 +118,8 @@ struct SidebarView: View {
             switch libraryFilter {
             case .all:
                 Section {
-                    ForEach(store.folderGroups) { group in
-                        if group.name.isEmpty {
-                            ForEach(group.documents) { document in
-                                noteRow(document, rowKey: document.id)
-                                    .tag(document.id)
-                            }
-                        } else if group.documents.isEmpty {
-                            folderRow(group.name)
-                        } else {
-                            DisclosureGroup {
-                                ForEach(group.documents) { document in
-                                    noteRow(document, rowKey: document.id)
-                                        .tag(document.id)
-                                }
-                            } label: {
-                                folderRow(group.name)
-                            }
-                        }
+                    OutlineGroup(store.libraryTree, children: \.children) { item in
+                        libraryTreeRow(item)
                     }
                 } header: {
                     Text("知识库")
@@ -230,7 +214,8 @@ struct SidebarView: View {
 
     private func noteRow(
         _ document: NoteDocument,
-        rowKey: String
+        rowKey: String,
+        showsFolder: Bool = true
     ) -> some View {
         Label {
             if renameTargetRowKey == rowKey {
@@ -242,7 +227,7 @@ struct SidebarView: View {
             } else {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(document.title).lineLimit(1)
-                    if !document.folder.isEmpty {
+                    if showsFolder, !document.folder.isEmpty {
                         Text(document.folder)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -255,7 +240,7 @@ struct SidebarView: View {
                 .foregroundStyle(.secondary)
         }
         .contextMenu {
-            Button(store.favorites.contains(document.relativePath) ? "取消收藏" : "收藏") {
+            Button(store.favorites.contains(document.persistenceKey) ? "取消收藏" : "收藏") {
                 store.toggleFavorite(document)
             }
             Button("重命名…") {
@@ -266,6 +251,21 @@ struct SidebarView: View {
             Button("移到废纸篓", role: .destructive) { deleteTarget = document }
         }
         .draggable(document.relativePath)
+    }
+
+    @ViewBuilder
+    private func libraryTreeRow(_ item: LibraryTreeItem) -> some View {
+        switch item.content {
+        case .folder(let path):
+            folderRow(path)
+        case .document(let document):
+            noteRow(
+                document,
+                rowKey: document.id,
+                showsFolder: false
+            )
+            .tag(document.id)
+        }
     }
 
     @ViewBuilder
@@ -280,16 +280,8 @@ struct SidebarView: View {
                     .onSubmit { commitFolderRename(folder) }
                     .onExitCommand { cancelRename() }
             } else {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(folderDisplayName(folder))
-                        .lineLimit(1)
-                    if !folderParentPath(folder).isEmpty {
-                        Text(folderParentPath(folder))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
+                Text(folderDisplayName(folder))
+                    .lineLimit(1)
             }
         }
         .contentShape(Rectangle())
@@ -357,11 +349,6 @@ struct SidebarView: View {
 
     private func folderDisplayName(_ folder: String) -> String {
         (folder as NSString).lastPathComponent
-    }
-
-    private func folderParentPath(_ folder: String) -> String {
-        let parent = (folder as NSString).deletingLastPathComponent
-        return parent == "." ? "" : parent
     }
 
     private func documents(in folder: String) -> [NoteDocument] {

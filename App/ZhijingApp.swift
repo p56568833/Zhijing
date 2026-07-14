@@ -1,5 +1,4 @@
 import AppKit
-import CoreServices
 import SwiftUI
 
 @main
@@ -107,7 +106,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        MarkdownFileAssociation.makeZhijingDefaultEditor()
     }
 
     func connect(store: AppStore) {
@@ -171,16 +169,5 @@ private struct MainWindowBridge: NSViewRepresentable {
     private func configure(_ window: NSWindow?) {
         window?.identifier = NSUserInterfaceItemIdentifier("zhijing-main")
         window?.isReleasedWhenClosed = false
-    }
-}
-
-private enum MarkdownFileAssociation {
-    static func makeZhijingDefaultEditor() {
-        guard let bundleID = Bundle.main.bundleIdentifier else { return }
-        LSSetDefaultRoleHandlerForContentType(
-            "net.daringfireball.markdown" as CFString,
-            .all,
-            bundleID as CFString
-        )
     }
 }

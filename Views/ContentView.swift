@@ -4,10 +4,16 @@ struct ContentView: View {
     @Bindable var store: AppStore
     @AppStorage("sidebarPaneWidth") private var savedSidebarPaneWidth = 260.0
     @AppStorage("assistantPaneWidth") private var savedAssistantPaneWidth = 350.0
-    @State private var sidebarPaneWidth =
-        UserDefaults.standard.object(forKey: "sidebarPaneWidth") as? Double ?? 260.0
-    @State private var assistantPaneWidth =
-        UserDefaults.standard.object(forKey: "assistantPaneWidth") as? Double ?? 350.0
+    @State private var sidebarPaneWidth = PaneWidthPreference.load(
+        key: "sidebarPaneWidth",
+        default: 260,
+        range: 210...360
+    )
+    @State private var assistantPaneWidth = PaneWidthPreference.load(
+        key: "assistantPaneWidth",
+        default: 350,
+        range: 300...480
+    )
 
     var body: some View {
         Group {

@@ -1,5 +1,10 @@
 import Foundation
 
+struct LibraryScanResult: Sendable {
+    let documents: [NoteDocument]
+    let folders: [String]
+}
+
 struct KnowledgeBaseService: Sendable {
     private var fileManager: FileManager { .default }
     private let allowedExtensions = NoteDocument.supportedFileExtensions
@@ -12,28 +17,45 @@ struct KnowledgeBaseService: Sendable {
     }
 
     func scan(root: URL, excludedFolders: [String]) throws -> [NoteDocument] {
+        try scanLibrary(root: root, excludedFolders: excludedFolders).documents
+    }
+
+    func scanFolders(root: URL, excludedFolders: [String]) throws -> [String] {
+        try scanLibrary(root: root, excludedFolders: excludedFolders).folders
+    }
+
+    func scanLibrary(
+        root: URL,
+        excludedFolders: [String]
+    ) throws -> LibraryScanResult {
         let keys: [URLResourceKey] = [
             .isRegularFileKey, .isDirectoryKey, .contentModificationDateKey,
-            .fileSizeKey, .isHiddenKey
+            .fileSizeKey
         ]
         guard let enumerator = fileManager.enumerator(
             at: root,
             includingPropertiesForKeys: keys,
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return [] }
+        ) else { return LibraryScanResult(documents: [], folders: []) }
 
+        let exclusions = Set(excludedFolders)
         var notes: [NoteDocument] = []
+        var folders: [String] = []
         for case let url as URL in enumerator {
             let relative = relativePath(of: url, root: root)
             let components = relative.split(separator: "/").map(String.init)
-            if components.contains(where: { excludedFolders.contains($0) }) {
-                if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            let values = try url.resourceValues(forKeys: Set(keys))
+            if components.contains(where: exclusions.contains) {
+                if values.isDirectory == true {
                     enumerator.skipDescendants()
                 }
                 continue
             }
 
-            let values = try url.resourceValues(forKeys: Set(keys))
+            if values.isDirectory == true {
+                folders.append(relative)
+                continue
+            }
             guard values.isRegularFile == true,
                   allowedExtensions.contains(url.pathExtension.lowercased()) else { continue }
             notes.append(NoteDocument(
@@ -43,44 +65,38 @@ struct KnowledgeBaseService: Sendable {
                 size: values.fileSize ?? 0
             ))
         }
-        return notes.sorted {
-            $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
-        }
-    }
-
-    func scanFolders(root: URL, excludedFolders: [String]) throws -> [String] {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isHiddenKey]
-        guard let enumerator = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return [] }
-
-        var folders: [String] = []
-        for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: Set(keys))
-            guard values.isDirectory == true else { continue }
-            let relative = relativePath(of: url, root: root)
-            let components = relative.split(separator: "/").map(String.init)
-            if components.contains(where: { excludedFolders.contains($0) }) {
-                enumerator.skipDescendants()
-                continue
+        return LibraryScanResult(
+            documents: notes.sorted {
+                $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+            },
+            folders: folders.sorted {
+                $0.localizedStandardCompare($1) == .orderedAscending
             }
-            folders.append(relative)
-        }
-        return folders.sorted {
-            $0.localizedStandardCompare($1) == .orderedAscending
-        }
+        )
     }
 
     func read(_ document: NoteDocument) throws -> String {
         try String(contentsOf: document.url, encoding: .utf8)
     }
 
-    func write(_ text: String, to document: NoteDocument) throws {
+    @discardableResult
+    func write(_ text: String, to document: NoteDocument) throws -> NoteDocument {
         try text.write(to: document.url, atomically: true, encoding: .utf8)
-        contentCache.set(document, text)
+        var refreshedURL = document.url
+        refreshedURL.removeAllCachedResourceValues()
+        let values = try? refreshedURL.resourceValues(forKeys: [
+            .contentModificationDateKey,
+            .fileSizeKey,
+        ])
+        let refreshed = NoteDocument(
+            url: refreshedURL,
+            relativePath: document.relativePath,
+            modifiedAt: values?.contentModificationDate ?? .now,
+            size: values?.fileSize ?? text.utf8.count
+        )
+        contentCache.set(refreshed, text)
         searchIndex.invalidate(document)
+        return refreshed
     }
 
     func createNote(root: URL, folder: String? = nil) throws -> URL {
@@ -190,7 +206,7 @@ struct KnowledgeBaseService: Sendable {
         currentFolder: String? = nil,
         limit: Int = 60
     ) -> [SearchHit] {
-        let terms = tokenize(query)
+        let terms = SearchTokenization.tokenize(query)
         guard !terms.isEmpty else { return [] }
         contentCache.reconcile(documents)
         searchIndex.reconcile(documents: documents)
@@ -244,10 +260,7 @@ struct KnowledgeBaseService: Sendable {
         document: NoteDocument,
         name: String? = nil
     ) throws -> URL {
-        let base = try applicationSupportDirectory().appending(
-            path: "Versions/\(safeFilename(document.relativePath))",
-            directoryHint: .isDirectory
-        )
+        let base = try revisionDirectory(for: document, migrateLegacy: true)
         try fileManager.createDirectory(at: base, withIntermediateDirectories: true)
         let createdAt = Date.now
         let formatter = ISO8601DateFormatter()
@@ -272,9 +285,9 @@ struct KnowledgeBaseService: Sendable {
     }
 
     func revisions(for document: NoteDocument) -> [Revision] {
-        guard let base = try? applicationSupportDirectory().appending(
-            path: "Versions/\(safeFilename(document.relativePath))",
-            directoryHint: .isDirectory
+        guard let base = try? revisionDirectory(
+            for: document,
+            migrateLegacy: true
         ) else { return [] }
         let urls = (try? fileManager.contentsOfDirectory(
             at: base,
@@ -297,57 +310,29 @@ struct KnowledgeBaseService: Sendable {
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
-    func migrateRevisions(from oldPath: String, to newPath: String) throws {
-        guard oldPath != newPath else { return }
-        let versions = try applicationSupportDirectory().appending(
-            path: "Versions",
-            directoryHint: .isDirectory
-        )
-        let source = versions.appending(
-            path: safeFilename(oldPath),
-            directoryHint: .isDirectory
-        )
+    func migrateRevisions(
+        from document: NoteDocument,
+        to destinationURL: URL
+    ) throws {
+        let destinationKey = destinationURL.standardizedFileURL.path
+        guard document.persistenceKey != destinationKey else { return }
+        let source = try revisionDirectory(for: document, migrateLegacy: true)
         guard fileManager.fileExists(atPath: source.path) else { return }
 
-        let destination = versions.appending(
-            path: safeFilename(newPath),
+        let destination = try versionsDirectory().appending(
+            path: safeFilename(destinationKey),
             directoryHint: .isDirectory
         )
         if !fileManager.fileExists(atPath: destination.path) {
             try fileManager.moveItem(at: source, to: destination)
             return
         }
-
-        let revisions = try fileManager.contentsOfDirectory(
-            at: source,
-            includingPropertiesForKeys: nil
-        )
-        for revision in revisions {
-            var target = destination.appending(path: revision.lastPathComponent)
-            if fileManager.fileExists(atPath: target.path) {
-                target = destination.appending(
-                    path: "\(UUID().uuidString)-\(revision.lastPathComponent)"
-                )
-            }
-            try fileManager.moveItem(at: revision, to: target)
-        }
-        try fileManager.removeItem(at: source)
+        try mergeRevisionDirectory(source, into: destination)
     }
 
     private func nearestHeading(in document: NoteDocument, before line: Int) -> String? {
         searchIndex.heading(in: document, before: line) { document in
             cachedOrRead(document)
-        }
-    }
-
-    private func tokenize(_ value: String) -> [String] {
-        SearchTokenization.tokenize(value)
-    }
-
-    private func matchScore(terms: [String], in value: String) -> Double {
-        let lower = value.lowercased()
-        return terms.reduce(0) { result, term in
-            result + (lower.localizedStandardContains(term) ? 1 : 0)
         }
     }
 
@@ -389,6 +374,66 @@ struct KnowledgeBaseService: Sendable {
     private func safeFilename(_ value: String) -> String {
         Data(value.utf8).base64EncodedString()
             .replacingOccurrences(of: "/", with: "_")
+    }
+
+    private func versionsDirectory() throws -> URL {
+        try applicationSupportDirectory().appending(
+            path: "Versions",
+            directoryHint: .isDirectory
+        )
+    }
+
+    private func revisionDirectory(
+        for document: NoteDocument,
+        migrateLegacy: Bool
+    ) throws -> URL {
+        let versions = try versionsDirectory()
+        let current = versions.appending(
+            path: safeFilename(document.persistenceKey),
+            directoryHint: .isDirectory
+        )
+        guard migrateLegacy else { return current }
+
+        let legacy = versions.appending(
+            path: safeFilename(document.relativePath),
+            directoryHint: .isDirectory
+        )
+        guard legacy.standardizedFileURL != current.standardizedFileURL,
+              fileManager.fileExists(atPath: legacy.path) else {
+            return current
+        }
+        if fileManager.fileExists(atPath: current.path) {
+            try mergeRevisionDirectory(legacy, into: current)
+        } else {
+            try fileManager.createDirectory(at: versions, withIntermediateDirectories: true)
+            try fileManager.moveItem(at: legacy, to: current)
+        }
+        return current
+    }
+
+    private func mergeRevisionDirectory(_ source: URL, into destination: URL) throws {
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        let entries = try fileManager.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: nil
+        )
+        let groups = Dictionary(grouping: entries) {
+            $0.deletingPathExtension().lastPathComponent
+        }
+        for (stem, files) in groups {
+            let hasCollision = files.contains { file in
+                fileManager.fileExists(atPath: destination.appending(
+                    path: stem
+                ).appendingPathExtension(file.pathExtension).path)
+            }
+            let targetStem = hasCollision ? "\(UUID().uuidString)-\(stem)" : stem
+            for file in files {
+                let target = destination.appending(path: targetStem)
+                    .appendingPathExtension(file.pathExtension)
+                try fileManager.moveItem(at: file, to: target)
+            }
+        }
+        try fileManager.removeItem(at: source)
     }
 
     private struct RevisionMetadata: Codable {

@@ -10,7 +10,7 @@ final class DocumentWriteCoordinator: @unchecked Sendable {
         _ text: String,
         to document: NoteDocument,
         using service: KnowledgeBaseService
-    ) async throws -> Int {
+    ) async throws -> NoteDocument {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 continuation.resume(with: Result {
@@ -24,7 +24,7 @@ final class DocumentWriteCoordinator: @unchecked Sendable {
         _ text: String,
         to document: NoteDocument,
         using service: KnowledgeBaseService
-    ) throws -> Int {
+    ) throws -> NoteDocument {
         try queue.sync {
             try Self.performWrite(text, to: document, using: service)
         }
@@ -34,9 +34,7 @@ final class DocumentWriteCoordinator: @unchecked Sendable {
         _ text: String,
         to document: NoteDocument,
         using service: KnowledgeBaseService
-    ) throws -> Int {
+    ) throws -> NoteDocument {
         try service.write(text, to: document)
-        return (try? document.url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-            ?? document.size
     }
 }

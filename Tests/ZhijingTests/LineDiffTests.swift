@@ -192,7 +192,7 @@ import PDFKit
 
 @Test func documentOpenRequestKeepsEverySelectedFileInTheCurrentLibrary() throws {
     let root = URL(filePath: "/tmp/ZhijingOpenLibrary", directoryHint: .isDirectory)
-    let resolved = try DocumentOpenRequestResolver.resolve(
+    let resolved = DocumentOpenRequestResolver.resolve(
         urls: [
             root.appending(path: "第一篇.md"),
             root.appending(path: "资料/第二篇.txt"),
@@ -210,7 +210,7 @@ import PDFKit
 @Test func documentOpenRequestKeepsOtherFoldersAsExternalDocuments() throws {
     let first = URL(filePath: "/tmp/ZhijingOne/第一篇.md")
     let second = URL(filePath: "/tmp/ZhijingTwo/第二篇.md")
-    let request = try #require(try DocumentOpenRequestResolver.resolve(
+    let request = try #require(DocumentOpenRequestResolver.resolve(
         urls: [first, second],
         currentLibrary: nil
     ))
@@ -236,6 +236,57 @@ import PDFKit
     )
 
     #expect(first.id != second.id)
+}
+
+@Test func libraryTreeFollowsTheRealNestedFolderStructure() {
+    let documents = [
+        NoteDocument(
+            url: URL(filePath: "/tmp/library/根目录.md"),
+            relativePath: "根目录.md",
+            modifiedAt: .distantPast,
+            size: 0
+        ),
+        NoteDocument(
+            url: URL(filePath: "/tmp/library/稿子/第一期/大纲.md"),
+            relativePath: "稿子/第一期/大纲.md",
+            modifiedAt: .distantPast,
+            size: 0
+        ),
+        NoteDocument(
+            url: URL(filePath: "/tmp/library/稿子/第一期/最终版/正文.md"),
+            relativePath: "稿子/第一期/最终版/正文.md",
+            modifiedAt: .distantPast,
+            size: 0
+        ),
+    ]
+
+    let tree = LibraryTreeBuilder.build(
+        folders: ["稿子", "稿子/第一期", "稿子/第一期/最终版", "稿子/空文件夹"],
+        documents: documents
+    )
+
+    func snapshot(_ items: [LibraryTreeItem], depth: Int = 0) -> [String] {
+        items.flatMap { item in
+            let prefix = String(repeating: "  ", count: depth)
+            switch item.content {
+            case .folder(let path):
+                return ["\(prefix)F:\(path)"]
+                    + snapshot(item.children ?? [], depth: depth + 1)
+            case .document(let document):
+                return ["\(prefix)D:\(document.relativePath)"]
+            }
+        }
+    }
+
+    #expect(snapshot(tree) == [
+        "F:稿子",
+        "  F:稿子/第一期",
+        "    F:稿子/第一期/最终版",
+        "      D:稿子/第一期/最终版/正文.md",
+        "    D:稿子/第一期/大纲.md",
+        "  F:稿子/空文件夹",
+        "D:根目录.md",
+    ])
 }
 
 @Test func connectionTestRejectsMissingKeyBeforeNetworking() async {
@@ -315,6 +366,23 @@ import PDFKit
     #expect(service.search(query: "旧关键词", documents: refreshedDocuments).isEmpty)
 }
 
+@Test func savingReturnsFreshMetadataAndKeepsTheSearchCacheCurrent() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingSaveMetadata-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let noteURL = root.appending(path: "笔记.md")
+    try "遗留标识甲乙".write(to: noteURL, atomically: true, encoding: .utf8)
+    let service = KnowledgeBaseService()
+    let original = try #require(service.scan(root: root, excludedFolders: []).first)
+    let refreshed = try service.write("新的可搜索内容", to: original)
+
+    #expect(refreshed.size == "新的可搜索内容".utf8.count)
+    #expect(!service.search(query: "新的可搜索", documents: [refreshed]).isEmpty)
+    #expect(service.search(query: "遗留标识", documents: [refreshed]).isEmpty)
+}
+
 @Test func searchCacheDoesNotLeakAcrossLibrariesWithMatchingFileSignatures() throws {
     let root = URL(filePath: NSTemporaryDirectory())
         .appending(path: "ZhijingLibraries-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -387,6 +455,42 @@ import PDFKit
 
     let loaded = persistence.load()
     #expect(loaded["文章.md"]?.map(\.text) == ["新消息"])
+}
+
+@Test func documentStateKeysDoNotLeakAcrossLibraries() {
+    let first = NoteDocument(
+        url: URL(filePath: "/tmp/FirstLibrary/共享.md"),
+        relativePath: "共享.md",
+        modifiedAt: .distantPast,
+        size: 0
+    )
+    let second = NoteDocument(
+        url: URL(filePath: "/tmp/SecondLibrary/共享.md"),
+        relativePath: "共享.md",
+        modifiedAt: .distantPast,
+        size: 0
+    )
+    let message = ChatMessage(role: .user, text: "只属于第一个知识库")
+
+    let migrated = DocumentStateStore.migrateLegacyKeys(
+        favorites: ["共享.md"],
+        chats: ["共享.md": [message]],
+        documents: [first]
+    )
+
+    #expect(first.persistenceKey != second.persistenceKey)
+    #expect(migrated.favorites == [first.persistenceKey])
+    #expect(migrated.chats[first.persistenceKey] == [message])
+    #expect(migrated.chats[second.persistenceKey] == nil)
+
+    let afterSwitch = DocumentStateStore.migrateLegacyKeys(
+        favorites: migrated.favorites,
+        chats: migrated.chats,
+        documents: [second]
+    )
+    #expect(!afterSwitch.didChange)
+    #expect(afterSwitch.favorites == [first.persistenceKey])
+    #expect(afterSwitch.chats[second.persistenceKey] == nil)
 }
 
 @Test func scanIncludesLongMarkdownExtension() throws {
@@ -472,6 +576,38 @@ import PDFKit
         excludedFolders: []
     )
     #expect(folders == ["空文件夹", "空文件夹/子文件夹"])
+}
+
+@Test func onePassLibraryScanReturnsDocumentsFoldersAndExclusions() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingOnePassScan-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: root.appending(path: "内容/空目录", directoryHint: .isDirectory),
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+        at: root.appending(path: "node_modules/pkg", directoryHint: .isDirectory),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    try "正文".write(
+        to: root.appending(path: "内容/文章.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "不应扫描".write(
+        to: root.appending(path: "node_modules/pkg/忽略.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try KnowledgeBaseService().scanLibrary(
+        root: root,
+        excludedFolders: ["node_modules"]
+    )
+
+    #expect(result.documents.map(\.relativePath) == ["内容/文章.md"])
+    #expect(result.folders == ["内容", "内容/空目录"])
 }
 
 @Test func staleEditProposalCannotOverwriteNewTyping() {
@@ -831,6 +967,70 @@ import PDFKit
     #expect(Set(revisions.map(\.url)).count == 2)
 }
 
+@Test func snapshotsWithMatchingRelativePathsStayInTheirOwnLibraries() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingVersionIsolation-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let firstLibrary = root.appending(path: "First", directoryHint: .isDirectory)
+    let secondLibrary = root.appending(path: "Second", directoryHint: .isDirectory)
+    let support = root.appending(path: "Support", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: firstLibrary, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: secondLibrary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let first = NoteDocument(
+        url: firstLibrary.appending(path: "共享.md"),
+        relativePath: "共享.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let second = NoteDocument(
+        url: secondLibrary.appending(path: "共享.md"),
+        relativePath: "共享.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let service = KnowledgeBaseService(supportDirectoryOverride: support)
+
+    _ = try service.createSnapshot(text: "第一库版本", document: first)
+    _ = try service.createSnapshot(text: "第二库版本", document: second)
+
+    #expect(try service.revisions(for: first).map(service.revisionText) == ["第一库版本"])
+    #expect(try service.revisions(for: second).map(service.revisionText) == ["第二库版本"])
+}
+
+@Test func snapshotsFollowAFileRenameWithoutLosingMetadata() throws {
+    let root = URL(filePath: NSTemporaryDirectory())
+        .appending(path: "ZhijingVersionMove-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let library = root.appending(path: "Library", directoryHint: .isDirectory)
+    let support = root.appending(path: "Support", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let originalURL = library.appending(path: "原名.md")
+    try "正文".write(to: originalURL, atomically: true, encoding: .utf8)
+    let original = NoteDocument(
+        url: originalURL,
+        relativePath: "原名.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let service = KnowledgeBaseService(supportDirectoryOverride: support)
+    _ = try service.createSnapshot(text: "历史正文", document: original, name: "重命名前")
+
+    let destination = try service.rename(original, to: "新名")
+    try service.migrateRevisions(from: original, to: destination)
+    let renamed = NoteDocument(
+        url: destination,
+        relativePath: "新名.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let revisions = service.revisions(for: renamed)
+
+    #expect(revisions.map(\.name) == ["重命名前"])
+    #expect(try revisions.map(service.revisionText) == ["历史正文"])
+}
+
 @Test func externalFileChangesAreReconciledWithoutOverwritingEitherSide() {
     #expect(
         ExternalFileReconciler.evaluate(
@@ -868,6 +1068,14 @@ import PDFKit
 
     let long = DocumentMetrics(markdown: String(repeating: "知", count: 501))
     #expect(long.count == 501)
+}
+
+@Test func persistedPaneWidthsAreAlwaysUsable() {
+    #expect(PaneWidthPreference.clamped(nil, default: 260, range: 210...360) == 260)
+    #expect(PaneWidthPreference.clamped(.nan, default: 260, range: 210...360) == 260)
+    #expect(PaneWidthPreference.clamped(40, default: 260, range: 210...360) == 210)
+    #expect(PaneWidthPreference.clamped(900, default: 260, range: 210...360) == 360)
+    #expect(PaneWidthPreference.clamped(280, default: 260, range: 210...360) == 280)
 }
 
 @Test func documentFindMatchesCaseAndWholeWordOptions() {

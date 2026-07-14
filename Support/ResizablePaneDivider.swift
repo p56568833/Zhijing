@@ -47,7 +47,13 @@ struct ResizablePaneDivider: View {
                 .onChanged { value in
                     let start = dragStartWidth ?? paneWidth
                     dragStartWidth = start
-                    dragPreviewTranslation = value.translation.width
+                    let previewWidth = clampedWidth(
+                        from: start,
+                        translation: value.translation.width
+                    )
+                    dragPreviewTranslation = CGFloat(
+                        (previewWidth - start) / dragDirection
+                    )
                     guard updatesContinuously else { return }
                     let now = ContinuousClock.now
                     if let lastDragUpdate,
@@ -72,6 +78,12 @@ struct ResizablePaneDivider: View {
                     dragPreviewTranslation = 0
                 }
         )
+        .onDisappear {
+            if isHovering {
+                NSCursor.pop()
+                isHovering = false
+            }
+        }
         .accessibilityElement()
         .accessibilityLabel("调整分栏宽度")
         .accessibilityHint("左右拖动")
@@ -79,8 +91,7 @@ struct ResizablePaneDivider: View {
 
     @discardableResult
     private func updateWidth(from start: Double, translation: CGFloat) -> Double {
-        let proposed = start + Double(translation) * dragDirection
-        let clamped = min(range.upperBound, max(range.lowerBound, proposed))
+        let clamped = clampedWidth(from: start, translation: translation)
         guard paneWidth != clamped else { return clamped }
         var transaction = Transaction()
         transaction.disablesAnimations = true
@@ -88,5 +99,10 @@ struct ResizablePaneDivider: View {
             paneWidth = clamped
         }
         return clamped
+    }
+
+    private func clampedWidth(from start: Double, translation: CGFloat) -> Double {
+        let proposed = start + Double(translation) * dragDirection
+        return min(range.upperBound, max(range.lowerBound, proposed))
     }
 }

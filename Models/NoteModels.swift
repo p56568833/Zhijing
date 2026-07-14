@@ -7,6 +7,7 @@ struct NoteDocument: Identifiable, Hashable, Codable, Sendable {
     let size: Int
 
     var id: String { url.standardizedFileURL.path }
+    var persistenceKey: String { id }
     var title: String {
         url.deletingPathExtension().lastPathComponent
     }
@@ -43,7 +44,7 @@ enum DocumentOpenRequestResolver {
     static func resolve(
         urls: [URL],
         currentLibrary: URL?
-    ) throws -> DocumentOpenRequest? {
+    ) -> DocumentOpenRequest? {
         var seenPaths: Set<String> = []
         let documents = urls.map(\.standardizedFileURL).filter {
             NoteDocument.isSupportedFile($0) && seenPaths.insert($0.path).inserted
@@ -83,11 +84,81 @@ struct SearchHit: Identifiable, Hashable, Sendable {
     let score: Double
 }
 
-struct LibraryFolderGroup: Identifiable, Hashable, Sendable {
-    let name: String
-    let documents: [NoteDocument]
+struct LibraryTreeItem: Identifiable, Hashable, Sendable {
+    enum Content: Hashable, Sendable {
+        case folder(String)
+        case document(NoteDocument)
+    }
 
-    var id: String { name }
+    let content: Content
+    let children: [LibraryTreeItem]?
+
+    var id: String {
+        switch content {
+        case .folder(let path):
+            "folder:\(path)"
+        case .document(let document):
+            "document:\(document.id)"
+        }
+    }
+}
+
+enum LibraryTreeBuilder {
+    static func build(
+        folders: [String],
+        documents: [NoteDocument]
+    ) -> [LibraryTreeItem] {
+        var folderPaths: Set<String> = []
+        for path in folders + documents.map(\.folder) where !path.isEmpty {
+            var current = path
+            while !current.isEmpty {
+                folderPaths.insert(current)
+                current = parentPath(of: current)
+            }
+        }
+
+        let documentsByFolder = Dictionary(grouping: documents, by: \.folder)
+        let childFoldersByParent = Dictionary(grouping: folderPaths) {
+            parentPath(of: $0)
+        }
+
+        func children(of parent: String) -> [LibraryTreeItem] {
+            let childFolders = (childFoldersByParent[parent] ?? [])
+                .sorted {
+                    displayName(of: $0).localizedStandardCompare(
+                        displayName(of: $1)
+                    ) == .orderedAscending
+                }
+                .map { path in
+                    let nestedItems = children(of: path)
+                    return LibraryTreeItem(
+                        content: .folder(path),
+                        children: nestedItems.isEmpty ? nil : nestedItems
+                    )
+                }
+
+            let directDocuments = (documentsByFolder[parent] ?? [])
+                .sorted {
+                    $0.title.localizedStandardCompare($1.title) == .orderedAscending
+                }
+                .map {
+                    LibraryTreeItem(content: .document($0), children: nil)
+                }
+
+            return childFolders + directDocuments
+        }
+
+        return children(of: "")
+    }
+
+    private static func parentPath(of path: String) -> String {
+        let parent = (path as NSString).deletingLastPathComponent
+        return parent == "." ? "" : parent
+    }
+
+    private static func displayName(of path: String) -> String {
+        (path as NSString).lastPathComponent
+    }
 }
 
 struct RetrievedChunk: Identifiable, Hashable, Codable, Sendable {
