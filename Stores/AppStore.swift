@@ -72,6 +72,7 @@ final class AppStore {
     var isRefreshingBalance = false
     var externalConflict: ExternalFileConflict?
     private(set) var openDocumentPaths: [String] = []
+    private(set) var externalDocuments: [NoteDocument] = []
     var isComparisonVisible = false
     private(set) var comparisonDocumentPath: String?
     private(set) var comparisonText = ""
@@ -134,9 +135,21 @@ final class AppStore {
     }
 
     var openDocuments: [NoteDocument] {
-        openDocumentPaths.compactMap { path in
+        let libraryDocuments = openDocumentPaths.compactMap { path in
             documentByPath[path]
         }
+        return libraryDocuments + externalDocuments.filter { external in
+            !libraryDocuments.contains(where: { $0.id == external.id })
+        }
+    }
+
+    var selectedDocumentLocationLabel: String? {
+        guard let document = selectedDocument else { return nil }
+        if isLibraryDocument(document) {
+            return document.folder.isEmpty ? "知识库根目录" : document.folder
+        }
+        let parent = document.url.deletingLastPathComponent().lastPathComponent
+        return parent.isEmpty ? "外部文稿" : "外部文稿 · \(parent)"
     }
 
     var comparisonDocument: NoteDocument? {
@@ -171,6 +184,8 @@ final class AppStore {
         isSidebarVisible = defaults.object(forKey: Keys.sidebarVisible) as? Bool ?? true
         colorScheme = AppColorScheme(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
         openDocumentPaths = defaults.stringArray(forKey: Keys.openDocumentPaths) ?? []
+        externalDocuments = (defaults.stringArray(forKey: Keys.externalDocumentPaths) ?? [])
+            .compactMap { Self.makeExternalDocument(at: URL(filePath: $0)) }
         isComparisonVisible = defaults.object(forKey: Keys.comparisonVisible) as? Bool ?? false
         comparisonDocumentPath = defaults.string(forKey: Keys.comparisonDocumentPath)
         if let presetEndpoint = provider.endpoint {
@@ -297,11 +312,31 @@ final class AppStore {
             libraryURL = root
             defaults.set(root.path, forKey: Keys.libraryPath)
         }
+
+        let externalDocuments = request.externalURLs.compactMap {
+            Self.makeExternalDocument(at: $0)
+        }
+        for document in externalDocuments {
+            addOpenDocument(document)
+        }
+
+        let firstIsExternal = externalDocuments.contains {
+            $0.id == request.firstURL.standardizedFileURL.path
+        }
+        if firstIsExternal,
+           let first = externalDocuments.first(where: {
+               $0.id == request.firstURL.standardizedFileURL.path
+           }) {
+            select(first)
+        }
+
         Task {
-            await refreshLibrary(
-                selecting: request.relativePaths.first,
-                opening: request.relativePaths
-            )
+            if !request.relativePaths.isEmpty || !isInCurrentLibrary {
+                await refreshLibrary(
+                    selecting: firstIsExternal ? nil : request.relativePaths.first,
+                    opening: request.relativePaths
+                )
+            }
         }
     }
 
@@ -338,6 +373,7 @@ final class AppStore {
             else { return }
             documents = scanned.documents
             folders = scanned.folders
+            migrateExternalDocumentsIntoLibrary()
             refreshDerivedLibraryState()
             let service = knowledgeBase
             let indexedDocuments = scanned.documents
@@ -347,12 +383,17 @@ final class AppStore {
             reconcileOpenDocuments()
             reloadComparisonDocument()
             startWatchingLibrary()
-            let targetPath = relativePath ?? selectedDocument?.relativePath
+            let selectedLibraryPath = selectedDocument.flatMap { selected in
+                documents.first(where: { $0.id == selected.id })?.relativePath
+            }
+            let targetPath = relativePath ?? selectedLibraryPath
             if let targetPath, let target = documentByPath[targetPath] {
                 select(target)
-            } else {
-                if selectedDocument != nil {
-                    if externalConflict?.document.id != selectedDocument?.id {
+            } else if let selectedDocument {
+                if externalDocuments.contains(where: { $0.id == selectedDocument.id }) {
+                    // Keep an external tab selected while the library refreshes.
+                } else {
+                    if externalConflict?.document.id != selectedDocument.id {
                         saveTask?.cancel()
                         clearDocumentSelection()
                         errorMessage = "当前文稿已不在知识库中，可能被其他应用移动或删除。"
@@ -360,6 +401,7 @@ final class AppStore {
                         return
                     }
                 }
+            } else {
                 if let first = documents.first {
                     select(first)
                 } else {
@@ -390,7 +432,9 @@ final class AppStore {
             selectedDocument = document
             addOpenDocument(document)
             ensureComparisonDiffersFromSelection()
-            defaults.set(document.relativePath, forKey: Keys.selectedPath)
+            if isLibraryDocument(document) {
+                defaults.set(document.relativePath, forKey: Keys.selectedPath)
+            }
             revisions = knowledgeBase.revisions(for: document)
             saveState = .saved(.now)
         } catch {
@@ -527,15 +571,7 @@ final class AppStore {
             )
             loadedText = editorText
             saveState = .saved(.now)
-            if let idx = documents.firstIndex(where: { $0.relativePath == document.relativePath }) {
-                documents[idx] = NoteDocument(
-                    url: document.url,
-                    relativePath: document.relativePath,
-                    modifiedAt: .now,
-                    size: newSize
-                )
-                refreshDerivedLibraryState()
-            }
+            updateDocumentMetadata(document, size: newSize)
             return true
         } catch {
             saveState = .failed(error.localizedDescription)
@@ -1053,11 +1089,10 @@ final class AppStore {
         let closingSelectedDocument = selectedDocument?.id == document.id
         if closingSelectedDocument, !flushSave() { return }
 
-        let closingIndex = openDocumentPaths.firstIndex(of: document.relativePath) ?? 0
-        openDocumentPaths.removeAll { $0 == document.relativePath }
-        persistOpenDocuments()
+        let closingIndex = openDocuments.firstIndex(where: { $0.id == document.id }) ?? 0
+        removeOpenDocument(document)
 
-        if comparisonDocumentPath == document.relativePath {
+        if isLibraryDocument(document), comparisonDocumentPath == document.relativePath {
             comparisonDocumentPath = nil
             comparisonText = ""
         }
@@ -1315,7 +1350,7 @@ final class AppStore {
             externalConflict = nil
             saveState = .saved(.now)
             revisions = knowledgeBase.revisions(for: conflict.document)
-            Task { await refreshLibrary(selecting: conflict.document.relativePath) }
+            refreshAfterExternalResolution(conflict.document)
         } catch {
             errorMessage = "保留本地版本失败：\(error.localizedDescription)"
         }
@@ -1336,17 +1371,29 @@ final class AppStore {
             externalConflict = nil
             saveState = .saved(.now)
             revisions = knowledgeBase.revisions(for: conflict.document)
-            Task { await refreshLibrary(selecting: conflict.document.relativePath) }
+            refreshAfterExternalResolution(conflict.document)
         } catch {
             errorMessage = "载入外部版本失败：\(error.localizedDescription)"
         }
     }
 
     func discardLocalVersionAfterExternalRemoval() {
-        guard externalConflict?.fileWasRemoved == true else { return }
+        guard let conflict = externalConflict, conflict.fileWasRemoved else { return }
         externalConflict = nil
-        clearDocumentSelection()
-        Task { await refreshLibrary() }
+        if isLibraryDocument(conflict.document) {
+            clearDocumentSelection()
+            Task { await refreshLibrary() }
+        } else {
+            let closingIndex = openDocuments.firstIndex(where: {
+                $0.id == conflict.document.id
+            }) ?? 0
+            removeOpenDocument(conflict.document)
+            clearDocumentSelection()
+            let remaining = openDocuments
+            if !remaining.isEmpty {
+                select(remaining[min(closingIndex, remaining.count - 1)])
+            }
+        }
     }
 
     @discardableResult
@@ -1374,6 +1421,83 @@ final class AppStore {
             LibraryFolderGroup(name: $0, documents: groups[$0] ?? [])
         }.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func isLibraryDocument(_ document: NoteDocument) -> Bool {
+        documents.contains(where: { $0.id == document.id })
+    }
+
+    private static func makeExternalDocument(at url: URL) -> NoteDocument? {
+        let url = url.standardizedFileURL
+        guard NoteDocument.isSupportedFile(url),
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let values = try? url.resourceValues(forKeys: [
+            .contentModificationDateKey,
+            .fileSizeKey,
+        ])
+        return NoteDocument(
+            url: url,
+            relativePath: url.path,
+            modifiedAt: values?.contentModificationDate ?? .distantPast,
+            size: values?.fileSize ?? 0
+        )
+    }
+
+    private func updateDocumentMetadata(_ document: NoteDocument, size: Int) {
+        let refreshed = NoteDocument(
+            url: document.url,
+            relativePath: document.relativePath,
+            modifiedAt: .now,
+            size: size
+        )
+        if let index = documents.firstIndex(where: { $0.id == document.id }) {
+            documents[index] = refreshed
+            refreshDerivedLibraryState()
+        } else if let index = externalDocuments.firstIndex(where: {
+            $0.id == document.id
+        }) {
+            externalDocuments[index] = refreshed
+            persistExternalDocuments()
+        }
+        if selectedDocument?.id == document.id {
+            selectedDocument = refreshed
+        }
+    }
+
+    private func migrateExternalDocumentsIntoLibrary() {
+        var migratedIDs: Set<String> = []
+        for external in externalDocuments {
+            guard let libraryDocument = documents.first(where: {
+                $0.id == external.id
+            }) else { continue }
+            if !openDocumentPaths.contains(libraryDocument.relativePath) {
+                openDocumentPaths.append(libraryDocument.relativePath)
+            }
+            if selectedDocument?.id == external.id {
+                selectedDocument = libraryDocument
+            }
+            migratedIDs.insert(external.id)
+        }
+        guard !migratedIDs.isEmpty else { return }
+        externalDocuments.removeAll { migratedIDs.contains($0.id) }
+        persistOpenDocuments()
+        persistExternalDocuments()
+    }
+
+    private func refreshAfterExternalResolution(_ document: NoteDocument) {
+        if isLibraryDocument(document) {
+            Task { await refreshLibrary(selecting: document.relativePath) }
+        } else {
+            if let refreshed = Self.makeExternalDocument(at: document.url),
+               let index = externalDocuments.firstIndex(where: {
+                   $0.id == document.id
+               }) {
+                externalDocuments[index] = refreshed
+                selectedDocument = refreshed
+                persistExternalDocuments()
+            }
+            startWatchingLibrary()
         }
     }
 
@@ -1418,15 +1542,7 @@ final class AppStore {
             guard selectedDocument?.id == document.id, editorText == text else { return }
             loadedText = text
             saveState = .saved(.now)
-            if let idx = documents.firstIndex(where: { $0.relativePath == document.relativePath }) {
-                documents[idx] = NoteDocument(
-                    url: document.url,
-                    relativePath: document.relativePath,
-                    modifiedAt: .now,
-                    size: newSize
-                )
-                refreshDerivedLibraryState()
-            }
+            updateDocumentMetadata(document, size: newSize)
         } catch {
             guard selectedDocument?.id == document.id, editorText == text else { return }
             saveState = .failed(error.localizedDescription)
@@ -1457,6 +1573,7 @@ final class AppStore {
         }
         libraryWatcher.start(
             root: libraryURL,
+            additionalFiles: externalDocuments.map(\.url),
             excludedFolders: excludedFolders
         ) { [weak self] changedURLs in
             Task { @MainActor [weak self] in
@@ -1519,7 +1636,18 @@ final class AppStore {
                 )
                 saveState = .failed("检测到外部修改")
             case .removedCleanly:
-                break
+                if !isLibraryDocument(document) {
+                    let closingIndex = openDocuments.firstIndex(where: {
+                        $0.id == document.id
+                    }) ?? 0
+                    removeOpenDocument(document)
+                    clearDocumentSelection()
+                    let remaining = openDocuments
+                    if !remaining.isEmpty {
+                        select(remaining[min(closingIndex, remaining.count - 1)])
+                    }
+                    errorMessage = "当前外部文稿已被移动或删除。"
+                }
             case .removedWithLocalChanges:
                 externalConflict = ExternalFileConflict(
                     document: document,
@@ -1531,7 +1659,18 @@ final class AppStore {
             }
         }
 
-        await refreshLibrary(selecting: document.relativePath)
+        if isLibraryDocument(document) {
+            await refreshLibrary(selecting: document.relativePath)
+        } else if let refreshed = Self.makeExternalDocument(at: document.url),
+                  let index = externalDocuments.firstIndex(where: {
+                      $0.id == document.id
+                  }) {
+            externalDocuments[index] = refreshed
+            if selectedDocument?.id == document.id {
+                selectedDocument = refreshed
+            }
+            persistExternalDocuments()
+        }
     }
 
     private func shouldCheckSelectedDocument(
@@ -1661,9 +1800,29 @@ final class AppStore {
     }
 
     private func addOpenDocument(_ document: NoteDocument) {
-        guard !openDocumentPaths.contains(document.relativePath) else { return }
-        openDocumentPaths.append(document.relativePath)
-        persistOpenDocuments()
+        if isLibraryDocument(document) {
+            guard !openDocumentPaths.contains(document.relativePath) else { return }
+            openDocumentPaths.append(document.relativePath)
+            persistOpenDocuments()
+        } else {
+            guard !externalDocuments.contains(where: { $0.id == document.id }) else {
+                return
+            }
+            externalDocuments.append(document)
+            persistExternalDocuments()
+            startWatchingLibrary()
+        }
+    }
+
+    private func removeOpenDocument(_ document: NoteDocument) {
+        if isLibraryDocument(document) {
+            openDocumentPaths.removeAll { $0 == document.relativePath }
+            persistOpenDocuments()
+        } else {
+            externalDocuments.removeAll { $0.id == document.id }
+            persistExternalDocuments()
+            startWatchingLibrary()
+        }
     }
 
     private func reconcileOpenDocuments() {
@@ -1677,6 +1836,13 @@ final class AppStore {
 
     private func persistOpenDocuments() {
         defaults.set(openDocumentPaths, forKey: Keys.openDocumentPaths)
+    }
+
+    private func persistExternalDocuments() {
+        defaults.set(
+            externalDocuments.map { $0.url.standardizedFileURL.path },
+            forKey: Keys.externalDocumentPaths
+        )
     }
 
     private func resetWorkspaceNavigation() {
@@ -1747,6 +1913,7 @@ final class AppStore {
         static let sidebarVisible = "sidebarVisible"
         static let colorScheme = "colorScheme"
         static let openDocumentPaths = "openDocumentPaths"
+        static let externalDocumentPaths = "externalDocumentPaths"
         static let comparisonVisible = "comparisonVisible"
         static let comparisonDocumentPath = "comparisonDocumentPath"
     }

@@ -204,18 +204,38 @@ import PDFKit
 
     #expect(request.root == root.standardizedFileURL)
     #expect(request.relativePaths == ["第一篇.md", "资料/第二篇.txt"])
+    #expect(request.externalURLs.isEmpty)
 }
 
-@Test func documentOpenRequestRejectsFilesFromDifferentExternalFolders() {
-    #expect(throws: DocumentOpenRequestError.self) {
-        try DocumentOpenRequestResolver.resolve(
-            urls: [
-                URL(filePath: "/tmp/ZhijingOne/第一篇.md"),
-                URL(filePath: "/tmp/ZhijingTwo/第二篇.md"),
-            ],
-            currentLibrary: nil
-        )
-    }
+@Test func documentOpenRequestKeepsOtherFoldersAsExternalDocuments() throws {
+    let first = URL(filePath: "/tmp/ZhijingOne/第一篇.md")
+    let second = URL(filePath: "/tmp/ZhijingTwo/第二篇.md")
+    let request = try #require(try DocumentOpenRequestResolver.resolve(
+        urls: [first, second],
+        currentLibrary: nil
+    ))
+
+    #expect(request.root == first.deletingLastPathComponent().standardizedFileURL)
+    #expect(request.relativePaths == ["第一篇.md"])
+    #expect(request.externalURLs == [second.standardizedFileURL])
+    #expect(request.firstURL == first.standardizedFileURL)
+}
+
+@Test func documentsWithTheSameRelativeNameUseDifferentAbsoluteIdentities() {
+    let first = NoteDocument(
+        url: URL(filePath: "/tmp/ZhijingOne/README.md"),
+        relativePath: "README.md",
+        modifiedAt: .distantPast,
+        size: 0
+    )
+    let second = NoteDocument(
+        url: URL(filePath: "/tmp/ZhijingTwo/README.md"),
+        relativePath: "README.md",
+        modifiedAt: .distantPast,
+        size: 0
+    )
+
+    #expect(first.id != second.id)
 }
 
 @Test func connectionTestRejectsMissingKeyBeforeNetworking() async {

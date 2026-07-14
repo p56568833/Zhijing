@@ -6,7 +6,7 @@ struct NoteDocument: Identifiable, Hashable, Codable, Sendable {
     let modifiedAt: Date
     let size: Int
 
-    var id: String { relativePath }
+    var id: String { url.standardizedFileURL.path }
     var title: String {
         url.deletingPathExtension().lastPathComponent
     }
@@ -35,17 +35,8 @@ struct NoteDocument: Identifiable, Hashable, Codable, Sendable {
 struct DocumentOpenRequest: Equatable, Sendable {
     let root: URL
     let relativePaths: [String]
-}
-
-enum DocumentOpenRequestError: LocalizedError {
-    case multipleExternalFolders
-
-    var errorDescription: String? {
-        switch self {
-        case .multipleExternalFolders:
-            "一次只能打开同一文件夹中的文稿；若文件已在当前知识库内，则可以跨子文件夹同时打开。"
-        }
-    }
+    let externalURLs: [URL]
+    let firstURL: URL
 }
 
 enum DocumentOpenRequestResolver {
@@ -60,24 +51,21 @@ enum DocumentOpenRequestResolver {
         guard let first = documents.first else { return nil }
 
         let currentRoot = currentLibrary?.standardizedFileURL
-        let root: URL
-        if let currentRoot, documents.allSatisfy({ isContained($0, in: currentRoot) }) {
-            root = currentRoot
-        } else {
-            let parent = first.deletingLastPathComponent().standardizedFileURL
-            guard documents.allSatisfy({
-                $0.deletingLastPathComponent().standardizedFileURL == parent
-            }) else {
-                throw DocumentOpenRequestError.multipleExternalFolders
-            }
-            root = parent
-        }
+        let root = currentRoot
+            ?? first.deletingLastPathComponent().standardizedFileURL
 
         let rootPath = root.path
-        let relativePaths = documents.map { url in
+        let libraryDocuments = documents.filter { isContained($0, in: root) }
+        let relativePaths = libraryDocuments.map { url in
             String(url.path.dropFirst(rootPath.count + 1))
         }
-        return DocumentOpenRequest(root: root, relativePaths: relativePaths)
+        let externalURLs = documents.filter { !isContained($0, in: root) }
+        return DocumentOpenRequest(
+            root: root,
+            relativePaths: relativePaths,
+            externalURLs: externalURLs,
+            firstURL: first
+        )
     }
 
     private static func isContained(_ url: URL, in root: URL) -> Bool {

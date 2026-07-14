@@ -333,9 +333,9 @@ private struct DocumentMetricsBar: View {
                     ProgressView().controlSize(.mini)
                 }
                 Text(store.saveState.label)
-                if let folder = store.selectedDocument?.folder, !folder.isEmpty {
+                if let location = store.selectedDocumentLocationLabel {
                     Text("·")
-                    Text(folder)
+                    Text(location)
                         .lineLimit(1)
                 }
             }

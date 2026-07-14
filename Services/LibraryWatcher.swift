@@ -11,19 +11,30 @@ final class LibraryWatcher: @unchecked Sendable {
 
     func start(
         root: URL,
+        additionalFiles: [URL] = [],
         excludedFolders: [String],
         onChange: @escaping @Sendable ([URL]) -> Void
     ) {
         stop()
         let rootPath = root.standardizedFileURL.path
         let exclusions = Set(excludedFolders)
+        let externalFilePaths = Set(
+            additionalFiles.map { $0.standardizedFileURL.path }
+        )
+        let externalParentPaths = Set(
+            additionalFiles.map {
+                $0.deletingLastPathComponent().standardizedFileURL.path
+            }
+        )
         self.onChange = { urls in
             let filtered = urls.filter {
-                Self.shouldInclude(
+                let path = $0.standardizedFileURL.path
+                return Self.shouldInclude(
                     $0,
                     rootPath: rootPath,
                     excludedFolders: exclusions
-                )
+                ) || externalFilePaths.contains(path)
+                    || externalParentPaths.contains(path)
             }
             if !filtered.isEmpty {
                 onChange(filtered)
@@ -42,7 +53,8 @@ final class LibraryWatcher: @unchecked Sendable {
             kFSEventStreamCreateFlagUseCFTypes |
             kFSEventStreamCreateFlagNoDefer
         )
-        let paths = [root.path] as CFArray
+        let paths = ([root.standardizedFileURL.path] + Array(externalParentPaths))
+            .sorted() as CFArray
         guard let stream = FSEventStreamCreate(
             kCFAllocatorDefault,
             Self.handleEvents,

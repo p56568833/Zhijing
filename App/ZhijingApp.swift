@@ -8,7 +8,7 @@ struct ZhijingApp: App {
     @State private var store = AppStore()
 
     var body: some Scene {
-        WindowGroup("知境", id: "main") {
+        Window("知境", id: "main") {
             ContentView(store: store)
                 .frame(minWidth: 940, minHeight: 620)
                 .preferredColorScheme(store.colorScheme.colorScheme)
@@ -143,7 +143,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func open(_ urls: [URL]) {
+        presentMainWindow()
         store?.openDocuments(at: urls)
+    }
+
+    private func presentMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            NSApp.windows.first(where: {
+                $0.identifier?.rawValue == "zhijing-main"
+            })?.makeKeyAndOrderFront(nil)
+        }
     }
 }
 
