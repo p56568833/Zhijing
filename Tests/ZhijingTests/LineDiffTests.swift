@@ -62,9 +62,11 @@ import PDFKit
         replacement: "开头\n新段落\n结尾"
     ))
 
-    #expect(presentation.text == "开头\n旧段落\n新段落\n结尾")
+    #expect(presentation.text == "开头\n旧段落\n新段落\n \n结尾")
     #expect(presentation.decorations.count == 2)
     #expect(presentation.decorations.map(\.kind) == [.removed, .inserted])
+    #expect(presentation.decorations.map(\.hunkID) == [0, 0])
+    #expect(presentation.controlAnchors.map(\.hunkID) == [0])
     let source = presentation.text as NSString
     #expect(source.substring(with: presentation.decorations[0].range) == "旧段落")
     #expect(source.substring(with: presentation.decorations[1].range) == "新段落")
@@ -78,7 +80,18 @@ import PDFKit
 
     #expect(presentation.text == "第一行\n\n最后一行\n")
     #expect(presentation.decorations.isEmpty)
+    #expect(presentation.controlAnchors.isEmpty)
     #expect(presentation.firstChangeRange == nil)
+}
+
+@Test func inlineDiffPresentationProvidesOneDecisionControlPerHunk() {
+    let presentation = InlineDiffPresentation(diff: LineDiff(
+        original: "开头\n旧段一\n中间\n旧段二\n结尾",
+        replacement: "开头\n新段一\n中间\n新段二\n结尾"
+    ))
+
+    #expect(presentation.controlAnchors.map(\.hunkID) == [0, 1])
+    #expect(Set(presentation.decorations.map(\.hunkID)) == [0, 1])
 }
 
 @Test func aiEditPatchChangesOnlyReturnedPassages() throws {

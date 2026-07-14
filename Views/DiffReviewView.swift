@@ -5,6 +5,7 @@ struct DiffReviewView: View {
     let proposal: EditProposal
     private let diff: LineDiff
     private let presentation: InlineDiffPresentation
+    @State private var decisions: [LineDiffHunk.ID: Bool] = [:]
 
     init(store: AppStore, proposal: EditProposal) {
         self.store = store
@@ -18,68 +19,33 @@ struct DiffReviewView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            InlineDiffSourceEditor(
-                presentation: presentation,
-                proposalID: proposal.id
-            )
-            reviewActions
-                .padding(18)
-        }
+        InlineDiffSourceEditor(
+            presentation: presentation,
+            proposalID: proposal.id,
+            decisions: decisions,
+            onDecision: decide
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor))
     }
 
-    private var reviewActions: some View {
-        HStack(spacing: 10) {
-            Label(reviewTitle, systemImage: reviewIcon)
-                .font(.callout.weight(.medium))
-            Text("−\(diff.removedOffsets.count)  +\(diff.insertedOffsets.count)")
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-            Divider()
-                .frame(height: 20)
-            Button("不同意") {
-                store.cancelEditProposal()
-            }
-            .keyboardShortcut(.cancelAction)
-            Button("同意") {
-                store.applyProposal()
-            }
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.defaultAction)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(.separator.opacity(0.7), lineWidth: 0.5)
-        }
-        .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
-        .help(reviewHelp)
-    }
+    private func decide(hunkID: LineDiffHunk.ID, accepted: Bool) {
+        guard diff.hunks.contains(where: { $0.id == hunkID }) else { return }
+        var updatedDecisions = decisions
+        updatedDecisions[hunkID] = accepted
+        decisions = updatedDecisions
 
-    private var reviewTitle: String {
-        switch proposal.source {
-        case .assistant: "AI 修改"
-        case .externalFile: "外部修改"
-        }
-    }
-
-    private var reviewIcon: String {
-        switch proposal.source {
-        case .assistant: "sparkles"
-        case .externalFile: "arrow.triangle.2.circlepath"
-        }
-    }
-
-    private var reviewHelp: String {
-        switch proposal.source {
-        case .assistant:
-            "红色为原文，绿色为 AI 修改；同意前会保存版本快照。"
-        case .externalFile:
-            "红色为原文，绿色为外部修改；不同意时会保存外部版本后恢复原稿。"
+        let allHunkIDs = Set(diff.hunks.map(\.id))
+        guard allHunkIDs.isSubset(of: Set(updatedDecisions.keys)) else { return }
+        let acceptedHunkIDs = Set(updatedDecisions.compactMap { id, accepted in
+            accepted ? id : nil
+        })
+        if acceptedHunkIDs.isEmpty {
+            store.cancelEditProposal()
+        } else {
+            store.applyProposal(
+                replacement: diff.applying(acceptedHunkIDs: acceptedHunkIDs)
+            )
         }
     }
 }

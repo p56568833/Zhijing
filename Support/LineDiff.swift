@@ -129,39 +129,58 @@ enum InlineDiffLineKind: Equatable {
 struct InlineDiffDecoration: Equatable {
     let range: NSRange
     let kind: InlineDiffLineKind
+    let hunkID: LineDiffHunk.ID
+}
+
+struct InlineDiffControlAnchor: Equatable {
+    let range: NSRange
+    let hunkID: LineDiffHunk.ID
 }
 
 struct InlineDiffPresentation {
     let text: String
     let decorations: [InlineDiffDecoration]
+    let controlAnchors: [InlineDiffControlAnchor]
 
     var firstChangeRange: NSRange? {
         decorations.first?.range
     }
 
     init(diff: LineDiff) {
-        var rows: [(text: String, kind: InlineDiffLineKind)] = []
+        typealias Row = (
+            text: String,
+            kind: InlineDiffLineKind,
+            hunkID: LineDiffHunk.ID?,
+            controlHunkID: LineDiffHunk.ID?
+        )
+        var rows: [Row] = []
         var originalCursor = 0
 
         for hunk in diff.hunks {
             if originalCursor < hunk.originalRange.lowerBound {
                 rows.append(contentsOf: diff.originalLines[
                     originalCursor..<hunk.originalRange.lowerBound
-                ].map { ($0, .unchanged) })
+                ].map { ($0, .unchanged, nil, nil) })
             }
-            rows.append(contentsOf: hunk.originalLines.map { ($0, .removed) })
-            rows.append(contentsOf: hunk.replacementLines.map { ($0, .inserted) })
+            rows.append(contentsOf: hunk.originalLines.map {
+                ($0, .removed, hunk.id, nil)
+            })
+            rows.append(contentsOf: hunk.replacementLines.map {
+                ($0, .inserted, hunk.id, nil)
+            })
+            rows.append((" ", .unchanged, nil, hunk.id))
             originalCursor = hunk.originalRange.upperBound
         }
 
         if originalCursor < diff.originalLines.count {
             rows.append(contentsOf: diff.originalLines[originalCursor...].map {
-                ($0, .unchanged)
+                ($0, .unchanged, nil, nil)
             })
         }
 
         var renderedText = ""
         var renderedDecorations: [InlineDiffDecoration] = []
+        var renderedControlAnchors: [InlineDiffControlAnchor] = []
         var utf16Location = 0
 
         for (index, row) in rows.enumerated() {
@@ -170,10 +189,17 @@ struct InlineDiffPresentation {
                 utf16Location += 1
             }
             let length = row.text.utf16.count
-            if row.kind != .unchanged {
+            if row.kind != .unchanged, let hunkID = row.hunkID {
                 renderedDecorations.append(InlineDiffDecoration(
                     range: NSRange(location: utf16Location, length: length),
-                    kind: row.kind
+                    kind: row.kind,
+                    hunkID: hunkID
+                ))
+            }
+            if let hunkID = row.controlHunkID {
+                renderedControlAnchors.append(InlineDiffControlAnchor(
+                    range: NSRange(location: utf16Location, length: length),
+                    hunkID: hunkID
                 ))
             }
             renderedText.append(row.text)
@@ -182,5 +208,6 @@ struct InlineDiffPresentation {
 
         text = renderedText
         decorations = renderedDecorations
+        controlAnchors = renderedControlAnchors
     }
 }

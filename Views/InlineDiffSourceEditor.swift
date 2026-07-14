@@ -1,18 +1,55 @@
 import AppKit
 import SwiftUI
 
+private final class InlineDiffDecisionControl: NSSegmentedControl {
+    let hunkID: LineDiffHunk.ID
+    var onDecision: ((LineDiffHunk.ID, Bool) -> Void)?
+
+    init(hunkID: LineDiffHunk.ID) {
+        self.hunkID = hunkID
+        super.init(
+            labels: ["不同意", "同意"],
+            trackingMode: .selectOne,
+            target: nil,
+            action: nil
+        )
+        target = self
+        action = #selector(decisionChanged(_:))
+        segmentStyle = .rounded
+        controlSize = .small
+        setWidth(62, forSegment: 0)
+        setWidth(62, forSegment: 1)
+        selectedSegment = -1
+        toolTip = "只处理这一处修改；所有变更都决定后会自动保存"
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setDecision(_ decision: Bool?) {
+        selectedSegment = decision.map { $0 ? 1 : 0 } ?? -1
+    }
+
+    @objc private func decisionChanged(_ sender: NSSegmentedControl) {
+        guard sender.selectedSegment >= 0 else { return }
+        onDecision?(hunkID, sender.selectedSegment == 1)
+    }
+}
+
 final class InlineDiffTextView: NSTextView {
     var decorations: [InlineDiffDecoration] = [] {
         didSet { needsDisplay = true }
     }
+    private var controlAnchors: [InlineDiffControlAnchor] = []
+    private var decisionControls: [LineDiffHunk.ID: InlineDiffDecisionControl] = [:]
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard let layoutManager, let textContainer else { return }
+        guard let layoutManager else { return }
 
         for decoration in decorations {
             let lineRange = effectiveLineRange(for: decoration.range)
-            guard lineRange.location <= string.utf16.count else { continue }
             let glyphRange = layoutManager.glyphRange(
                 forCharacterRange: lineRange,
                 actualCharacterRange: nil
@@ -24,29 +61,97 @@ final class InlineDiffTextView: NSTextView {
             ) { _, usedRect, _, fragmentGlyphRange, _ in
                 let intersection = NSIntersectionRange(glyphRange, fragmentGlyphRange)
                 guard intersection.length > 0 else { return }
-                let contentRect = layoutManager.boundingRect(
-                    forGlyphRange: intersection,
-                    in: textContainer
-                )
-                let minimumWidth = min(180, max(80, textContainer.containerSize.width * 0.28))
                 let highlightRect = NSRect(
-                    x: self.textContainerOrigin.x + contentRect.minX - 5,
-                    y: self.textContainerOrigin.y + usedRect.minY + 1,
-                    width: max(contentRect.width + 10, minimumWidth),
-                    height: max(18, usedRect.height - 2)
+                    x: self.textContainerOrigin.x - 8,
+                    y: self.textContainerOrigin.y + usedRect.minY,
+                    width: max(
+                        0,
+                        self.bounds.width - self.textContainerOrigin.x - 10
+                    ),
+                    height: usedRect.height
                 )
                 guard highlightRect.intersects(rect) else { return }
 
                 let color: NSColor = decoration.kind == .removed
                     ? .systemRed
                     : .systemGreen
-                color.withAlphaComponent(0.10).setFill()
-                let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
-                path.fill()
-                color.withAlphaComponent(0.72).setStroke()
-                path.lineWidth = 1.5
-                path.stroke()
+                color.withAlphaComponent(0.075).setFill()
+                highlightRect.fill()
+
+                let marker = decoration.kind == .removed ? "−" : "+"
+                (marker as NSString).draw(
+                    at: NSPoint(
+                        x: self.textContainerOrigin.x - 21,
+                        y: self.textContainerOrigin.y + usedRect.minY + 3
+                    ),
+                    withAttributes: [
+                        .font: NSFont.monospacedSystemFont(
+                            ofSize: 12,
+                            weight: .semibold
+                        ),
+                        .foregroundColor: color.withAlphaComponent(0.9)
+                    ]
+                )
             }
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        layoutDecisionControls()
+    }
+
+    func configureDecisionControls(
+        anchors: [InlineDiffControlAnchor],
+        decisions: [LineDiffHunk.ID: Bool],
+        onDecision: @escaping (LineDiffHunk.ID, Bool) -> Void
+    ) {
+        controlAnchors = anchors
+        let activeIDs = Set(anchors.map(\.hunkID))
+        let removedIDs = decisionControls.keys.filter { !activeIDs.contains($0) }
+        for id in removedIDs {
+            decisionControls[id]?.removeFromSuperview()
+            decisionControls[id] = nil
+        }
+
+        for anchor in anchors {
+            let control = decisionControls[anchor.hunkID] ?? {
+                let control = InlineDiffDecisionControl(hunkID: anchor.hunkID)
+                addSubview(control)
+                decisionControls[anchor.hunkID] = control
+                return control
+            }()
+            control.onDecision = onDecision
+            control.setDecision(decisions[anchor.hunkID])
+        }
+        needsLayout = true
+    }
+
+    private func layoutDecisionControls() {
+        guard let layoutManager, let textContainer else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        for anchor in controlAnchors {
+            guard let control = decisionControls[anchor.hunkID] else { continue }
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: anchor.range,
+                actualCharacterRange: nil
+            )
+            guard glyphRange.location < layoutManager.numberOfGlyphs else { continue }
+            let fragment = layoutManager.lineFragmentRect(
+                forGlyphAt: glyphRange.location,
+                effectiveRange: nil
+            )
+            let size = control.intrinsicContentSize
+            control.frame = NSRect(
+                x: max(
+                    textContainerOrigin.x,
+                    bounds.width - size.width - 22
+                ),
+                y: textContainerOrigin.y + fragment.minY
+                    + max(0, (fragment.height - size.height) / 2),
+                width: size.width,
+                height: size.height
+            )
         }
     }
 
@@ -61,6 +166,8 @@ final class InlineDiffTextView: NSTextView {
 struct InlineDiffSourceEditor: NSViewRepresentable {
     let presentation: InlineDiffPresentation
     let proposalID: UUID
+    let decisions: [LineDiffHunk.ID: Bool]
+    let onDecision: (LineDiffHunk.ID, Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -73,12 +180,6 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
-        scrollView.contentInsets = NSEdgeInsets(
-            top: 0,
-            left: 0,
-            bottom: 72,
-            right: 0
-        )
 
         let textView = InlineDiffTextView(frame: scrollView.contentView.bounds)
         textView.isEditable = false
@@ -110,6 +211,8 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         context.coordinator.apply(
             presentation,
             proposalID: proposalID,
+            decisions: decisions,
+            onDecision: onDecision,
             to: textView,
             scrollView: scrollView,
             revealFirstChange: true
@@ -124,6 +227,8 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         context.coordinator.apply(
             presentation,
             proposalID: proposalID,
+            decisions: decisions,
+            onDecision: onDecision,
             to: textView,
             scrollView: scrollView,
             revealFirstChange: context.coordinator.proposalID != proposalID
@@ -137,26 +242,58 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
         func apply(
             _ presentation: InlineDiffPresentation,
             proposalID: UUID,
+            decisions: [LineDiffHunk.ID: Bool],
+            onDecision: @escaping (LineDiffHunk.ID, Bool) -> Void,
             to textView: InlineDiffTextView,
             scrollView: NSScrollView,
             revealFirstChange: Bool
         ) {
-            guard self.proposalID != proposalID || textView.string != presentation.text else {
-                return
-            }
+            let contentChanged = self.proposalID != proposalID
+                || textView.string != presentation.text
             self.proposalID = proposalID
-            textView.string = presentation.text
-            MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
-            MarkdownPresentationHighlighter.apply(to: textView)
-            applyDiffAttributes(presentation.decorations, to: textView)
-            textView.decorations = presentation.decorations
-            scrollView.verticalRulerView?.needsDisplay = true
 
-            if revealFirstChange, let range = presentation.firstChangeRange {
+            if contentChanged {
+                textView.string = presentation.text
+                MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+                applyControlLineSpacing(
+                    presentation.controlAnchors,
+                    to: textView
+                )
+                MarkdownPresentationHighlighter.apply(to: textView)
+                applyDiffAttributes(presentation.decorations, to: textView)
+                textView.decorations = presentation.decorations
+                scrollView.verticalRulerView?.needsDisplay = true
+            }
+
+            textView.configureDecisionControls(
+                anchors: presentation.controlAnchors,
+                decisions: decisions,
+                onDecision: onDecision
+            )
+
+            if contentChanged, revealFirstChange,
+               let range = presentation.firstChangeRange {
                 DispatchQueue.main.async { [weak textView, weak scrollView] in
                     guard let textView, let scrollView else { return }
                     self.reveal(range, in: textView, scrollView: scrollView)
                 }
+            }
+        }
+
+        private func applyControlLineSpacing(
+            _ anchors: [InlineDiffControlAnchor],
+            to textView: NSTextView
+        ) {
+            guard let textStorage = textView.textStorage else { return }
+            let style = NSMutableParagraphStyle()
+            style.minimumLineHeight = 34
+            style.maximumLineHeight = 34
+            for anchor in anchors where anchor.range.length > 0 {
+                textStorage.addAttribute(
+                    .paragraphStyle,
+                    value: style,
+                    range: anchor.range
+                )
             }
         }
 
@@ -170,11 +307,11 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
                     ? .systemRed
                     : .systemGreen
                 var attributes: [NSAttributedString.Key: Any] = [
-                    .foregroundColor: color
+                    .foregroundColor: color.withAlphaComponent(0.92)
                 ]
                 if decoration.kind == .removed {
                     attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
-                    attributes[.strikethroughColor] = color
+                    attributes[.strikethroughColor] = color.withAlphaComponent(0.8)
                 }
                 layoutManager.addTemporaryAttributes(
                     attributes,
