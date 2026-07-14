@@ -94,6 +94,15 @@ import PDFKit
     #expect(Set(presentation.decorations.map(\.hunkID)) == [0, 1])
 }
 
+@MainActor
+@Test func inlineDiffDecisionControlCanBeCreated() {
+    let control = InlineDiffDecisionControl(hunkID: 7)
+
+    #expect(control.hunkID == 7)
+    #expect(control.intrinsicContentSize.width > 0)
+    #expect(control.intrinsicContentSize.height > 0)
+}
+
 @Test func aiEditPatchChangesOnlyReturnedPassages() throws {
     let original = """
     # 标题

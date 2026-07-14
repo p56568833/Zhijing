@@ -1,25 +1,29 @@
 import AppKit
 import SwiftUI
 
-private final class InlineDiffDecisionControl: NSSegmentedControl {
+final class InlineDiffDecisionControl: NSView {
     let hunkID: LineDiffHunk.ID
     var onDecision: ((LineDiffHunk.ID, Bool) -> Void)?
 
+    private let rejectButton = NSButton()
+    private let acceptButton = NSButton()
+
     init(hunkID: LineDiffHunk.ID) {
         self.hunkID = hunkID
-        super.init(
-            labels: ["不同意", "同意"],
-            trackingMode: .selectOne,
-            target: nil,
-            action: nil
+        super.init(frame: .zero)
+
+        configure(
+            rejectButton,
+            title: "不同意",
+            action: #selector(rejectChange)
         )
-        target = self
-        action = #selector(decisionChanged(_:))
-        segmentStyle = .rounded
-        controlSize = .small
-        setWidth(62, forSegment: 0)
-        setWidth(62, forSegment: 1)
-        selectedSegment = -1
+        configure(
+            acceptButton,
+            title: "同意",
+            action: #selector(acceptChange)
+        )
+        addSubview(rejectButton)
+        addSubview(acceptButton)
         toolTip = "只处理这一处修改；所有变更都决定后会自动保存"
     }
 
@@ -27,13 +31,55 @@ private final class InlineDiffDecisionControl: NSSegmentedControl {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func setDecision(_ decision: Bool?) {
-        selectedSegment = decision.map { $0 ? 1 : 0 } ?? -1
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 124, height: 24)
     }
 
-    @objc private func decisionChanged(_ sender: NSSegmentedControl) {
-        guard sender.selectedSegment >= 0 else { return }
-        onDecision?(hunkID, sender.selectedSegment == 1)
+    override func layout() {
+        super.layout()
+        let gap: CGFloat = 6
+        let buttonWidth = (bounds.width - gap) / 2
+        rejectButton.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: buttonWidth,
+            height: bounds.height
+        )
+        acceptButton.frame = NSRect(
+            x: buttonWidth + gap,
+            y: 0,
+            width: buttonWidth,
+            height: bounds.height
+        )
+    }
+
+    func setDecision(_ decision: Bool?) {
+        rejectButton.state = decision == false ? .on : .off
+        acceptButton.state = decision == true ? .on : .off
+    }
+
+    private func configure(
+        _ button: NSButton,
+        title: String,
+        action: Selector
+    ) {
+        button.title = title
+        button.target = self
+        button.action = action
+        button.setButtonType(.pushOnPushOff)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    }
+
+    @objc private func rejectChange() {
+        setDecision(false)
+        onDecision?(hunkID, false)
+    }
+
+    @objc private func acceptChange() {
+        setDecision(true)
+        onDecision?(hunkID, true)
     }
 }
 
