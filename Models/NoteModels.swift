@@ -333,6 +333,7 @@ enum SaveState: Equatable, Sendable {
     case idle
     case saving
     case saved(Date)
+    case reviewingExternalChange
     case failed(String)
 
     var label: String {
@@ -340,6 +341,7 @@ enum SaveState: Equatable, Sendable {
         case .idle: "未修改"
         case .saving: "正在保存…"
         case .saved: "已保存"
+        case .reviewingExternalChange: "等待确认外部修改"
         case .failed: "保存失败"
         }
     }
@@ -376,6 +378,11 @@ struct ExternalFileConflict: Identifiable, Sendable {
     var fileWasRemoved: Bool { diskText == nil }
 }
 
+enum EditProposalSource: Equatable, Sendable {
+    case assistant
+    case externalFile
+}
+
 struct EditProposal: Identifiable, Sendable {
     let id = UUID()
     let documentPath: String
@@ -385,6 +392,7 @@ struct EditProposal: Identifiable, Sendable {
     let selectionLineRange: Range<Int>?
     let selectionRange: NSRange?
     let outsideSelectionReason: String?
+    let source: EditProposalSource
 
     init(
         documentPath: String,
@@ -393,7 +401,8 @@ struct EditProposal: Identifiable, Sendable {
         instruction: String,
         selectionLineRange: Range<Int>? = nil,
         selectionRange: NSRange? = nil,
-        outsideSelectionReason: String? = nil
+        outsideSelectionReason: String? = nil,
+        source: EditProposalSource = .assistant
     ) {
         self.documentPath = documentPath
         self.original = original
@@ -402,6 +411,7 @@ struct EditProposal: Identifiable, Sendable {
         self.selectionLineRange = selectionLineRange
         self.selectionRange = selectionRange
         self.outsideSelectionReason = outsideSelectionReason
+        self.source = source
     }
 
     func canApply(to documentPath: String, currentText: String) -> Bool {

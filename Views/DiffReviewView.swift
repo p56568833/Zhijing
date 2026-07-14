@@ -5,7 +5,6 @@ struct DiffReviewView: View {
     let proposal: EditProposal
     private let diff: LineDiff
     @State private var acceptedHunkIDs: Set<LineDiffHunk.ID>
-    @Environment(\.dismiss) private var dismiss
 
     init(store: AppStore, proposal: EditProposal) {
         self.store = store
@@ -54,7 +53,8 @@ struct DiffReviewView: View {
             Divider()
             footer
         }
-        .frame(minWidth: 920, minHeight: 640)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private func isOutsideSelection(_ hunk: LineDiffHunk) -> Bool {
@@ -79,7 +79,7 @@ struct DiffReviewView: View {
     private var header: some View {
         HStack {
             VStack(alignment: .leading, spacing: 3) {
-                Text("查看 AI 修改")
+                Label(reviewTitle, systemImage: reviewIcon)
                     .font(.title2.weight(.semibold))
                 Text(proposal.instruction)
                     .font(.callout)
@@ -106,31 +106,53 @@ struct DiffReviewView: View {
         .padding(18)
     }
 
+    private var reviewTitle: String {
+        switch proposal.source {
+        case .assistant: "审阅 AI 修改"
+        case .externalFile: "审阅外部文件修改"
+        }
+    }
+
+    private var reviewIcon: String {
+        switch proposal.source {
+        case .assistant: "sparkles"
+        case .externalFile: "arrow.triangle.2.circlepath"
+        }
+    }
+
     private var footer: some View {
         HStack {
-            Label("应用前会自动保存一个版本快照", systemImage: "clock.arrow.circlepath")
+            Label(footerMessage, systemImage: "clock.arrow.circlepath")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
             Spacer()
             Text("已选择 \(acceptedHunkIDs.count) / \(diff.hunks.count) 段")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Button("取消") {
-                store.editProposal = nil
-                dismiss()
+                store.cancelEditProposal()
             }
-            Button("应用所选修改") {
+            Button("同意所选修改") {
                 store.applyProposal(
                     replacement: diff.applying(
                         acceptedHunkIDs: acceptedHunkIDs
                     )
                 )
-                dismiss()
             }
             .buttonStyle(.borderedProminent)
             .disabled(acceptedHunkIDs.isEmpty)
         }
         .padding(14)
+    }
+
+    private var footerMessage: String {
+        switch proposal.source {
+        case .assistant:
+            "应用前会自动保存一个版本快照"
+        case .externalFile:
+            "外部修改已完成；取消时会保存外部版本后恢复原稿"
+        }
     }
 }
 
@@ -179,20 +201,17 @@ private struct DiffHunkView: View {
 
             Divider()
 
-            HStack(alignment: .top, spacing: 0) {
-                DiffHunkColumn(
-                    title: "原文",
-                    lines: hunk.originalLines,
-                    startingLine: hunk.originalRange.lowerBound + 1,
-                    tint: .red
-                )
-                Divider()
-                DiffHunkColumn(
-                    title: "AI 修改",
-                    lines: hunk.replacementLines,
-                    startingLine: hunk.replacementRange.lowerBound + 1,
-                    tint: .green
-                )
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 0) {
+                    originalColumn.frame(minWidth: 300)
+                    Divider()
+                    replacementColumn.frame(minWidth: 300)
+                }
+                VStack(spacing: 0) {
+                    originalColumn
+                    Divider()
+                    replacementColumn
+                }
             }
         }
         .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 10))
@@ -203,6 +222,24 @@ private struct DiffHunkView: View {
                     lineWidth: 1
                 )
         }
+    }
+
+    private var originalColumn: some View {
+        DiffHunkColumn(
+            title: "原文",
+            lines: hunk.originalLines,
+            startingLine: hunk.originalRange.lowerBound + 1,
+            tint: .red
+        )
+    }
+
+    private var replacementColumn: some View {
+        DiffHunkColumn(
+            title: "修改后",
+            lines: hunk.replacementLines,
+            startingLine: hunk.replacementRange.lowerBound + 1,
+            tint: .green
+        )
     }
 }
 

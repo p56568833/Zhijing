@@ -81,9 +81,6 @@ struct ContentView: View {
                 }
             }
         }
-        .sheet(item: $store.editProposal) { proposal in
-            DiffReviewView(store: store, proposal: proposal)
-        }
         .sheet(item: $store.selectionEditRequest) { request in
             SelectionEditPromptView(store: store, request: request)
         }

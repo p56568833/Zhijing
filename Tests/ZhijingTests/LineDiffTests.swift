@@ -623,6 +623,26 @@ import PDFKit
     #expect(!proposal.canApply(to: "另一篇.md", currentText: "生成建议时的正文"))
 }
 
+@Test func editProposalsDistinguishAssistantAndExternalFileChanges() {
+    let assistant = EditProposal(
+        documentPath: "文章.md",
+        original: "原稿",
+        replacement: "AI 修改",
+        instruction: "润色"
+    )
+    let external = EditProposal(
+        documentPath: "文章.md",
+        original: "原稿",
+        replacement: "外部 AI 修改",
+        instruction: "外部修改",
+        source: .externalFile
+    )
+
+    #expect(assistant.source == .assistant)
+    #expect(external.source == .externalFile)
+    #expect(SaveState.reviewingExternalChange.label == "等待确认外部修改")
+}
+
 @MainActor
 @Test func editorIgnoresObservableFeedbackUntilContentRevisionChanges() {
     let textView = MarkdownEditorTextView()

@@ -534,7 +534,9 @@ final class AppStore {
                 }
                 let reasons = outsideEdits.compactMap(\.reason)
                     .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                if selectedDocument?.relativePath == document.relativePath {
+                if selectedDocument?.relativePath == document.relativePath,
+                   editProposal == nil,
+                   editorText == originalText {
                     editProposal = EditProposal(
                         documentPath: document.relativePath,
                         original: originalText,
@@ -582,6 +584,10 @@ final class AppStore {
     }
 
     func prepareForTermination() -> Bool {
+        guard editProposal == nil else {
+            errorMessage = "请先接受或取消当前修改，再退出知境。"
+            return false
+        }
         guard saveNow() else { return false }
         do {
             try chatPersistence.saveSynchronously(chats)
@@ -932,7 +938,9 @@ final class AppStore {
                         }
                         persistChats()
                         if let editText = extractedEdit {
-                            if selectedDocument?.id == document.id {
+                            if selectedDocument?.id == document.id,
+                               editProposal == nil,
+                               editorText == currentText {
                                 editProposal = EditProposal(
                                     documentPath: document.relativePath,
                                     original: currentText,
@@ -1004,7 +1012,9 @@ final class AppStore {
                 )
                 if !Task.isCancelled,
                    self.generationID == generationID,
-                   selectedDocument?.relativePath == documentPath {
+                   selectedDocument?.relativePath == documentPath,
+                   editProposal == nil,
+                   editorText == originalText {
                     editProposal = EditProposal(
                         documentPath: documentPath,
                         original: originalText,
@@ -1030,9 +1040,22 @@ final class AppStore {
             errorMessage = "生成建议后文稿已经发生变化。为避免覆盖新内容，请重新生成修改建议。"
             return
         }
+        guard validateExternalProposal(proposal, document: document) else { return }
         let finalReplacement = replacement ?? proposal.replacement
         do {
-            _ = try knowledgeBase.createSnapshot(text: editorText, document: document)
+            _ = try knowledgeBase.createSnapshot(
+                text: editorText,
+                document: document,
+                name: proposal.source == .externalFile ? "应用外部修改前" : nil
+            )
+            if proposal.source == .externalFile,
+               finalReplacement != proposal.replacement {
+                _ = try knowledgeBase.createSnapshot(
+                    text: proposal.replacement,
+                    document: document,
+                    name: "外部修改完整版本"
+                )
+            }
             replaceEditorText(finalReplacement)
             if proposal.selectionRange != nil {
                 editorNavigationRequest = EditorNavigationRequest(
@@ -1052,6 +1075,68 @@ final class AppStore {
             editProposal = nil
         }
         revisions = knowledgeBase.revisions(for: document)
+    }
+
+    func cancelEditProposal() {
+        guard let proposal = editProposal else { return }
+        guard proposal.source == .externalFile else {
+            editProposal = nil
+            return
+        }
+        guard let document = selectedDocument,
+              proposal.canApply(
+                  to: document.relativePath,
+                  currentText: editorText
+              ) else {
+            errorMessage = "当前文稿已变化，无法安全取消这次外部修改。"
+            return
+        }
+        guard validateExternalProposal(proposal, document: document) else { return }
+
+        do {
+            _ = try knowledgeBase.createSnapshot(
+                text: proposal.replacement,
+                document: document,
+                name: "已取消的外部修改"
+            )
+            let refreshed = try documentWriter.writeSynchronously(
+                proposal.original,
+                to: document,
+                using: knowledgeBase
+            )
+            replaceEditorText(proposal.original)
+            loadedText = proposal.original
+            updateDocumentMetadata(refreshed)
+            editProposal = nil
+            saveState = .saved(.now)
+            revisions = knowledgeBase.revisions(for: document)
+        } catch {
+            errorMessage = "取消外部修改失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func validateExternalProposal(
+        _ proposal: EditProposal,
+        document: NoteDocument
+    ) -> Bool {
+        guard proposal.source == .externalFile else { return true }
+        do {
+            let latestDiskText = try knowledgeBase.read(document)
+            guard latestDiskText != proposal.replacement else { return true }
+            editProposal = EditProposal(
+                documentPath: document.relativePath,
+                original: editorText,
+                replacement: latestDiskText,
+                instruction: "外部文件在审阅期间又被改写，已更新为最新版本",
+                source: .externalFile
+            )
+            saveState = .reviewingExternalChange
+            errorMessage = "外部文件又有新修改，Diff 已更新，请重新确认。"
+            return false
+        } catch {
+            errorMessage = "无法确认外部文件的最新内容：\(error.localizedDescription)"
+            return false
+        }
     }
 
     func createManualSnapshot(name: String? = nil) {
@@ -1410,6 +1495,7 @@ final class AppStore {
             )
             replaceEditorText(diskText)
             loadedText = diskText
+            editProposal = nil
             externalConflict = nil
             saveState = .saved(.now)
             revisions = knowledgeBase.revisions(for: conflict.document)
@@ -1440,6 +1526,10 @@ final class AppStore {
 
     @discardableResult
     private func flushSave() -> Bool {
+        guard editProposal == nil else {
+            errorMessage = "请先接受或取消当前修改。"
+            return false
+        }
         saveTask?.cancel()
         return saveNow()
     }
@@ -1669,9 +1759,26 @@ final class AppStore {
                 loadedText = text
                 saveState = .saved(.now)
             case .reloadFromDisk(let text):
-                replaceEditorText(text)
-                loadedText = text
-                saveState = .saved(.now)
+                if let proposal = editProposal,
+                   proposal.source == .assistant {
+                    externalConflict = ExternalFileConflict(
+                        document: document,
+                        localText: editorText,
+                        diskText: text,
+                        detectedAt: .now
+                    )
+                    saveState = .failed("检测到外部修改")
+                } else if editProposal?.replacement != text {
+                    editProposal = EditProposal(
+                        documentPath: document.relativePath,
+                        original: editorText,
+                        replacement: text,
+                        instruction: "外部工具已完成文件修改，请确认差异",
+                        source: .externalFile
+                    )
+                    hideDocumentFind()
+                    saveState = .reviewingExternalChange
+                }
             case .conflict(let text):
                 externalConflict = ExternalFileConflict(
                     document: document,

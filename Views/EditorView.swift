@@ -13,12 +13,17 @@ struct EditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             editorChrome
-            if store.isDocumentFindVisible, store.selectedDocument != nil {
+            if store.isDocumentFindVisible,
+               store.selectedDocument != nil,
+               store.editProposal == nil {
                 Divider()
                 DocumentFindBar(store: store)
             }
             Divider()
-            if store.isComparisonVisible {
+            if let proposal = store.editProposal {
+                DiffReviewView(store: store, proposal: proposal)
+                    .id(proposal.id)
+            } else if store.isComparisonVisible {
                 HStack(spacing: 0) {
                     primaryEditor
                         .frame(
@@ -67,6 +72,7 @@ struct EditorView: View {
                 }
                 .help("查找当前文稿（⌘F）")
                 .buttonStyle(.plain)
+                .disabled(store.editProposal != nil)
                 Button {
                     showVersions.toggle()
                 } label: {
@@ -75,6 +81,7 @@ struct EditorView: View {
                 }
                 .help("版本历史")
                 .buttonStyle(.plain)
+                .disabled(store.editProposal != nil)
                 Button {
                     store.toggleComparison()
                 } label: {
@@ -86,6 +93,7 @@ struct EditorView: View {
                 }
                 .help("左右分屏对照另一篇文稿")
                 .buttonStyle(.plain)
+                .disabled(store.editProposal != nil)
                 Menu {
                     Button("导出 PDF…") {
                         store.exportCurrentDocument(as: .pdf)
@@ -99,6 +107,7 @@ struct EditorView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+                .disabled(store.editProposal != nil)
                 Picker("编辑模式", selection: $store.isPreviewMode) {
                     Text("编辑").tag(false)
                     Text("阅读").tag(true)
@@ -106,6 +115,7 @@ struct EditorView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .fixedSize()
+                .disabled(store.editProposal != nil)
             }
         }
         .padding(.horizontal, 8)
