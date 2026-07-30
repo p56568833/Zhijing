@@ -2284,10 +2284,12 @@ final class AppStore {
             return
         }
         do {
-            let items = try annotationRepository.loadExternalAnnotations(
+            guard let items = try annotationRepository.loadExternalAnnotations(
                 for: document
-            )
-            if !items.isEmpty {
+            ) else { return }
+            if items.isEmpty {
+                annotations[document.persistenceKey] = nil
+            } else {
                 annotations[document.persistenceKey] = items
             }
         } catch {

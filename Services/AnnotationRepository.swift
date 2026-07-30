@@ -171,7 +171,7 @@ final class AnnotationRepository {
 
     func loadExternalAnnotations(
         for document: NoteDocument
-    ) throws -> [TextAnnotation] {
+    ) throws -> [TextAnnotation]? {
         try persistence.loadExternal(document: document)
     }
 

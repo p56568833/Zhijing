@@ -149,6 +149,43 @@ private func makeTemporaryDirectory() throws -> URL {
     #expect(!FileManager.default.fileExists(atPath: portableURL.path))
 }
 
+@Test func emptyExternalAnnotationSidecarIsDifferentFromAMissingSidecar() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let documentURL = directory.appending(path: "note.md")
+    try "正文".write(to: documentURL, atomically: true, encoding: .utf8)
+    let document = NoteDocument(
+        url: documentURL,
+        relativePath: "note.md",
+        modifiedAt: .now,
+        size: 6
+    )
+    let service = AnnotationPersistenceService(
+        directoryOverride: directory.appending(path: "Support")
+    )
+
+    #expect(try service.loadExternal(document: document) == nil)
+
+    let annotation = TextAnnotation(
+        anchor: TextAnnotationAnchor(
+            selectedText: "正文",
+            utf16Location: 0,
+            prefix: "",
+            suffix: ""
+        ),
+        text: "临时批注"
+    )
+    try service.saveSynchronously(
+        [document.persistenceKey: [annotation]],
+        externalDocuments: [document]
+    )
+    #expect(try service.loadExternal(document: document) == [annotation])
+
+    try service.saveSynchronously([:], externalDocuments: [document])
+    #expect(try service.loadExternal(document: document) == [])
+}
+
 @Test func libraryWatcherIgnoresInternalAnnotationFiles() {
     let root = URL(filePath: "/tmp/zhijing-library", directoryHint: .isDirectory)
     let portable = root.appending(

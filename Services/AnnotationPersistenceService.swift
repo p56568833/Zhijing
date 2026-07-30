@@ -58,9 +58,9 @@ final class AnnotationPersistenceService: @unchecked Sendable {
         })
     }
 
-    func loadExternal(document: NoteDocument) throws -> [TextAnnotation] {
+    func loadExternal(document: NoteDocument) throws -> [TextAnnotation]? {
         let url = sidecarURL(for: document)
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let portable = try decodePortableFile(at: url)
         return portable.documents[document.url.lastPathComponent]
             ?? portable.documents.values.first
