@@ -58,7 +58,9 @@ enum TextAnnotationAnchorResolver {
             return ResolvedTextAnnotation(annotation: annotation, range: expected)
         }
 
-        var candidates: [NSRange] = []
+        var bestRange: NSRange?
+        var bestScore = Int.min
+        var bestScoreIsAmbiguous = false
         var searchRange = NSRange(location: 0, length: source.length)
         while searchRange.length > 0 {
             let match = source.range(
@@ -67,7 +69,14 @@ enum TextAnnotationAnchorResolver {
                 range: searchRange
             )
             guard match.location != NSNotFound else { break }
-            candidates.append(match)
+            let candidateScore = score(match, anchor: anchor, source: source)
+            if candidateScore > bestScore {
+                bestRange = match
+                bestScore = candidateScore
+                bestScoreIsAmbiguous = false
+            } else if candidateScore == bestScore {
+                bestScoreIsAmbiguous = true
+            }
             let nextLocation = NSMaxRange(match)
             guard nextLocation < source.length else { break }
             searchRange = NSRange(
@@ -75,21 +84,8 @@ enum TextAnnotationAnchorResolver {
                 length: source.length - nextLocation
             )
         }
-        guard !candidates.isEmpty else { return nil }
-
-        let ranked = candidates.map { range in
-            (range: range, score: score(range, anchor: anchor, source: source))
-        }.sorted {
-            if $0.score == $1.score {
-                return $0.range.location < $1.range.location
-            }
-            return $0.score > $1.score
-        }
-        guard let best = ranked.first else { return nil }
-        if ranked.count > 1, ranked[1].score == best.score {
-            return nil
-        }
-        return ResolvedTextAnnotation(annotation: annotation, range: best.range)
+        guard let bestRange, !bestScoreIsAmbiguous else { return nil }
+        return ResolvedTextAnnotation(annotation: annotation, range: bestRange)
     }
 
     static func reanchor(

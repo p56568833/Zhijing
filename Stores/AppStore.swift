@@ -107,7 +107,7 @@ final class AppStore {
     private let documentExporter = DocumentExportService()
     private let documentSession = DocumentSessionController()
     private let chatPersistence = ChatPersistenceService()
-    private let annotationPersistence = AnnotationPersistenceService()
+    private let annotationRepository = AnnotationRepository()
     @ObservationIgnored
     private var generationTask: Task<Void, Never>?
     @ObservationIgnored
@@ -128,11 +128,6 @@ final class AppStore {
     private var lastBalanceRefresh: Date?
     @ObservationIgnored
     private var libraryRefreshID = UUID()
-    @ObservationIgnored
-    private var loadedAnnotationRootPath: String?
-    @ObservationIgnored
-    private var annotationPersistenceBlockedRoots: Set<String> = []
-
     var currentMessages: [ChatMessage] {
         guard let key = selectedDocument?.persistenceKey else { return [] }
         return chats[key] ?? []
@@ -144,32 +139,19 @@ final class AppStore {
     }
 
     var currentResolvedAnnotations: [ResolvedTextAnnotation] {
-        currentAnnotations.compactMap {
-            TextAnnotationAnchorResolver.resolve($0, in: editorText)
-        }
+        currentAnnotationResolution.resolved
     }
 
     var currentAnnotationDisplayItems: [TextAnnotationDisplayItem] {
-        currentAnnotations.map { annotation in
-            TextAnnotationDisplayItem(
-                annotation: annotation,
-                range: TextAnnotationAnchorResolver.resolve(
-                    annotation,
-                    in: editorText
-                )?.range
-            )
-        }.sorted { lhs, rhs in
-            switch (lhs.range, rhs.range) {
-            case let (.some(left), .some(right)):
-                return left.location < right.location
-            case (.some, .none):
-                return true
-            case (.none, .some):
-                return false
-            case (.none, .none):
-                return lhs.annotation.createdAt < rhs.annotation.createdAt
-            }
-        }
+        currentAnnotationResolution.displayItems
+    }
+
+    private var currentAnnotationResolution: AnnotationResolutionSnapshot {
+        annotationRepository.resolution(
+            documentKey: selectedDocument?.persistenceKey,
+            annotations: currentAnnotations,
+            text: editorText
+        )
     }
 
     var latestUsage: AIUsage? {
@@ -235,7 +217,7 @@ final class AppStore {
             errorMessage = "对话记录无法读取，已停止覆盖原文件：\(error.localizedDescription)"
         }
         do {
-            annotations = try annotationPersistence.loadStrict()
+            annotations = try annotationRepository.loadCachedAnnotations()
         } catch {
             annotations = [:]
             if errorMessage == nil {
@@ -787,7 +769,7 @@ final class AppStore {
         guard saveNow() else { return false }
         do {
             try chatPersistence.saveSynchronously(chats)
-            try annotationPersistence.saveSynchronously(
+            try annotationRepository.saveSynchronously(
                 annotations,
                 libraryRoot: libraryURL,
                 externalDocuments: externalDocuments
@@ -2219,7 +2201,7 @@ final class AppStore {
         isIndexing = false
 
         let standardizedURL = url.standardizedFileURL
-        loadedAnnotationRootPath = nil
+        annotationRepository.transitionToLibrary()
         libraryURL = standardizedURL
         defaults.set(standardizedURL.path, forKey: Keys.libraryPath)
     }
@@ -2272,44 +2254,24 @@ final class AppStore {
               let key = selectedDocument?.persistenceKey,
               let current = annotations[key],
               !current.isEmpty else { return false }
-        let updated = current.map {
-            TextAnnotationAnchorResolver.reanchor(
-                $0,
-                from: oldText,
-                to: newText,
-                mutation: mutation
-            )
-        }
+        let updated = annotationRepository.reanchor(
+            current,
+            from: oldText,
+            to: newText,
+            mutation: mutation
+        )
         guard updated != current else { return false }
         annotations[key] = updated
         return true
     }
 
     private func loadPortableAnnotationsIfNeeded(at root: URL) {
-        let rootPath = root.standardizedFileURL.path
-        guard loadedAnnotationRootPath != rootPath else { return }
-        let portableURL = root.appending(
-            path: AnnotationPersistenceService.portableFilename
-        )
-        let hasPortableFile = FileManager.default.fileExists(atPath: portableURL.path)
         do {
-            let portable = try annotationPersistence.loadLibrary(at: root)
-            let prefix = rootPath + "/"
-            if hasPortableFile {
-                annotations = annotations.filter { !$0.key.hasPrefix(prefix) }
-                annotations.merge(portable) { _, portableValue in portableValue }
-            } else {
-                let hasLegacyValues = annotations.contains {
-                    $0.key.hasPrefix(prefix) && !$0.value.isEmpty
-                }
-                if hasLegacyValues {
-                    annotationPersistence.saveLibrary(annotations, at: root)
-                }
-            }
-            loadedAnnotationRootPath = rootPath
-            annotationPersistenceBlockedRoots.remove(rootPath)
+            try annotationRepository.loadLibraryIfNeeded(
+                at: root,
+                into: &annotations
+            )
         } catch {
-            annotationPersistenceBlockedRoots.insert(rootPath)
             errorMessage = "批注索引无法读取，已停止覆盖原文件：\(error.localizedDescription)"
         }
     }
@@ -2322,7 +2284,9 @@ final class AppStore {
             return
         }
         do {
-            let items = try annotationPersistence.loadExternal(document: document)
+            let items = try annotationRepository.loadExternalAnnotations(
+                for: document
+            )
             if !items.isEmpty {
                 annotations[document.persistenceKey] = items
             }
@@ -2332,19 +2296,14 @@ final class AppStore {
     }
 
     private func persistAnnotations(for document: NoteDocument? = nil) {
-        annotationPersistence.save(annotations)
-        if let root = libraryURL {
-            let rootPath = root.standardizedFileURL.path
-            if !annotationPersistenceBlockedRoots.contains(rootPath) {
-                annotationPersistence.saveLibrary(annotations, at: root)
-            }
+        let externalDocument = document.flatMap {
+            isLibraryDocument($0) ? nil : $0
         }
-        if let document, !isLibraryDocument(document) {
-            annotationPersistence.saveExternal(
-                annotations[document.persistenceKey] ?? [],
-                document: document
-            )
-        }
+        annotationRepository.save(
+            annotations,
+            libraryRoot: libraryURL,
+            externalDocument: externalDocument
+        )
     }
 
     private static func inferProvider(from endpoint: String?) -> AIProviderPreset {

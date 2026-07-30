@@ -2,6 +2,48 @@ import Foundation
 import Testing
 @testable import Zhijing
 
+@Test func annotationResolutionCacheReusesACompleteDisplaySnapshot() {
+    let text = "甲。需要批注的段落。乙。"
+    let selected = "需要批注的段落"
+    let range = (text as NSString).range(of: selected)
+    let selection = EditorTextSelection(
+        documentID: "note",
+        range: range,
+        text: selected
+    )
+    let anchor = try! #require(
+        TextAnnotationAnchorResolver.makeAnchor(
+            selection: selection,
+            in: text
+        )
+    )
+    let annotation = TextAnnotation(anchor: anchor, text: "批注")
+    var cache = AnnotationResolutionCache()
+
+    let first = cache.resolve(
+        documentKey: "note",
+        annotations: [annotation],
+        text: text
+    )
+    let second = cache.resolve(
+        documentKey: "note",
+        annotations: [annotation],
+        text: text
+    )
+
+    #expect(first == second)
+    #expect(first.resolved.map(\.id) == [annotation.id])
+    #expect(first.displayItems.map(\.range) == [range])
+    #expect(cache.cacheMissCount == 1)
+
+    _ = cache.resolve(
+        documentKey: "note",
+        annotations: [annotation],
+        text: text + "丙。"
+    )
+    #expect(cache.cacheMissCount == 2)
+}
+
 @Test func aiContextBuilderKeepsSelectionAndRelevantLongDocumentSections() {
     let lines = (0..<1_800).map { index in
         index == 900 ? "目标主题出现在这里" : "普通内容 \(index)"
