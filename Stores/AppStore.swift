@@ -83,7 +83,10 @@ final class AppStore {
     var isGenerating: Bool { aiGenerationController.isGenerating }
     var retrievalStatus: String { aiGenerationController.retrievalStatus }
     var errorMessage: String?
-    var editProposal: EditProposal?
+    var editProposal: EditProposal? {
+        get { editProposalController.proposal }
+        set { editProposalController.proposal = newValue }
+    }
     var revisions: [Revision] {
         get { revisionController.revisions }
         set { revisionController.revisions = newValue }
@@ -135,9 +138,10 @@ final class AppStore {
     private let librarySearchController: LibrarySearchController
     private let revisionController: RevisionController
     private let aiGenerationController: AIGenerationController
+    private let editProposalController: EditProposalController
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
-    private let documentSession = DocumentSessionController()
+    private let documentSession: DocumentSessionController
     private let documentFindController = DocumentFindController()
     private let annotationRepository = AnnotationRepository()
     @ObservationIgnored
@@ -146,8 +150,6 @@ final class AppStore {
     private var externalRefreshTask: Task<Void, Never>?
     @ObservationIgnored
     private var pendingLibraryChangeURLs: Set<URL> = []
-    @ObservationIgnored
-    private var snapshottedProposalIDs: Set<UUID> = []
     @ObservationIgnored
     private var documentByPath: [String: NoteDocument] = [:]
     @ObservationIgnored
@@ -228,14 +230,21 @@ final class AppStore {
         defaults: UserDefaults = .standard,
         knowledgeBase: KnowledgeBaseService = .init(),
         aiService: AIService = .init(),
-        chatPersistence: ChatPersistenceService = .init()
+        chatPersistence: ChatPersistenceService = .init(),
+        documentSession: DocumentSessionController = .init()
     ) {
         self.defaults = defaults
         self.knowledgeBase = knowledgeBase
+        self.documentSession = documentSession
         librarySearchController = LibrarySearchController(
             service: knowledgeBase
         )
         revisionController = RevisionController(service: knowledgeBase)
+        editProposalController = EditProposalController(
+            knowledgeBase: knowledgeBase,
+            documentSession: documentSession,
+            revisions: revisionController
+        )
         aiGenerationController = AIGenerationController(
             ai: aiService,
             knowledgeBase: knowledgeBase,
@@ -1021,118 +1030,44 @@ final class AppStore {
         accepted: Bool,
         viewportFraction: Double
     ) {
-        guard let proposal = editProposal,
-              let document = selectedDocument else { return }
-        guard proposal.canApply(
-            to: document.relativePath,
-            currentText: editorText
-        ) else {
-            errorMessage = "文稿已在审阅期间发生变化，无法安全处理这处修改。"
-            return
-        }
-        guard validateExternalProposal(proposal, document: document) else {
-            return
-        }
-
-        let diff = LineDiff(
-            original: proposal.original,
-            replacement: proposal.replacement
-        )
-        guard let resolution = diff.resolving(
-            hunkID: hunkID,
-            accepted: accepted
-        ) else { return }
-
+        guard let document = selectedDocument else { return }
         do {
-            if !snapshottedProposalIDs.contains(proposal.id) {
-                _ = try revisionController.createSnapshot(
-                    text: proposal.original,
-                    document: document,
-                    name: proposal.source == .externalFile
-                        ? "应用外部修改前"
-                        : nil
-                )
-                if proposal.source == .externalFile {
-                    _ = try revisionController.createSnapshot(
-                        text: proposal.replacement,
-                        document: document,
-                        name: "外部修改完整版本"
+            guard let outcome = try editProposalController.resolve(
+                hunkID: hunkID,
+                accepted: accepted,
+                document: document,
+                currentText: editorText
+            ) else { return }
+            switch outcome {
+            case let .applied(
+                text,
+                refreshedDocument,
+                settledLine,
+                isComplete,
+                isExternal
+            ):
+                replaceEditorText(text)
+                updateDocumentMetadata(refreshedDocument)
+                saveState = isExternal && !isComplete
+                    ? .reviewingExternalChange
+                    : .saved(.now)
+                if isComplete {
+                    editorNavigationRequest = EditorNavigationRequest(
+                        documentID: document.id,
+                        line: settledLine,
+                        verticalFraction: viewportFraction
                     )
                 }
-                snapshottedProposalIDs.insert(proposal.id)
+            case .externalFileChanged(let message):
+                saveState = .reviewingExternalChange
+                errorMessage = message
             }
-
-            documentSession.cancelAutosave()
-            let refreshed = try documentSession.writeSynchronously(
-                resolution.settledText,
-                to: document,
-                using: knowledgeBase
-            )
-            replaceEditorText(resolution.settledText)
-            documentSession.loadedText = resolution.settledText
-            updateDocumentMetadata(refreshed)
-            saveState = .saved(.now)
-
-            if let remainingReplacement = resolution.remainingReplacement {
-                editProposal = EditProposal(
-                    id: proposal.id,
-                    documentPath: proposal.documentPath,
-                    original: resolution.settledText,
-                    replacement: remainingReplacement,
-                    instruction: proposal.instruction,
-                    selectionLineRange: proposal.selectionLineRange,
-                    selectionRange: proposal.selectionRange,
-                    outsideSelectionReason: proposal.outsideSelectionReason,
-                    source: proposal.source,
-                    expectedDiskText: proposal.source == .externalFile
-                        ? resolution.settledText
-                        : nil
-                )
-                if proposal.source == .externalFile {
-                    saveState = .reviewingExternalChange
-                }
-            } else {
-                editProposal = nil
-                snapshottedProposalIDs.remove(proposal.id)
-                editorNavigationRequest = EditorNavigationRequest(
-                    documentID: document.id,
-                    line: resolution.settledLine,
-                    verticalFraction: viewportFraction
-                )
-            }
-            revisionController.load(for: document)
+        } catch let error as EditProposalControllerError {
+            errorMessage = error.localizedDescription
         } catch {
             errorMessage = "处理这处修改失败：\(error.localizedDescription)"
         }
     }
-
-    private func validateExternalProposal(
-        _ proposal: EditProposal,
-        document: NoteDocument
-    ) -> Bool {
-        guard proposal.source == .externalFile else { return true }
-        do {
-            let latestDiskText = try knowledgeBase.read(document)
-            let expectedDiskText = proposal.expectedDiskText
-                ?? proposal.replacement
-            guard latestDiskText != expectedDiskText else { return true }
-            snapshottedProposalIDs.remove(proposal.id)
-            editProposal = EditProposal(
-                documentPath: document.relativePath,
-                original: editorText,
-                replacement: latestDiskText,
-                instruction: "外部文件在审阅期间又被改写，已更新为最新版本",
-                source: .externalFile
-            )
-            saveState = .reviewingExternalChange
-            errorMessage = "外部文件又有新修改，Diff 已更新，请重新确认。"
-            return false
-        } catch {
-            errorMessage = "无法确认外部文件的最新内容：\(error.localizedDescription)"
-            return false
-        }
-    }
-
     func createManualSnapshot(name: String? = nil) {
         guard let document = selectedDocument else { return }
         do {
@@ -1363,7 +1298,7 @@ final class AppStore {
             )
             replaceEditorText(diskText)
             documentSession.loadedText = diskText
-            editProposal = nil
+            editProposalController.reset()
             externalConflict = nil
             saveState = .saved(.now)
             revisionController.load(for: conflict.document)
@@ -1550,7 +1485,7 @@ final class AppStore {
         replaceEditorText("", reanchoringAnnotations: false)
         documentSession.reset()
         revisionController.reset()
-        editProposal = nil
+        editProposalController.reset()
         externalConflict = nil
     }
 

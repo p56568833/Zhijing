@@ -3,6 +3,68 @@ import Testing
 @testable import Zhijing
 
 @MainActor
+@Test func editProposalControllerOwnsSnapshotsWritesAndCompletion() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "EditProposalControllerTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let documentURL = root.appending(path: "note.md")
+    let original = "标题\n旧内容\n结尾"
+    let replacement = "标题\n新内容\n结尾"
+    try original.write(to: documentURL, atomically: true, encoding: .utf8)
+    let document = NoteDocument(
+        url: documentURL,
+        relativePath: "note.md",
+        modifiedAt: .now,
+        size: original.utf8.count
+    )
+    let service = KnowledgeBaseService(
+        supportDirectoryOverride: root.appending(path: "Support")
+    )
+    let session = DocumentSessionController()
+    session.loadedText = original
+    let revisions = RevisionController(service: service)
+    let controller = EditProposalController(
+        knowledgeBase: service,
+        documentSession: session,
+        revisions: revisions
+    )
+    controller.proposal = EditProposal(
+        documentPath: document.relativePath,
+        original: original,
+        replacement: replacement,
+        instruction: "更新内容"
+    )
+    let hunk = try #require(
+        LineDiff(original: original, replacement: replacement).hunks.first
+    )
+
+    let resolved = try controller.resolve(
+        hunkID: hunk.id,
+        accepted: true,
+        document: document,
+        currentText: original
+    )
+    let outcome = try #require(resolved)
+
+    guard case .applied(let text, _, _, let isComplete, _) = outcome else {
+        Issue.record("应返回已应用的提案结果")
+        return
+    }
+    #expect(text == replacement)
+    #expect(isComplete)
+    #expect(controller.proposal == nil)
+    #expect(session.loadedText == replacement)
+    #expect(try String(contentsOf: documentURL, encoding: .utf8) == replacement)
+    #expect(revisions.revisions.count == 1)
+}
+
+@MainActor
 @Test func aiGenerationControllerOwnsChatMigrationAndPersistence() throws {
     let root = FileManager.default.temporaryDirectory.appending(
         path: "AIGenerationControllerTests-\(UUID().uuidString)",
