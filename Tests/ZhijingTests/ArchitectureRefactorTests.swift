@@ -14,6 +14,43 @@ private final class InertLibraryWatcher: LibraryWatching {
 }
 
 @MainActor
+@Test func annotationControllerOwnsMutationAndReanchoring() throws {
+    let document = NoteDocument(
+        url: URL(filePath: "/tmp/annotation-controller.md"),
+        relativePath: "annotation-controller.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let original = "hello world"
+    let selection = EditorTextSelection(
+        documentID: document.id,
+        range: NSRange(location: 6, length: 5),
+        text: "world"
+    )
+    let controller = AnnotationController()
+
+    #expect(controller.add(
+        text: "重点",
+        selection: selection,
+        document: document,
+        documentText: original
+    ))
+    let annotation = try #require(controller.annotations(for: document).first)
+    #expect(controller.toggleResolution(id: annotation.id, document: document))
+    #expect(controller.annotations(for: document).first?.isResolved == true)
+
+    let changed = "hello brave world"
+    #expect(controller.reanchor(
+        document: document,
+        from: original,
+        to: changed,
+        mutation: nil
+    ))
+    let resolved = controller.resolution(for: document, text: changed)
+    #expect(resolved.resolved.first?.annotation.anchor.selectedText == "world")
+}
+
+@MainActor
 @Test func editorSessionStateOwnsEditorIdentityAndMetrics() async {
     let document = NoteDocument(
         url: URL(filePath: "/tmp/editor-state.md"),

@@ -75,8 +75,9 @@ final class AppStore {
         documentFindController.navigationRequest
     }
     var selectionEditRequest: SelectionEditRequest?
-    private(set) var annotationComposerRequest: AnnotationComposerRequest?
-    private(set) var annotations: [String: [TextAnnotation]] = [:]
+    var annotationComposerRequest: AnnotationComposerRequest? {
+        annotationController.composerRequest
+    }
     var searchQuery: String {
         get { librarySearchController.query }
         set { librarySearchController.query = newValue }
@@ -175,7 +176,7 @@ final class AppStore {
     private let documentSession: DocumentSessionController
     private let editorState: EditorSessionState
     private let documentFindController = DocumentFindController()
-    private let annotationRepository = AnnotationRepository()
+    private let annotationController: AnnotationController
     var currentMessages: [ChatMessage] {
         aiGenerationController.messages(
             for: selectedDocument?.persistenceKey
@@ -183,8 +184,7 @@ final class AppStore {
     }
 
     var currentAnnotations: [TextAnnotation] {
-        guard let key = selectedDocument?.persistenceKey else { return [] }
-        return annotations[key] ?? []
+        annotationController.annotations(for: selectedDocument)
     }
 
     var currentResolvedAnnotations: [ResolvedTextAnnotation] {
@@ -196,9 +196,8 @@ final class AppStore {
     }
 
     private var currentAnnotationResolution: AnnotationResolutionSnapshot {
-        annotationRepository.resolution(
-            documentKey: selectedDocument?.persistenceKey,
-            annotations: currentAnnotations,
+        annotationController.resolution(
+            for: selectedDocument,
             text: editorText
         )
     }
@@ -259,6 +258,9 @@ final class AppStore {
         self.knowledgeBase = knowledgeBase
         self.documentSession = documentSession
         editorState = EditorSessionState()
+        annotationController = AnnotationController(
+            knowledgeBase: knowledgeBase
+        )
         workspaceCatalog = WorkspaceCatalogController(service: knowledgeBase)
         externalChangeMonitor = ExternalChangeMonitor()
         librarySearchController = LibrarySearchController(
@@ -291,9 +293,9 @@ final class AppStore {
             errorMessage = "对话记录无法读取，已停止覆盖原文件：\(error.localizedDescription)"
         }
         do {
-            annotations = try annotationRepository.loadCachedAnnotations()
+            try annotationController.loadCachedAnnotations()
         } catch {
-            annotations = [:]
+            annotationController.discardCachedAnnotations()
             if errorMessage == nil {
                 errorMessage = "批注缓存无法读取，已停止覆盖原文件：\(error.localizedDescription)"
             }
@@ -478,7 +480,7 @@ final class AppStore {
         if isGenerating {
             cancelGeneration()
         }
-        annotationComposerRequest = nil
+        annotationController.cancelComposing()
         editorSelection = nil
         do {
             loadPortableAnnotations(for: document)
@@ -545,14 +547,12 @@ final class AppStore {
             NSSound.beep()
             return
         }
-        annotationComposerRequest = AnnotationComposerRequest(
-            selection: selection
-        )
+        annotationController.beginComposing(for: selection)
         setAnnotationRailVisible(true)
     }
 
     func cancelAnnotationComposer() {
-        annotationComposerRequest = nil
+        annotationController.cancelComposing()
     }
 
     func addAnnotation(
@@ -563,61 +563,52 @@ final class AppStore {
         guard !value.isEmpty,
               let document = selectedDocument,
               let validSelection = validEditorSelection(selection),
-              let anchor = TextAnnotationAnchorResolver.makeAnchor(
+              annotationController.add(
+                  text: value,
                   selection: validSelection,
-                  in: editorText
+                  document: document,
+                  documentText: editorText
               ) else { return }
-        annotations[document.persistenceKey, default: []].append(
-            TextAnnotation(anchor: anchor, text: value)
-        )
-        annotationComposerRequest = nil
         persistAnnotations(for: document)
     }
 
     func updateAnnotation(id: UUID, text: String) {
-        guard let key = selectedDocument?.persistenceKey,
-              let index = annotations[key]?.firstIndex(where: { $0.id == id })
-        else { return }
-        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return }
-        annotations[key]?[index].text = value
-        annotations[key]?[index].modifiedAt = .now
+        guard annotationController.update(
+            id: id,
+            text: text,
+            document: selectedDocument
+        ) else { return }
         persistAnnotations(for: selectedDocument)
     }
 
     func deleteAnnotation(id: UUID) {
-        guard let key = selectedDocument?.persistenceKey else { return }
-        annotations[key]?.removeAll { $0.id == id }
-        if annotations[key]?.isEmpty == true {
-            annotations[key] = nil
-        }
+        guard annotationController.delete(
+            id: id,
+            document: selectedDocument
+        ) else { return }
         persistAnnotations(for: selectedDocument)
     }
 
     func toggleAnnotationResolution(id: UUID) {
-        guard let key = selectedDocument?.persistenceKey,
-              let index = annotations[key]?.firstIndex(where: { $0.id == id })
-        else { return }
-        guard var annotation = annotations[key]?[index] else { return }
-        annotation.resolvedAt = annotation.isResolved ? nil : .now
-        annotation.modifiedAt = .now
-        annotations[key]?[index] = annotation
+        guard annotationController.toggleResolution(
+            id: id,
+            document: selectedDocument
+        ) else { return }
         persistAnnotations(for: selectedDocument)
     }
 
     func relinkAnnotation(id: UUID) {
-        guard let key = selectedDocument?.persistenceKey,
-              let index = annotations[key]?.firstIndex(where: { $0.id == id }),
+        guard let document = selectedDocument,
               let selection = validEditorSelection(),
-              let anchor = TextAnnotationAnchorResolver.makeAnchor(
+              annotationController.relink(
+                  id: id,
                   selection: selection,
-                  in: editorText
+                  document: document,
+                  documentText: editorText
               ) else {
             NSSound.beep()
             return
         }
-        annotations[key]?[index].anchor = anchor
-        annotations[key]?[index].modifiedAt = .now
         persistAnnotations(for: selectedDocument)
     }
 
@@ -724,8 +715,7 @@ final class AppStore {
         guard saveNow() else { return false }
         do {
             try aiGenerationController.saveSynchronously()
-            try annotationRepository.saveSynchronously(
-                annotations,
+            try annotationController.saveSynchronously(
                 libraryRoot: libraryURL,
                 externalDocuments: externalDocuments
             )
@@ -898,9 +888,7 @@ final class AppStore {
             try knowledgeBase.trashFolder(root: root, relativePath: folder)
             favorites.subtract(affectedKeys)
             defaults.set(Array(favorites), forKey: Keys.favorites)
-            for key in affectedKeys {
-                annotations[key] = nil
-            }
+            annotationController.removeAnnotations(for: affectedKeys)
             aiGenerationController.removeChats(for: affectedKeys)
             defaults.removeObject(forKey: Keys.chats)
             openDocumentPaths.removeAll { affectedPaths.contains($0) }
@@ -934,7 +922,9 @@ final class AppStore {
                 for: CollectionOfOne(document.persistenceKey)
             )
             defaults.removeObject(forKey: Keys.chats)
-            annotations[document.persistenceKey] = nil
+            annotationController.removeAnnotations(
+                for: CollectionOfOne(document.persistenceKey)
+            )
             persistAnnotations()
             if wasSelected {
                 documentSession.cancelAutosave()
@@ -1226,7 +1216,7 @@ final class AppStore {
         isAnnotationRailVisible = isVisible
         defaults.set(isVisible, forKey: Keys.annotationRailVisible)
         if !isVisible {
-            annotationComposerRequest = nil
+            annotationController.cancelComposing()
         }
     }
 
@@ -1346,37 +1336,10 @@ final class AppStore {
     }
 
     private func reconcileMovedAnnotationDocuments(in root: URL) {
-        let rootPath = root.standardizedFileURL.path
-        let prefix = rootPath + "/"
-        let staleEntries = annotations.filter { key, items in
-            key.hasPrefix(prefix) &&
-                !items.isEmpty &&
-                !FileManager.default.fileExists(atPath: key)
-        }
-        guard !staleEntries.isEmpty else { return }
-
-        var availableDocuments = documents.filter {
-            annotations[$0.persistenceKey]?.isEmpty != false
-        }
-        var migrated = false
-        for (oldKey, items) in staleEntries {
-            let distinctiveEnough = items.count > 1 ||
-                items.contains { $0.anchor.selectedText.count >= 12 }
-            guard distinctiveEnough else { continue }
-
-            let matches = availableDocuments.filter { document in
-                guard let text = try? knowledgeBase.read(document) else { return false }
-                return items.allSatisfy {
-                    TextAnnotationAnchorResolver.resolve($0, in: text) != nil
-                }
-            }
-            guard matches.count == 1, let destination = matches.first else { continue }
-            annotations[oldKey] = nil
-            annotations[destination.persistenceKey] = items
-            availableDocuments.removeAll { $0.id == destination.id }
-            migrated = true
-        }
-        if migrated {
+        if annotationController.reconcileMovedDocuments(
+            in: root,
+            documents: documents
+        ) {
             persistAnnotations()
         }
     }
@@ -1455,7 +1418,7 @@ final class AppStore {
             cancelGeneration()
         }
         editorState.clearDocument()
-        annotationComposerRequest = nil
+        annotationController.cancelComposing()
         hideDocumentFind()
         documentSession.reset()
         revisionController.reset()
@@ -1653,8 +1616,7 @@ final class AppStore {
         }
         aiGenerationController.moveChat(from: oldKey, to: newKey)
         defaults.removeObject(forKey: Keys.chats)
-        if let documentAnnotations = annotations.removeValue(forKey: oldKey) {
-            annotations[newKey] = documentAnnotations
+        if annotationController.moveAnnotations(from: oldKey, to: newKey) {
             persistAnnotations()
         }
         if let index = openDocumentPaths.firstIndex(of: oldPath) {
@@ -1746,7 +1708,7 @@ final class AppStore {
         clearDocumentSelection()
         resetWorkspaceNavigation()
         let standardizedURL = url.standardizedFileURL
-        annotationRepository.transitionToLibrary()
+        annotationController.transitionToLibrary()
         workspaceCatalog.transition(to: standardizedURL)
         defaults.set(standardizedURL.path, forKey: Keys.libraryPath)
     }
@@ -1795,27 +1757,17 @@ final class AppStore {
         to newText: String,
         mutation: EditorTextMutation?
     ) -> Bool {
-        guard oldText != newText,
-              let key = selectedDocument?.persistenceKey,
-              let current = annotations[key],
-              !current.isEmpty else { return false }
-        let updated = annotationRepository.reanchor(
-            current,
+        annotationController.reanchor(
+            document: selectedDocument,
             from: oldText,
             to: newText,
             mutation: mutation
         )
-        guard updated != current else { return false }
-        annotations[key] = updated
-        return true
     }
 
     private func loadPortableAnnotationsIfNeeded(at root: URL) {
         do {
-            try annotationRepository.loadLibraryIfNeeded(
-                at: root,
-                into: &annotations
-            )
+            try annotationController.loadLibraryIfNeeded(at: root)
         } catch {
             errorMessage = "批注索引无法读取，已停止覆盖原文件：\(error.localizedDescription)"
         }
@@ -1829,14 +1781,7 @@ final class AppStore {
             return
         }
         do {
-            guard let items = try annotationRepository.loadExternalAnnotations(
-                for: document
-            ) else { return }
-            if items.isEmpty {
-                annotations[document.persistenceKey] = nil
-            } else {
-                annotations[document.persistenceKey] = items
-            }
+            try annotationController.loadExternalAnnotations(for: document)
         } catch {
             errorMessage = "外部文稿的批注文件无法读取：\(error.localizedDescription)"
         }
@@ -1846,8 +1791,7 @@ final class AppStore {
         let externalDocument = document.flatMap {
             isLibraryDocument($0) ? nil : $0
         }
-        annotationRepository.save(
-            annotations,
+        annotationController.save(
             libraryRoot: libraryURL,
             externalDocument: externalDocument
         )
