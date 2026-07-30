@@ -45,7 +45,12 @@ struct AIService: Sendable {
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw connectionError("请先填写 DeepSeek API Key。")
         }
-        var request = URLRequest(url: URL(string: "https://api.deepseek.com/user/balance")!)
+        guard let balanceURL = URL(
+            string: "https://api.deepseek.com/user/balance"
+        ) else {
+            throw connectionError("余额服务地址无效。")
+        }
+        var request = URLRequest(url: balanceURL)
         request.timeoutInterval = 20
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")

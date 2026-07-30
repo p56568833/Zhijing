@@ -76,13 +76,19 @@ final class AppStore {
     var errorMessage: String?
     var editProposal: EditProposal?
     var revisions: [Revision] = []
-    var provider: AIProviderPreset = .openAI
-    var isTestingConnection = false
-    var connectionTestSucceeded = false
-    var connectionTestError: String?
-    var accountBalances: [AIAccountBalance] = []
-    var balanceError: String?
-    var isRefreshingBalance = false
+    var provider: AIProviderPreset {
+        get { aiSettings.provider }
+        set { aiSettings.provider = newValue }
+    }
+    var isTestingConnection: Bool { aiSettings.isTestingConnection }
+    var connectionTestSucceeded: Bool { aiSettings.connectionTestSucceeded }
+    var connectionTestError: String? {
+        get { aiSettings.connectionTestError }
+        set { aiSettings.connectionTestError = newValue }
+    }
+    var accountBalances: [AIAccountBalance] { aiSettings.accountBalances }
+    var balanceError: String? { aiSettings.balanceError }
+    var isRefreshingBalance: Bool { aiSettings.isRefreshingBalance }
     var externalConflict: ExternalFileConflict?
     private(set) var openDocumentPaths: [String] = []
     private(set) var externalDocuments: [NoteDocument] = []
@@ -90,27 +96,29 @@ final class AppStore {
     private(set) var comparisonDocumentPath: String?
     private(set) var comparisonText = ""
 
-    var model = "gpt-4.1-mini" {
-        didSet { defaults.set(model, forKey: Keys.model) }
+    var model: String {
+        get { aiSettings.model }
+        set { aiSettings.model = newValue }
     }
-    var endpoint = "https://api.openai.com/v1" {
-        didSet { defaults.set(endpoint, forKey: Keys.endpoint) }
+    var endpoint: String {
+        get { aiSettings.endpoint }
+        set { aiSettings.endpoint = newValue }
     }
     var excludedFoldersText = ".git, node_modules" {
         didSet { defaults.set(excludedFoldersText, forKey: Keys.excludedFolders) }
     }
-    var apiKey = "" {
-        didSet {
-            guard apiKey != oldValue else { return }
-            do {
-                try LocalSecretStore.save(apiKey, account: "openai-api-key")
-            } catch {
-                errorMessage = "API Key 无法保存到本地配置：\(error.localizedDescription)"
+    var apiKey: String {
+        get { aiSettings.apiKey }
+        set {
+            aiSettings.apiKey = newValue
+            if let persistenceError = aiSettings.secretPersistenceError {
+                errorMessage = persistenceError
             }
         }
     }
 
     private let defaults: UserDefaults
+    private let aiSettings: AISettingsController
     private let knowledgeBase = KnowledgeBaseService()
     private let ai = AIService()
     private let libraryWatcher = LibraryWatcher()
@@ -135,8 +143,6 @@ final class AppStore {
     private var snapshottedProposalIDs: Set<UUID> = []
     @ObservationIgnored
     private var documentByPath: [String: NoteDocument] = [:]
-    @ObservationIgnored
-    private var lastBalanceRefresh: Date?
     @ObservationIgnored
     private var libraryRefreshID = UUID()
     var currentMessages: [ChatMessage] {
@@ -212,13 +218,8 @@ final class AppStore {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        provider = AIProviderPreset(
-            rawValue: defaults.string(forKey: Keys.provider) ?? ""
-        ) ?? Self.inferProvider(from: defaults.string(forKey: Keys.endpoint))
-        model = defaults.string(forKey: Keys.model) ?? "gpt-4.1-mini"
-        endpoint = defaults.string(forKey: Keys.endpoint) ?? "https://api.openai.com/v1"
+        aiSettings = AISettingsController(defaults: defaults)
         excludedFoldersText = defaults.string(forKey: Keys.excludedFolders) ?? ".git, node_modules"
-        apiKey = LocalSecretStore.read(account: "openai-api-key")
         favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
         let legacyChats = defaults.data(forKey: Keys.chats)
         do {
@@ -254,13 +255,6 @@ final class AppStore {
             .compactMap { Self.makeExternalDocument(at: URL(filePath: $0)) }
         isComparisonVisible = defaults.object(forKey: Keys.comparisonVisible) as? Bool ?? false
         comparisonDocumentPath = defaults.string(forKey: Keys.comparisonDocumentPath)
-        if let presetEndpoint = provider.endpoint {
-            endpoint = presetEndpoint
-            if !provider.models.contains(where: { $0.id == model }) {
-                model = provider.defaultModel
-            }
-        }
-
         if let path = defaults.string(forKey: Keys.libraryPath) {
             let url = URL(filePath: path, directoryHint: .isDirectory)
             if FileManager.default.fileExists(atPath: url.path) {
@@ -284,72 +278,26 @@ final class AppStore {
     }
 
     func selectProvider(_ newProvider: AIProviderPreset) {
-        provider = newProvider
-        defaults.set(newProvider.rawValue, forKey: Keys.provider)
-        if let presetEndpoint = newProvider.endpoint {
-            endpoint = presetEndpoint
-            if !newProvider.models.contains(where: { $0.id == model }) {
-                model = newProvider.defaultModel
-            }
-        }
-        accountBalances = []
-        balanceError = nil
-        lastBalanceRefresh = nil
-        resetConnectionTest()
+        aiSettings.selectProvider(newProvider)
     }
 
     func selectModel(_ newModel: String) {
-        model = newModel
-        if let presetEndpoint = provider.endpoint {
-            endpoint = presetEndpoint
-        }
-        resetConnectionTest()
+        aiSettings.selectModel(newModel)
     }
 
     func testAIConnection(apiKey: String) async {
-        let cleanedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.apiKey = cleanedKey
-        isTestingConnection = true
-        connectionTestSucceeded = false
-        connectionTestError = nil
-        defer { isTestingConnection = false }
-
-        do {
-            let configuration = try resolvedConfiguration()
-            try await ai.testConnection(configuration: configuration)
-            guard configurationMatchesCurrent(configuration) else { return }
-            connectionTestSucceeded = true
-            if provider == .deepSeek {
-                await refreshAccountBalance(force: true)
-            }
-        } catch {
-            connectionTestError = error.localizedDescription
+        await aiSettings.testConnection(apiKey: apiKey)
+        if let persistenceError = aiSettings.secretPersistenceError {
+            errorMessage = persistenceError
         }
     }
 
     func resetConnectionTest() {
-        connectionTestSucceeded = false
-        connectionTestError = nil
+        aiSettings.resetConnectionTest()
     }
 
     func refreshAccountBalance(force: Bool = false) async {
-        guard provider == .deepSeek, !apiKey.isEmpty, !isRefreshingBalance else { return }
-        if !force, let lastBalanceRefresh, Date().timeIntervalSince(lastBalanceRefresh) < 60 {
-            return
-        }
-        isRefreshingBalance = true
-        balanceError = nil
-        defer { isRefreshingBalance = false }
-        let requestedKey = apiKey
-        do {
-            let balances = try await ai.fetchDeepSeekBalance(apiKey: requestedKey)
-            guard provider == .deepSeek, apiKey == requestedKey else { return }
-            accountBalances = balances
-            lastBalanceRefresh = .now
-        } catch {
-            guard provider == .deepSeek, apiKey == requestedKey else { return }
-            balanceError = error.localizedDescription
-        }
+        await aiSettings.refreshAccountBalance(force: force)
     }
 
     func openDocuments(at urls: [URL]) {
@@ -1576,39 +1524,7 @@ final class AppStore {
     }
 
     private func resolvedConfiguration() throws -> AIConfiguration {
-        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedKey.isEmpty {
-            // AIService returns a local retrieval response before it reads the endpoint.
-            return AIConfiguration(
-                apiKey: apiKey,
-                endpoint: URL(fileURLWithPath: "/"),
-                model: model,
-                provider: provider
-            )
-        }
-        guard let endpoint = AIEndpointResolver.chatCompletionsURL(from: endpoint) else {
-            throw NSError(
-                domain: "AIConfiguration",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "基础地址无效。请输入包含 http:// 或 https:// 的完整接口地址。"
-                ]
-            )
-        }
-        return AIConfiguration(
-            apiKey: apiKey,
-            endpoint: endpoint,
-            model: model,
-            provider: provider
-        )
-    }
-
-    private func configurationMatchesCurrent(_ configuration: AIConfiguration) -> Bool {
-        guard let current = try? resolvedConfiguration() else { return false }
-        return current.apiKey == configuration.apiKey &&
-            current.endpoint == configuration.endpoint &&
-            current.model == configuration.model &&
-            current.provider == configuration.provider
+        try aiSettings.configuration()
     }
 
     private var excludedFolders: [String] {
@@ -2309,21 +2225,11 @@ final class AppStore {
         )
     }
 
-    private static func inferProvider(from endpoint: String?) -> AIProviderPreset {
-        guard let endpoint else { return .openAI }
-        if endpoint.contains("api.deepseek.com") { return .deepSeek }
-        if endpoint.contains("api.openai.com") { return .openAI }
-        return .custom
-    }
-
     private enum Keys {
         static let libraryPath = "libraryPath"
         static let selectedPath = "selectedPath"
         static let favorites = "favorites"
         static let chats = "chats"
-        static let model = "model"
-        static let endpoint = "endpoint"
-        static let provider = "provider"
         static let excludedFolders = "excludedFolders"
         static let assistantVisible = "assistantVisible"
         static let sidebarVisible = "sidebarVisible"

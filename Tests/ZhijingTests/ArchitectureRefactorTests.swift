@@ -3,6 +3,35 @@ import Testing
 @testable import Zhijing
 
 @MainActor
+@Test func aiSettingsControllerOwnsProviderConfigurationAndSecretWrites() throws {
+    let suiteName = "AISettingsControllerTests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set("https://example.com/v1", forKey: "endpoint")
+    defaults.set("custom-model", forKey: "model")
+    var savedKey = ""
+    let controller = AISettingsController(
+        defaults: defaults,
+        loadAPIKey: { "" },
+        saveAPIKey: { savedKey = $0 }
+    )
+
+    #expect(controller.provider == .custom)
+    controller.apiKey = "test-key"
+    #expect(savedKey == "test-key")
+    let customConfiguration = try controller.configuration()
+    #expect(
+        customConfiguration.endpoint.absoluteString
+            == "https://example.com/v1/chat/completions"
+    )
+
+    controller.selectProvider(.deepSeek)
+    #expect(controller.endpoint == "https://api.deepseek.com")
+    #expect(controller.model == AIProviderPreset.deepSeek.defaultModel)
+    #expect(defaults.string(forKey: "provider") == "deepSeek")
+}
+
+@MainActor
 @Test func documentFindControllerKeepsTransitionsConsistent() {
     let controller = DocumentFindController()
     controller.options = DocumentFindOptions(
