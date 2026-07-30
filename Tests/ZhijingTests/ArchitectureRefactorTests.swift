@@ -14,6 +14,31 @@ private final class InertLibraryWatcher: LibraryWatching {
 }
 
 @MainActor
+@Test func editorSessionStateOwnsEditorIdentityAndMetrics() async {
+    let document = NoteDocument(
+        url: URL(filePath: "/tmp/editor-state.md"),
+        relativePath: "editor-state.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let state = EditorSessionState()
+    state.selectedDocument = document
+    state.replaceText("你好 world")
+    await state.waitForWordCountUpdate()
+
+    #expect(state.selectedDocument == document)
+    #expect(state.text == "你好 world")
+    #expect(state.contentRevision == 1)
+    #expect(state.wordCount == DocumentMetrics(markdown: "你好 world").count)
+
+    state.clearDocument()
+    #expect(state.selectedDocument == nil)
+    #expect(state.text.isEmpty)
+    #expect(state.contentRevision == 2)
+    #expect(state.wordCount == 0)
+}
+
+@MainActor
 @Test func externalChangeMonitorCoalescesPendingPaths() async throws {
     let root = FileManager.default.temporaryDirectory.appending(
         path: "ExternalChangeMonitorTests-\(UUID().uuidString)",

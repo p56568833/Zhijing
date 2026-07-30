@@ -43,12 +43,23 @@ final class AppStore {
     var libraryTree: [LibraryTreeItem] { workspaceCatalog.libraryTree }
     var recentDocuments: [NoteDocument] { workspaceCatalog.recentDocuments }
     var favoriteDocuments: [NoteDocument] { workspaceCatalog.favoriteDocuments }
-    var selectedDocument: NoteDocument?
-    private(set) var editorText = ""
-    private(set) var editorContentRevision = 0
-    private(set) var editorNavigationRequest: EditorNavigationRequest?
-    private(set) var editorSelection: EditorTextSelection?
-    private(set) var documentWordCount = 0
+    var selectedDocument: NoteDocument? {
+        get { editorState.selectedDocument }
+        set { editorState.selectedDocument = newValue }
+    }
+    private(set) var editorText: String {
+        get { editorState.text }
+        set { editorState.acceptUserText(newValue) }
+    }
+    var editorContentRevision: Int { editorState.contentRevision }
+    var editorNavigationRequest: EditorNavigationRequest? {
+        editorState.navigationRequest
+    }
+    private(set) var editorSelection: EditorTextSelection? {
+        get { editorState.selection }
+        set { editorState.updateSelection(newValue) }
+    }
+    var documentWordCount: Int { editorState.wordCount }
     var isDocumentFindVisible: Bool {
         get { documentFindController.isVisible }
         set { documentFindController.isVisible = newValue }
@@ -75,7 +86,10 @@ final class AppStore {
         set { librarySearchController.results = newValue }
     }
     var favorites: Set<String> = []
-    var saveState: SaveState = .idle
+    var saveState: SaveState {
+        get { editorState.saveState }
+        set { editorState.saveState = newValue }
+    }
     var isIndexing: Bool {
         get { workspaceCatalog.isIndexing }
         set { workspaceCatalog.isIndexing = newValue }
@@ -159,10 +173,9 @@ final class AppStore {
     private let externalConflictController: ExternalConflictController
     private let documentExporter = DocumentExportService()
     private let documentSession: DocumentSessionController
+    private let editorState: EditorSessionState
     private let documentFindController = DocumentFindController()
     private let annotationRepository = AnnotationRepository()
-    @ObservationIgnored
-    private var wordCountTask: Task<Void, Never>?
     var currentMessages: [ChatMessage] {
         aiGenerationController.messages(
             for: selectedDocument?.persistenceKey
@@ -245,6 +258,7 @@ final class AppStore {
         self.defaults = defaults
         self.knowledgeBase = knowledgeBase
         self.documentSession = documentSession
+        editorState = EditorSessionState()
         workspaceCatalog = WorkspaceCatalogController(service: knowledgeBase)
         externalChangeMonitor = ExternalChangeMonitor()
         librarySearchController = LibrarySearchController(
@@ -497,8 +511,7 @@ final class AppStore {
             to: text,
             mutation: mutation
         )
-        editorText = text
-        scheduleWordCount(for: text)
+        editorState.acceptUserText(text)
         documentSession.cancelAutosave()
         guard editorText != documentSession.loadedText else {
             if annotationsChanged {
@@ -613,9 +626,11 @@ final class AppStore {
               let item = currentAnnotationDisplayItems.first(where: { $0.id == id }),
               let range = item.range else { return }
         isPreviewMode = false
-        editorNavigationRequest = EditorNavigationRequest(
-            documentID: document.id,
-            selectionRange: range
+        editorState.navigate(
+            to: EditorNavigationRequest(
+                documentID: document.id,
+                selectionRange: range
+            )
         )
     }
 
@@ -1051,10 +1066,12 @@ final class AppStore {
                     ? .reviewingExternalChange
                     : .saved(.now)
                 if isComplete {
-                    editorNavigationRequest = EditorNavigationRequest(
-                        documentID: document.id,
-                        line: settledLine,
-                        verticalFraction: viewportFraction
+                    editorState.navigate(
+                        to: EditorNavigationRequest(
+                            documentID: document.id,
+                            line: settledLine,
+                            verticalFraction: viewportFraction
+                        )
                     )
                 }
             case .externalFileChanged(let message):
@@ -1104,9 +1121,11 @@ final class AppStore {
         if let document = documents.first(where: { $0.relativePath == source.filePath }) {
             select(document)
             isPreviewMode = false
-            editorNavigationRequest = EditorNavigationRequest(
-                documentID: document.id,
-                line: source.line
+            editorState.navigate(
+                to: EditorNavigationRequest(
+                    documentID: document.id,
+                    line: source.line
+                )
             )
         }
     }
@@ -1435,13 +1454,9 @@ final class AppStore {
         if isGenerating {
             cancelGeneration()
         }
-        selectedDocument = nil
-        editorSelection = nil
+        editorState.clearDocument()
         annotationComposerRequest = nil
         hideDocumentFind()
-        wordCountTask?.cancel()
-        documentWordCount = 0
-        replaceEditorText("", reanchoringAnnotations: false)
         documentSession.reset()
         revisionController.reset()
         editProposalController.reset()
@@ -1480,22 +1495,6 @@ final class AppStore {
             guard selectedDocument?.id == document.id, editorText == text else { return }
             saveState = .failed(error.localizedDescription)
             errorMessage = "保存失败：\(error.localizedDescription)"
-        }
-    }
-
-    private func scheduleWordCount(
-        for text: String,
-        delay: Duration = .milliseconds(280)
-    ) {
-        wordCountTask?.cancel()
-        wordCountTask = Task {
-            try? await Task.sleep(for: delay)
-            guard !Task.isCancelled else { return }
-            let count = await Task.detached(priority: .utility) {
-                DocumentMetrics(markdown: text).count
-            }.value
-            guard !Task.isCancelled, editorText == text else { return }
-            documentWordCount = count
         }
     }
 
@@ -1613,9 +1612,7 @@ final class AppStore {
                 mutation: nil
             )
         }
-        editorText = text
-        editorContentRevision &+= 1
-        scheduleWordCount(for: text, delay: .zero)
+        editorState.replaceText(text)
     }
 
     private func validEditorSelection(
