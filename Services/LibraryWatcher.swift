@@ -1,7 +1,18 @@
 import CoreServices
 import Foundation
 
-final class LibraryWatcher {
+protocol LibraryWatching: AnyObject {
+    func start(
+        root: URL,
+        additionalFiles: [URL],
+        excludedFolders: [String],
+        onChange: @escaping @Sendable ([URL]) -> Void
+    )
+
+    func stop()
+}
+
+final class LibraryWatcher: LibraryWatching {
     private final class EventHandlerBox {
         let handle: @Sendable ([URL]) -> Void
 

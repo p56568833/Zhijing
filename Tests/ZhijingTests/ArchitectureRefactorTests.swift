@@ -2,6 +2,102 @@ import Foundation
 import Testing
 @testable import Zhijing
 
+private final class InertLibraryWatcher: LibraryWatching {
+    func start(
+        root: URL,
+        additionalFiles: [URL],
+        excludedFolders: [String],
+        onChange: @escaping @Sendable ([URL]) -> Void
+    ) {}
+
+    func stop() {}
+}
+
+@MainActor
+@Test func externalChangeMonitorCoalescesPendingPaths() async throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "ExternalChangeMonitorTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = root.appending(path: "first.md")
+    let second = root.appending(path: "second.md")
+    var received: Set<URL> = []
+    let monitor = ExternalChangeMonitor(
+        watcher: InertLibraryWatcher(),
+        debounceDelay: .zero
+    )
+    monitor.start(
+        libraryRoot: root,
+        additionalFiles: [],
+        excludedFolders: []
+    ) { changedURLs in
+        received = changedURLs
+    }
+
+    monitor.receive([first])
+    monitor.receive([second])
+    await monitor.waitForPendingChanges()
+
+    #expect(received.contains(first.standardizedFileURL))
+    #expect(received.contains(second.standardizedFileURL))
+    monitor.stop()
+}
+
+@MainActor
+@Test func externalConflictControllerEvaluatesAndLoadsDiskVersion() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "ExternalConflictControllerTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let documentURL = root.appending(path: "note.md")
+    try "外部新版".write(to: documentURL, atomically: true, encoding: .utf8)
+    let document = NoteDocument(
+        url: documentURL,
+        relativePath: "note.md",
+        modifiedAt: .now,
+        size: 12
+    )
+    let service = KnowledgeBaseService(
+        supportDirectoryOverride: root.appending(path: "Support")
+    )
+    let session = DocumentSessionController()
+    session.loadedText = "原版"
+    let revisions = RevisionController(service: service)
+    let controller = ExternalConflictController(
+        knowledgeBase: service,
+        documentSession: session,
+        revisions: revisions
+    )
+
+    let change = try controller.evaluateChange(
+        for: document,
+        editorText: "原版",
+        changedURLs: [documentURL]
+    )
+    #expect(change == .reloadFromDisk("外部新版"))
+
+    controller.recordConflict(
+        document: document,
+        localText: "本地改动",
+        diskText: "外部新版"
+    )
+    let loaded = try controller.loadExternalVersion(editorText: "本地改动")
+    #expect(loaded?.text == "外部新版")
+    #expect(controller.conflict == nil)
+    #expect(session.loadedText == "外部新版")
+    #expect(revisions.revisions.contains { $0.name == "冲突前的本地版本" })
+}
+
 @MainActor
 @Test func workspaceCatalogOwnsScanIndexesAndDerivedLists() async throws {
     let root = FileManager.default.temporaryDirectory.appending(

@@ -116,7 +116,10 @@ final class AppStore {
     var accountBalances: [AIAccountBalance] { aiSettings.accountBalances }
     var balanceError: String? { aiSettings.balanceError }
     var isRefreshingBalance: Bool { aiSettings.isRefreshingBalance }
-    var externalConflict: ExternalFileConflict?
+    var externalConflict: ExternalFileConflict? {
+        get { externalConflictController.conflict }
+        set { externalConflictController.conflict = newValue }
+    }
     private(set) var openDocumentPaths: [String] = []
     private(set) var externalDocuments: [NoteDocument] = []
     var isComparisonVisible = false
@@ -152,17 +155,14 @@ final class AppStore {
     private let aiGenerationController: AIGenerationController
     private let editProposalController: EditProposalController
     private let workspaceCatalog: WorkspaceCatalogController
-    private let libraryWatcher = LibraryWatcher()
+    private let externalChangeMonitor: ExternalChangeMonitor
+    private let externalConflictController: ExternalConflictController
     private let documentExporter = DocumentExportService()
     private let documentSession: DocumentSessionController
     private let documentFindController = DocumentFindController()
     private let annotationRepository = AnnotationRepository()
     @ObservationIgnored
     private var wordCountTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var externalRefreshTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var pendingLibraryChangeURLs: Set<URL> = []
     var currentMessages: [ChatMessage] {
         aiGenerationController.messages(
             for: selectedDocument?.persistenceKey
@@ -246,10 +246,16 @@ final class AppStore {
         self.knowledgeBase = knowledgeBase
         self.documentSession = documentSession
         workspaceCatalog = WorkspaceCatalogController(service: knowledgeBase)
+        externalChangeMonitor = ExternalChangeMonitor()
         librarySearchController = LibrarySearchController(
             service: knowledgeBase
         )
         revisionController = RevisionController(service: knowledgeBase)
+        externalConflictController = ExternalConflictController(
+            knowledgeBase: knowledgeBase,
+            documentSession: documentSession,
+            revisions: revisionController
+        )
         editProposalController = EditProposalController(
             knowledgeBase: knowledgeBase,
             documentSession: documentSession,
@@ -1256,23 +1262,10 @@ final class AppStore {
         guard let conflict = externalConflict,
               selectedDocument?.id == conflict.document.id else { return }
         do {
-            if let diskText = conflict.diskText {
-                _ = try revisionController.createSnapshot(
-                    text: diskText,
-                    document: conflict.document,
-                    name: "外部修改（冲突备份）"
-                )
-            }
-            let refreshed = try documentSession.writeSynchronously(
-                editorText,
-                to: conflict.document,
-                using: knowledgeBase
-            )
-            documentSession.loadedText = editorText
+            guard let refreshed = try externalConflictController
+                .keepLocalVersion(editorText: editorText) else { return }
             updateDocumentMetadata(refreshed)
-            externalConflict = nil
             saveState = .saved(.now)
-            revisionController.load(for: conflict.document)
             refreshAfterExternalResolution(conflict.document)
         } catch {
             errorMessage = "保留本地版本失败：\(error.localizedDescription)"
@@ -1281,21 +1274,15 @@ final class AppStore {
 
     func loadExternalVersionAfterConflict() {
         guard let conflict = externalConflict,
-              let diskText = conflict.diskText,
+              conflict.diskText != nil,
               selectedDocument?.id == conflict.document.id else { return }
         do {
-            _ = try revisionController.createSnapshot(
-                text: editorText,
-                document: conflict.document,
-                name: "冲突前的本地版本"
-            )
-            replaceEditorText(diskText)
-            documentSession.loadedText = diskText
+            guard let resolution = try externalConflictController
+                .loadExternalVersion(editorText: editorText) else { return }
+            replaceEditorText(resolution.text)
             editProposalController.reset()
-            externalConflict = nil
             saveState = .saved(.now)
-            revisionController.load(for: conflict.document)
-            refreshAfterExternalResolution(conflict.document)
+            refreshAfterExternalResolution(resolution.document)
         } catch {
             errorMessage = "载入外部版本失败：\(error.localizedDescription)"
         }
@@ -1303,7 +1290,7 @@ final class AppStore {
 
     func discardLocalVersionAfterExternalRemoval() {
         guard let conflict = externalConflict, conflict.fileWasRemoved else { return }
-        externalConflict = nil
+        externalConflictController.clear()
         if isLibraryDocument(conflict.document) {
             clearDocumentSelection()
             Task { await refreshLibrary() }
@@ -1513,57 +1500,34 @@ final class AppStore {
     }
 
     private func startWatchingLibrary() {
-        guard let libraryURL else {
-            libraryWatcher.stop()
-            return
-        }
-        libraryWatcher.start(
-            root: libraryURL,
+        externalChangeMonitor.start(
+            libraryRoot: libraryURL,
             additionalFiles: externalDocuments.map(\.url),
             excludedFolders: excludedFolders
         ) { [weak self] changedURLs in
-            Task { @MainActor [weak self] in
-                self?.libraryDidChange(changedURLs)
-            }
+            await self?.reconcileExternalChanges(changedURLs: changedURLs)
         }
     }
-
-    private func libraryDidChange(_ changedURLs: [URL]) {
-        pendingLibraryChangeURLs.formUnion(changedURLs.map(\.standardizedFileURL))
-        externalRefreshTask?.cancel()
-        externalRefreshTask = Task {
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
-            let changedURLs = pendingLibraryChangeURLs
-            pendingLibraryChangeURLs.removeAll()
-            await reconcileExternalChanges(changedURLs: changedURLs)
-        }
-    }
-
     private func reconcileExternalChanges(changedURLs: Set<URL>) async {
         guard let document = selectedDocument else {
             await refreshLibrary()
             return
         }
 
-        if shouldCheckSelectedDocument(document, changedURLs: changedURLs) {
-            let fileExists = FileManager.default.fileExists(atPath: document.url.path)
-            let diskText: String?
-            do {
-                diskText = fileExists ? try knowledgeBase.read(document) : nil
-            } catch {
-                errorMessage = "无法读取外部修改：\(error.localizedDescription)"
-                return
-            }
-
-            switch ExternalFileReconciler.evaluate(
-                loadedText: documentSession.loadedText,
+        let externalChange: ExternalFileChange?
+        do {
+            externalChange = try externalConflictController.evaluateChange(
+                for: document,
                 editorText: editorText,
-                diskText: diskText,
-                knownLocalWriteSignatures: documentSession.localWriteSignatures(
-                    for: document
-                )
-            ) {
+                changedURLs: changedURLs
+            )
+        } catch {
+            errorMessage = "无法读取外部修改：\(error.localizedDescription)"
+            return
+        }
+
+        if let externalChange {
+            switch externalChange {
             case .unchanged:
                 break
             case .localChangesOnly:
@@ -1577,11 +1541,10 @@ final class AppStore {
             case .reloadFromDisk(let text):
                 if let proposal = editProposal,
                    proposal.source == .assistant {
-                    externalConflict = ExternalFileConflict(
+                    externalConflictController.recordConflict(
                         document: document,
                         localText: editorText,
-                        diskText: text,
-                        detectedAt: .now
+                        diskText: text
                     )
                     saveState = .failed("检测到外部修改")
                 } else if editProposal?.replacement != text {
@@ -1596,11 +1559,10 @@ final class AppStore {
                     saveState = .reviewingExternalChange
                 }
             case .conflict(let text):
-                externalConflict = ExternalFileConflict(
+                externalConflictController.recordConflict(
                     document: document,
                     localText: editorText,
-                    diskText: text,
-                    detectedAt: .now
+                    diskText: text
                 )
                 saveState = .failed("检测到外部修改")
             case .removedCleanly:
@@ -1617,11 +1579,10 @@ final class AppStore {
                     errorMessage = "当前外部文稿已被移动或删除。"
                 }
             case .removedWithLocalChanges:
-                externalConflict = ExternalFileConflict(
+                externalConflictController.recordConflict(
                     document: document,
                     localText: editorText,
-                    diskText: nil,
-                    detectedAt: .now
+                    diskText: nil
                 )
                 saveState = .failed("文稿已被外部移除")
             }
@@ -1638,19 +1599,6 @@ final class AppStore {
                 selectedDocument = refreshed
             }
             persistExternalDocuments()
-        }
-    }
-
-    private func shouldCheckSelectedDocument(
-        _ document: NoteDocument,
-        changedURLs: Set<URL>
-    ) -> Bool {
-        guard !changedURLs.isEmpty else { return true }
-        let documentPath = document.url.standardizedFileURL.path
-        let parentPath = document.url.deletingLastPathComponent().standardizedFileURL.path
-        return changedURLs.contains { url in
-            let path = url.standardizedFileURL.path
-            return path == documentPath || path == parentPath
         }
     }
 
@@ -1796,10 +1744,7 @@ final class AppStore {
 
     private func transitionToLibrary(_ url: URL) {
         workspaceCatalog.cancelRefresh()
-        libraryWatcher.stop()
-        externalRefreshTask?.cancel()
-        externalRefreshTask = nil
-        pendingLibraryChangeURLs.removeAll()
+        externalChangeMonitor.stop()
         librarySearchController.reset()
         clearDocumentSelection()
         resetWorkspaceNavigation()
