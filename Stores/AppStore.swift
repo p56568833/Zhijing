@@ -1,29 +1,6 @@
 import AppKit
 import Foundation
 import Observation
-import SwiftUI
-
-enum AppColorScheme: String, CaseIterable {
-    case system
-    case light
-    case dark
-
-    var name: String {
-        switch self {
-        case .system: "跟随系统"
-        case .light: "浅色"
-        case .dark: "深色"
-        }
-    }
-
-    var colorScheme: ColorScheme? {
-        switch self {
-        case .system: nil
-        case .light: .light
-        case .dark: .dark
-        }
-    }
-}
 
 @MainActor
 @Observable
@@ -86,7 +63,10 @@ final class AppStore {
         get { librarySearchController.results }
         set { librarySearchController.results = newValue }
     }
-    var favorites: Set<String> = []
+    var favorites: Set<String> {
+        get { preferences.favorites }
+        set { preferences.favorites = newValue }
+    }
     var saveState: SaveState {
         get { editorState.saveState }
         set { editorState.saveState = newValue }
@@ -95,11 +75,21 @@ final class AppStore {
         get { workspaceCatalog.isIndexing }
         set { workspaceCatalog.isIndexing = newValue }
     }
-    var isAssistantVisible = true
-    var isSidebarVisible = true
-    var isAnnotationRailVisible = true
-    var colorScheme = AppColorScheme.system {
-        didSet { defaults.set(colorScheme.rawValue, forKey: Keys.colorScheme) }
+    var isAssistantVisible: Bool {
+        get { preferences.isAssistantVisible }
+        set { preferences.isAssistantVisible = newValue }
+    }
+    var isSidebarVisible: Bool {
+        get { preferences.isSidebarVisible }
+        set { preferences.isSidebarVisible = newValue }
+    }
+    var isAnnotationRailVisible: Bool {
+        get { preferences.isAnnotationRailVisible }
+        set { preferences.isAnnotationRailVisible = newValue }
+    }
+    var colorScheme: AppColorScheme {
+        get { preferences.colorScheme }
+        set { preferences.colorScheme = newValue }
     }
     var isPreviewMode = false
     var retrievalScope: RetrievalScope = .library
@@ -164,8 +154,9 @@ final class AppStore {
         get { aiSettings.endpoint }
         set { aiSettings.endpoint = newValue }
     }
-    var excludedFoldersText = ".git, node_modules" {
-        didSet { defaults.set(excludedFoldersText, forKey: Keys.excludedFolders) }
+    var excludedFoldersText: String {
+        get { preferences.excludedFoldersText }
+        set { preferences.excludedFoldersText = newValue }
     }
     var apiKey: String {
         get { aiSettings.apiKey }
@@ -178,6 +169,7 @@ final class AppStore {
     }
 
     private let defaults: UserDefaults
+    private let preferences: AppPreferencesController
     private let aiSettings: AISettingsController
     private let knowledgeBase: KnowledgeBaseService
     private let librarySearchController: LibrarySearchController
@@ -266,6 +258,7 @@ final class AppStore {
         documentSession: DocumentSessionController = .init()
     ) {
         self.defaults = defaults
+        preferences = AppPreferencesController(defaults: defaults)
         self.knowledgeBase = knowledgeBase
         self.documentSession = documentSession
         editorState = EditorSessionState()
@@ -295,8 +288,6 @@ final class AppStore {
             persistence: chatPersistence
         )
         aiSettings = AISettingsController(defaults: defaults)
-        excludedFoldersText = defaults.string(forKey: Keys.excludedFolders) ?? ".git, node_modules"
-        favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
         let legacyChats = defaults.data(forKey: Keys.chats)
         do {
             try aiGenerationController.loadChats(legacyData: legacyChats)
@@ -320,12 +311,6 @@ final class AppStore {
                 errorMessage = "迁移对话记录失败：\(error.localizedDescription)"
             }
         }
-        isAssistantVisible = defaults.object(forKey: Keys.assistantVisible) as? Bool ?? true
-        isSidebarVisible = defaults.object(forKey: Keys.sidebarVisible) as? Bool ?? true
-        isAnnotationRailVisible = defaults.object(
-            forKey: Keys.annotationRailVisible
-        ) as? Bool ?? true
-        colorScheme = AppColorScheme(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
         if let path = defaults.string(forKey: Keys.libraryPath) {
             let url = URL(filePath: path, directoryHint: .isDirectory)
             if FileManager.default.fileExists(atPath: url.path) {
@@ -894,7 +879,6 @@ final class AppStore {
             if selectedIsAffected, !flushSave() { return }
             try knowledgeBase.trashFolder(root: root, relativePath: folder)
             favorites.subtract(affectedKeys)
-            defaults.set(Array(favorites), forKey: Keys.favorites)
             annotationController.removeAnnotations(for: affectedKeys)
             aiGenerationController.removeChats(for: affectedKeys)
             defaults.removeObject(forKey: Keys.chats)
@@ -921,7 +905,6 @@ final class AppStore {
             try knowledgeBase.trash(document)
             removeOpenDocument(document)
             favorites.remove(document.persistenceKey)
-            defaults.set(Array(favorites), forKey: Keys.favorites)
             if comparisonDocumentPath == document.relativePath {
                 setComparisonDocument(nil)
             }
@@ -950,7 +933,6 @@ final class AppStore {
         } else {
             favorites.insert(key)
         }
-        defaults.set(Array(favorites), forKey: Keys.favorites)
         refreshDerivedLibraryState()
     }
 
@@ -1207,12 +1189,10 @@ final class AppStore {
 
     func toggleAssistant() {
         isAssistantVisible.toggle()
-        defaults.set(isAssistantVisible, forKey: Keys.assistantVisible)
     }
 
     func toggleSidebar() {
         isSidebarVisible.toggle()
-        defaults.set(isSidebarVisible, forKey: Keys.sidebarVisible)
     }
 
     func toggleAnnotationRail() {
@@ -1221,7 +1201,6 @@ final class AppStore {
 
     private func setAnnotationRailVisible(_ isVisible: Bool) {
         isAnnotationRailVisible = isVisible
-        defaults.set(isVisible, forKey: Keys.annotationRailVisible)
         if !isVisible {
             annotationController.cancelComposing()
         }
@@ -1607,7 +1586,6 @@ final class AppStore {
         let newKey = destination.standardizedFileURL.path
         if favorites.remove(oldKey) != nil {
             favorites.insert(newKey)
-            defaults.set(Array(favorites), forKey: Keys.favorites)
         }
         aiGenerationController.moveChat(from: oldKey, to: newKey)
         defaults.removeObject(forKey: Keys.chats)
@@ -1636,7 +1614,6 @@ final class AppStore {
         guard migration.didChange else { return }
         favorites = migration.favorites
         chats = migration.chats
-        defaults.set(Array(favorites), forKey: Keys.favorites)
         persistChats()
     }
 
@@ -1786,12 +1763,6 @@ final class AppStore {
     private enum Keys {
         static let libraryPath = "libraryPath"
         static let selectedPath = "selectedPath"
-        static let favorites = "favorites"
         static let chats = "chats"
-        static let excludedFolders = "excludedFolders"
-        static let assistantVisible = "assistantVisible"
-        static let sidebarVisible = "sidebarVisible"
-        static let annotationRailVisible = "annotationRailVisible"
-        static let colorScheme = "colorScheme"
     }
 }

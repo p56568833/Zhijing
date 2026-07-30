@@ -14,6 +14,24 @@ private final class InertLibraryWatcher: LibraryWatching {
 }
 
 @MainActor
+@Test func appPreferencesOwnsDefaultsPersistence() throws {
+    let suite = "AppPreferencesTests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let preferences = AppPreferencesController(defaults: defaults)
+
+    preferences.favorites.insert("/tmp/favorite.md")
+    preferences.isAssistantVisible = false
+    preferences.colorScheme = .dark
+    preferences.excludedFoldersText = ".git, build"
+
+    #expect(defaults.stringArray(forKey: "favorites") == ["/tmp/favorite.md"])
+    #expect(defaults.bool(forKey: "assistantVisible") == false)
+    #expect(defaults.string(forKey: "colorScheme") == "dark")
+    #expect(defaults.string(forKey: "excludedFolders") == ".git, build")
+}
+
+@MainActor
 @Test func workspaceNavigationOwnsTabsAndComparisonPersistence() throws {
     let suite = "WorkspaceNavigationTests-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suite))
