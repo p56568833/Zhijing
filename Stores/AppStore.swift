@@ -57,8 +57,14 @@ final class AppStore {
     var selectionEditRequest: SelectionEditRequest?
     private(set) var annotationComposerRequest: AnnotationComposerRequest?
     private(set) var annotations: [String: [TextAnnotation]] = [:]
-    var searchQuery = ""
-    var searchResults: [SearchHit] = []
+    var searchQuery: String {
+        get { librarySearchController.query }
+        set { librarySearchController.query = newValue }
+    }
+    var searchResults: [SearchHit] {
+        get { librarySearchController.results }
+        set { librarySearchController.results = newValue }
+    }
     var favorites: Set<String> = []
     var saveState: SaveState = .idle
     var isIndexing = false
@@ -75,7 +81,10 @@ final class AppStore {
     var retrievalStatus = ""
     var errorMessage: String?
     var editProposal: EditProposal?
-    var revisions: [Revision] = []
+    var revisions: [Revision] {
+        get { revisionController.revisions }
+        set { revisionController.revisions = newValue }
+    }
     var provider: AIProviderPreset {
         get { aiSettings.provider }
         set { aiSettings.provider = newValue }
@@ -119,7 +128,9 @@ final class AppStore {
 
     private let defaults: UserDefaults
     private let aiSettings: AISettingsController
-    private let knowledgeBase = KnowledgeBaseService()
+    private let knowledgeBase: KnowledgeBaseService
+    private let librarySearchController: LibrarySearchController
+    private let revisionController: RevisionController
     private let ai = AIService()
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
@@ -133,8 +144,6 @@ final class AppStore {
     private var generationID: UUID?
     @ObservationIgnored
     private var wordCountTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var searchTask: Task<Void, Never>?
     @ObservationIgnored
     private var externalRefreshTask: Task<Void, Never>?
     @ObservationIgnored
@@ -216,8 +225,16 @@ final class AppStore {
         documents.filter { $0.id != selectedDocument?.id }
     }
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        knowledgeBase: KnowledgeBaseService = .init()
+    ) {
         self.defaults = defaults
+        self.knowledgeBase = knowledgeBase
+        librarySearchController = LibrarySearchController(
+            service: knowledgeBase
+        )
+        revisionController = RevisionController(service: knowledgeBase)
         aiSettings = AISettingsController(defaults: defaults)
         excludedFoldersText = defaults.string(forKey: Keys.excludedFolders) ?? ".git, node_modules"
         favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
@@ -448,7 +465,7 @@ final class AppStore {
             if isLibraryDocument(document) {
                 defaults.set(document.relativePath, forKey: Keys.selectedPath)
             }
-            revisions = knowledgeBase.revisions(for: document)
+            revisionController.load(for: document)
             saveState = .saved(.now)
         } catch {
             errorMessage = "无法打开文稿：\(error.localizedDescription)"
@@ -960,25 +977,7 @@ final class AppStore {
     }
 
     func performSearch() {
-        searchTask?.cancel()
-        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            searchResults = []
-            return
-        }
-        let documents = documents
-        let service = knowledgeBase
-        searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
-            let results = await Task.detached(priority: .userInitiated) {
-                service.search(query: query, documents: documents)
-            }.value
-            guard !Task.isCancelled,
-                  searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == query
-            else { return }
-            searchResults = results
-        }
+        librarySearchController.perform(documents: documents)
     }
 
     func sendMessage(_ text: String) {
@@ -1213,7 +1212,7 @@ final class AppStore {
 
         do {
             if !snapshottedProposalIDs.contains(proposal.id) {
-                _ = try knowledgeBase.createSnapshot(
+                _ = try revisionController.createSnapshot(
                     text: proposal.original,
                     document: document,
                     name: proposal.source == .externalFile
@@ -1221,7 +1220,7 @@ final class AppStore {
                         : nil
                 )
                 if proposal.source == .externalFile {
-                    _ = try knowledgeBase.createSnapshot(
+                    _ = try revisionController.createSnapshot(
                         text: proposal.replacement,
                         document: document,
                         name: "外部修改完整版本"
@@ -1268,7 +1267,7 @@ final class AppStore {
                     verticalFraction: viewportFraction
                 )
             }
-            revisions = knowledgeBase.revisions(for: document)
+            revisionController.load(for: document)
         } catch {
             errorMessage = "处理这处修改失败：\(error.localizedDescription)"
         }
@@ -1304,32 +1303,31 @@ final class AppStore {
     func createManualSnapshot(name: String? = nil) {
         guard let document = selectedDocument else { return }
         do {
-            _ = try knowledgeBase.createSnapshot(
+            _ = try revisionController.createSnapshot(
                 text: editorText,
                 document: document,
                 name: name
             )
-            revisions = knowledgeBase.revisions(for: document)
         } catch {
             errorMessage = "创建版本失败：\(error.localizedDescription)"
         }
     }
 
     func revisionText(_ revision: Revision) -> String {
-        (try? knowledgeBase.revisionText(revision)) ?? ""
+        (try? revisionController.revisionText(revision)) ?? ""
     }
 
     func restore(_ revision: Revision) {
         guard let document = selectedDocument else { return }
         do {
-            _ = try knowledgeBase.createSnapshot(
-                text: editorText,
-                document: document,
-                name: "恢复前自动备份"
+            let restoredText = try revisionController.prepareRestore(
+                revision,
+                currentText: editorText,
+                document: document
             )
-            replaceEditorText(try String(contentsOf: revision.url, encoding: .utf8))
+            replaceEditorText(restoredText)
             saveNow()
-            revisions = knowledgeBase.revisions(for: document)
+            revisionController.load(for: document)
         } catch {
             errorMessage = "恢复版本失败：\(error.localizedDescription)"
         }
@@ -1538,7 +1536,7 @@ final class AppStore {
               selectedDocument?.id == conflict.document.id else { return }
         do {
             if let diskText = conflict.diskText {
-                _ = try knowledgeBase.createSnapshot(
+                _ = try revisionController.createSnapshot(
                     text: diskText,
                     document: conflict.document,
                     name: "外部修改（冲突备份）"
@@ -1553,7 +1551,7 @@ final class AppStore {
             updateDocumentMetadata(refreshed)
             externalConflict = nil
             saveState = .saved(.now)
-            revisions = knowledgeBase.revisions(for: conflict.document)
+            revisionController.load(for: conflict.document)
             refreshAfterExternalResolution(conflict.document)
         } catch {
             errorMessage = "保留本地版本失败：\(error.localizedDescription)"
@@ -1565,7 +1563,7 @@ final class AppStore {
               let diskText = conflict.diskText,
               selectedDocument?.id == conflict.document.id else { return }
         do {
-            _ = try knowledgeBase.createSnapshot(
+            _ = try revisionController.createSnapshot(
                 text: editorText,
                 document: conflict.document,
                 name: "冲突前的本地版本"
@@ -1575,7 +1573,7 @@ final class AppStore {
             editProposal = nil
             externalConflict = nil
             saveState = .saved(.now)
-            revisions = knowledgeBase.revisions(for: conflict.document)
+            revisionController.load(for: conflict.document)
             refreshAfterExternalResolution(conflict.document)
         } catch {
             errorMessage = "载入外部版本失败：\(error.localizedDescription)"
@@ -1758,7 +1756,7 @@ final class AppStore {
         documentWordCount = 0
         replaceEditorText("", reanchoringAnnotations: false)
         documentSession.reset()
-        revisions = []
+        revisionController.reset()
         editProposal = nil
         externalConflict = nil
     }
@@ -2104,9 +2102,7 @@ final class AppStore {
         externalRefreshTask?.cancel()
         externalRefreshTask = nil
         pendingLibraryChangeURLs.removeAll()
-        searchTask?.cancel()
-        searchTask = nil
-        searchResults = []
+        librarySearchController.reset()
         clearDocumentSelection()
         resetWorkspaceNavigation()
         documents = []

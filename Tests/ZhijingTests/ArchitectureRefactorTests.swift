@@ -3,6 +3,81 @@ import Testing
 @testable import Zhijing
 
 @MainActor
+@Test func librarySearchControllerOwnsCancellationAndEmptyQueryState() async throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "LibrarySearchControllerTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let documentURL = root.appending(path: "note.md")
+    let content = "架构重构的目标内容"
+    try content.write(to: documentURL, atomically: true, encoding: .utf8)
+    let document = NoteDocument(
+        url: documentURL,
+        relativePath: "note.md",
+        modifiedAt: .now,
+        size: content.utf8.count
+    )
+    let controller = LibrarySearchController(
+        service: KnowledgeBaseService(),
+        delay: .zero
+    )
+
+    controller.query = "架构"
+    controller.perform(documents: [document])
+    await controller.waitForPendingSearch()
+    #expect(controller.results.map(\.document.id) == [document.id])
+
+    controller.query = "   "
+    controller.perform(documents: [document])
+    #expect(controller.results.isEmpty)
+}
+
+@MainActor
+@Test func revisionControllerCreatesBackupBeforePreparingRestore() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "RevisionControllerTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let documentURL = root.appending(path: "note.md")
+    let document = NoteDocument(
+        url: documentURL,
+        relativePath: "note.md",
+        modifiedAt: .now,
+        size: 0
+    )
+    let service = KnowledgeBaseService(
+        supportDirectoryOverride: root.appending(path: "Support")
+    )
+    let controller = RevisionController(service: service)
+
+    _ = try controller.createSnapshot(
+        text: "第一版",
+        document: document,
+        name: "初稿"
+    )
+    let target = try #require(controller.revisions.first)
+    let restored = try controller.prepareRestore(
+        target,
+        currentText: "第二版",
+        document: document
+    )
+
+    #expect(restored == "第一版")
+    #expect(controller.revisions.count == 2)
+    #expect(controller.revisions.contains { $0.name == "恢复前自动备份" })
+}
+
+@MainActor
 @Test func aiSettingsControllerOwnsProviderConfigurationAndSecretWrites() throws {
     let suiteName = "AISettingsControllerTests-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
