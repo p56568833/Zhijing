@@ -2,6 +2,33 @@ import Foundation
 import Testing
 @testable import Zhijing
 
+@MainActor
+@Test func documentFindControllerKeepsTransitionsConsistent() {
+    let controller = DocumentFindController()
+    controller.options = DocumentFindOptions(
+        query: "needle",
+        matchCase: true,
+        wholeWord: true
+    )
+    controller.updateResult(DocumentFindResult(
+        matchCount: 3,
+        selectedIndex: 1
+    ))
+
+    controller.navigate(.next)
+    #expect(controller.isVisible)
+    #expect(controller.navigationRequest?.direction == .next)
+    #expect(controller.result.matchCount == 3)
+
+    controller.hide()
+    #expect(!controller.isVisible)
+    #expect(controller.options.query.isEmpty)
+    #expect(controller.options.matchCase)
+    #expect(controller.options.wholeWord)
+    #expect(controller.result == DocumentFindResult())
+    #expect(controller.navigationRequest == nil)
+}
+
 @Test func annotationResolutionCacheReusesACompleteDisplaySnapshot() {
     let text = "甲。需要批注的段落。乙。"
     let selected = "需要批注的段落"

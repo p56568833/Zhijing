@@ -40,10 +40,20 @@ final class AppStore {
     private(set) var editorNavigationRequest: EditorNavigationRequest?
     private(set) var editorSelection: EditorTextSelection?
     private(set) var documentWordCount = 0
-    var isDocumentFindVisible = false
-    var documentFindOptions = DocumentFindOptions()
-    private(set) var documentFindResult = DocumentFindResult()
-    private(set) var documentFindNavigationRequest: DocumentFindNavigationRequest?
+    var isDocumentFindVisible: Bool {
+        get { documentFindController.isVisible }
+        set { documentFindController.isVisible = newValue }
+    }
+    var documentFindOptions: DocumentFindOptions {
+        get { documentFindController.options }
+        set { documentFindController.options = newValue }
+    }
+    var documentFindResult: DocumentFindResult {
+        documentFindController.result
+    }
+    var documentFindNavigationRequest: DocumentFindNavigationRequest? {
+        documentFindController.navigationRequest
+    }
     var selectionEditRequest: SelectionEditRequest?
     private(set) var annotationComposerRequest: AnnotationComposerRequest?
     private(set) var annotations: [String: [TextAnnotation]] = [:]
@@ -106,6 +116,7 @@ final class AppStore {
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
     private let documentSession = DocumentSessionController()
+    private let documentFindController = DocumentFindController()
     private let chatPersistence = ChatPersistenceService()
     private let annotationRepository = AnnotationRepository()
     @ObservationIgnored
@@ -1490,32 +1501,23 @@ final class AppStore {
     func showDocumentFind() {
         guard selectedDocument != nil else { return }
         isPreviewMode = false
-        isDocumentFindVisible = true
+        documentFindController.show()
     }
 
     func hideDocumentFind() {
-        isDocumentFindVisible = false
-        documentFindOptions.query = ""
-        documentFindResult = DocumentFindResult()
-        documentFindNavigationRequest = nil
+        documentFindController.hide()
     }
 
     func findNext() {
         guard selectedDocument != nil else { return }
         isPreviewMode = false
-        isDocumentFindVisible = true
-        documentFindNavigationRequest = DocumentFindNavigationRequest(
-            direction: .next
-        )
+        documentFindController.navigate(.next)
     }
 
     func findPrevious() {
         guard selectedDocument != nil else { return }
         isPreviewMode = false
-        isDocumentFindVisible = true
-        documentFindNavigationRequest = DocumentFindNavigationRequest(
-            direction: .previous
-        )
+        documentFindController.navigate(.previous)
     }
 
     func handleDocumentFindCommand(_ command: DocumentFindCommand) {
@@ -1530,8 +1532,7 @@ final class AppStore {
     }
 
     func updateDocumentFindResult(_ result: DocumentFindResult) {
-        guard documentFindResult != result else { return }
-        documentFindResult = result
+        documentFindController.updateResult(result)
     }
 
     private func updateAssistantMessage(
