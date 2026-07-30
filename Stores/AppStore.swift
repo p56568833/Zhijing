@@ -28,12 +28,21 @@ enum AppColorScheme: String, CaseIterable {
 @MainActor
 @Observable
 final class AppStore {
-    var libraryURL: URL?
-    var documents: [NoteDocument] = []
-    var folders: [String] = []
-    private(set) var libraryTree: [LibraryTreeItem] = []
-    private(set) var recentDocuments: [NoteDocument] = []
-    private(set) var favoriteDocuments: [NoteDocument] = []
+    var libraryURL: URL? {
+        get { workspaceCatalog.libraryURL }
+        set { workspaceCatalog.libraryURL = newValue }
+    }
+    var documents: [NoteDocument] {
+        get { workspaceCatalog.documents }
+        set { workspaceCatalog.documents = newValue }
+    }
+    var folders: [String] {
+        get { workspaceCatalog.folders }
+        set { workspaceCatalog.folders = newValue }
+    }
+    var libraryTree: [LibraryTreeItem] { workspaceCatalog.libraryTree }
+    var recentDocuments: [NoteDocument] { workspaceCatalog.recentDocuments }
+    var favoriteDocuments: [NoteDocument] { workspaceCatalog.favoriteDocuments }
     var selectedDocument: NoteDocument?
     private(set) var editorText = ""
     private(set) var editorContentRevision = 0
@@ -67,7 +76,10 @@ final class AppStore {
     }
     var favorites: Set<String> = []
     var saveState: SaveState = .idle
-    var isIndexing = false
+    var isIndexing: Bool {
+        get { workspaceCatalog.isIndexing }
+        set { workspaceCatalog.isIndexing = newValue }
+    }
     var isAssistantVisible = true
     var isSidebarVisible = true
     var isAnnotationRailVisible = true
@@ -139,6 +151,7 @@ final class AppStore {
     private let revisionController: RevisionController
     private let aiGenerationController: AIGenerationController
     private let editProposalController: EditProposalController
+    private let workspaceCatalog: WorkspaceCatalogController
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
     private let documentSession: DocumentSessionController
@@ -150,10 +163,6 @@ final class AppStore {
     private var externalRefreshTask: Task<Void, Never>?
     @ObservationIgnored
     private var pendingLibraryChangeURLs: Set<URL> = []
-    @ObservationIgnored
-    private var documentByPath: [String: NoteDocument] = [:]
-    @ObservationIgnored
-    private var libraryRefreshID = UUID()
     var currentMessages: [ChatMessage] {
         aiGenerationController.messages(
             for: selectedDocument?.persistenceKey
@@ -201,7 +210,7 @@ final class AppStore {
 
     var openDocuments: [NoteDocument] {
         let libraryDocuments = openDocumentPaths.compactMap { path in
-            documentByPath[path]
+            workspaceCatalog.document(at: path)
         }
         return libraryDocuments + externalDocuments.filter { external in
             !libraryDocuments.contains(where: { $0.id == external.id })
@@ -219,7 +228,7 @@ final class AppStore {
 
     var comparisonDocument: NoteDocument? {
         guard let comparisonDocumentPath else { return nil }
-        return documentByPath[comparisonDocumentPath]
+        return workspaceCatalog.document(at: comparisonDocumentPath)
     }
 
     var comparisonCandidates: [NoteDocument] {
@@ -236,6 +245,7 @@ final class AppStore {
         self.defaults = defaults
         self.knowledgeBase = knowledgeBase
         self.documentSession = documentSession
+        workspaceCatalog = WorkspaceCatalogController(service: knowledgeBase)
         librarySearchController = LibrarySearchController(
             service: knowledgeBase
         )
@@ -381,28 +391,11 @@ final class AppStore {
     ) async {
         guard let libraryURL else { return }
         loadPortableAnnotationsIfNeeded(at: libraryURL)
-        let refreshID = UUID()
-        libraryRefreshID = refreshID
-        isIndexing = true
-        defer {
-            if libraryRefreshID == refreshID {
-                isIndexing = false
-            }
-        }
         do {
-            let excluded = excludedFolders
-            let scanned = try await Task.detached {
-                let service = KnowledgeBaseService()
-                return try service.scanLibrary(
-                    root: libraryURL,
-                    excludedFolders: excluded
-                )
-            }.value
-            guard libraryRefreshID == refreshID,
-                  self.libraryURL?.standardizedFileURL == libraryURL.standardizedFileURL
-            else { return }
-            documents = scanned.documents
-            folders = scanned.folders
+            guard let scanned = try await workspaceCatalog.refresh(
+                excludedFolders: excludedFolders,
+                favorites: favorites
+            ) else { return }
             migrateExternalDocumentsIntoLibrary()
             refreshDerivedLibraryState()
             reconcileMovedAnnotationDocuments(in: libraryURL)
@@ -421,7 +414,8 @@ final class AppStore {
                 documents.first(where: { $0.id == selected.id })?.relativePath
             }
             let targetPath = relativePath ?? selectedLibraryPath
-            if let targetPath, let target = documentByPath[targetPath] {
+            if let targetPath,
+               let target = workspaceCatalog.document(at: targetPath) {
                 select(target)
             } else if let selectedDocument {
                 if externalDocuments.contains(where: { $0.id == selectedDocument.id }) {
@@ -444,19 +438,18 @@ final class AppStore {
                 }
             }
             for path in relativePaths where path != selectedDocument?.relativePath {
-                if let document = documentByPath[path] {
+                if let document = workspaceCatalog.document(at: path) {
                     addOpenDocument(document)
                 }
             }
         } catch {
-            guard libraryRefreshID == refreshID else { return }
             errorMessage = "无法读取知识库：\(error.localizedDescription)"
         }
     }
 
     func select(_ document: NoteDocument) {
         if selectedDocument?.id == document.id {
-            selectedDocument = documentByPath[document.relativePath]
+            selectedDocument = workspaceCatalog.document(at: document.relativePath)
                 ?? externalDocuments.first(where: { $0.id == document.id })
                 ?? document
             return
@@ -1338,25 +1331,12 @@ final class AppStore {
     }
 
     private func refreshDerivedLibraryState() {
-        documentByPath = Dictionary(
-            uniqueKeysWithValues: documents.map { ($0.relativePath, $0) }
-        )
         migrateLegacyDocumentStateIfNeeded()
-        recentDocuments = Array(
-            documents.sorted { $0.modifiedAt > $1.modifiedAt }.prefix(8)
-        )
-        favoriteDocuments = documents.filter {
-            favorites.contains($0.persistenceKey)
-        }
-
-        libraryTree = LibraryTreeBuilder.build(
-            folders: folders,
-            documents: documents
-        )
+        workspaceCatalog.rebuildDerivedState(favorites: favorites)
     }
 
     private func isLibraryDocument(_ document: NoteDocument) -> Bool {
-        documentByPath[document.relativePath]?.id == document.id
+        workspaceCatalog.isLibraryDocument(document)
     }
 
     private func reconcileMovedAnnotationDocuments(in root: URL) {
@@ -1412,19 +1392,11 @@ final class AppStore {
     }
 
     private func updateDocumentMetadata(_ refreshed: NoteDocument) {
-        if let index = documents.firstIndex(where: { $0.id == refreshed.id }) {
-            documents[index] = refreshed
-            documentByPath[refreshed.relativePath] = refreshed
-            recentDocuments.removeAll { $0.id == refreshed.id }
-            recentDocuments.insert(refreshed, at: 0)
-            recentDocuments = Array(
-                recentDocuments.sorted { $0.modifiedAt > $1.modifiedAt }.prefix(8)
+        if isLibraryDocument(refreshed) {
+            workspaceCatalog.updateDocumentMetadata(
+                refreshed,
+                favorites: favorites
             )
-            if let favoriteIndex = favoriteDocuments.firstIndex(where: {
-                $0.id == refreshed.id
-            }) {
-                favoriteDocuments[favoriteIndex] = refreshed
-            }
         } else if let index = externalDocuments.firstIndex(where: {
             $0.id == refreshed.id
         }) {
@@ -1823,7 +1795,7 @@ final class AppStore {
     }
 
     private func transitionToLibrary(_ url: URL) {
-        libraryRefreshID = UUID()
+        workspaceCatalog.cancelRefresh()
         libraryWatcher.stop()
         externalRefreshTask?.cancel()
         externalRefreshTask = nil
@@ -1831,17 +1803,9 @@ final class AppStore {
         librarySearchController.reset()
         clearDocumentSelection()
         resetWorkspaceNavigation()
-        documents = []
-        folders = []
-        documentByPath = [:]
-        libraryTree = []
-        recentDocuments = []
-        favoriteDocuments = []
-        isIndexing = false
-
         let standardizedURL = url.standardizedFileURL
         annotationRepository.transitionToLibrary()
-        libraryURL = standardizedURL
+        workspaceCatalog.transition(to: standardizedURL)
         defaults.set(standardizedURL.path, forKey: Keys.libraryPath)
     }
 

@@ -3,6 +3,43 @@ import Testing
 @testable import Zhijing
 
 @MainActor
+@Test func workspaceCatalogOwnsScanIndexesAndDerivedLists() async throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "WorkspaceCatalogTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    let folder = root.appending(path: "Folder", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: folder,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let documentURL = folder.appending(path: "note.md")
+    try "正文".write(to: documentURL, atomically: true, encoding: .utf8)
+    let controller = WorkspaceCatalogController(
+        service: KnowledgeBaseService()
+    )
+    controller.transition(to: root)
+
+    let scanned = try await controller.refresh(
+        excludedFolders: [],
+        favorites: [documentURL.standardizedFileURL.path]
+    )
+
+    let document = try #require(scanned?.documents.first)
+    #expect(controller.document(at: "Folder/note.md")?.id == document.id)
+    #expect(controller.isLibraryDocument(document))
+    #expect(controller.favoriteDocuments.map(\.id) == [document.id])
+    #expect(controller.recentDocuments.map(\.id) == [document.id])
+    #expect(!controller.libraryTree.isEmpty)
+    #expect(!controller.isIndexing)
+
+    controller.transition(to: root.appending(path: "Other"))
+    #expect(controller.documents.isEmpty)
+    #expect(controller.document(at: "Folder/note.md") == nil)
+}
+
+@MainActor
 @Test func editProposalControllerOwnsSnapshotsWritesAndCompletion() throws {
     let root = FileManager.default.temporaryDirectory.appending(
         path: "EditProposalControllerTests-\(UUID().uuidString)",
