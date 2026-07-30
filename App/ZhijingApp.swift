@@ -62,6 +62,10 @@ struct ZhijingApp: App {
                 .keyboardShortcut("g", modifiers: [.command, .shift])
             }
             CommandMenu("文稿") {
+                Button("添加批注…") {
+                    store.requestAnnotationComposer()
+                }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
                 Button("AI 修改所选内容…") {
                     store.requestCustomSelectionEdit()
                 }

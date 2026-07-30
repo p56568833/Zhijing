@@ -136,11 +136,18 @@ struct EditorView: View {
                     navigationRequest: store.editorNavigationRequest,
                     findOptions: store.documentFindOptions,
                     findNavigationRequest: store.documentFindNavigationRequest,
+                    annotations: store.currentResolvedAnnotations,
+                    annotationComposerRequestID: store.annotationComposerRequestID,
                     onChange: store.editorDidChange,
                     onSelectionChange: store.editorSelectionDidChange,
                     onFindResultChange: store.updateDocumentFindResult,
                     onFindCommand: store.handleDocumentFindCommand,
-                    onAIEditAction: store.handleSelectionEditAction
+                    onAIEditAction: store.handleSelectionEditAction,
+                    onCreateAnnotation: { text, selection in
+                        store.addAnnotation(text: text, selection: selection)
+                    },
+                    onUpdateAnnotation: store.updateAnnotation,
+                    onDeleteAnnotation: store.deleteAnnotation
                 )
                 .accessibilityLabel("\(document.title) 编辑器")
             }

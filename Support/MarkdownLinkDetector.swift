@@ -1,6 +1,6 @@
 import Foundation
 
-struct MarkdownEditorLink: Equatable {
+struct MarkdownEditorLink: Equatable, Sendable {
     let range: NSRange
     let url: URL
 }
@@ -10,12 +10,19 @@ enum MarkdownLinkDetector {
         pattern: #"\[[^\]\n]+\]\(([^)]+)\)"#
     )
 
-    static func links(in source: String) -> [MarkdownEditorLink] {
+    static func links(
+        in source: String,
+        characterRange requestedRange: NSRange? = nil
+    ) -> [MarkdownEditorLink] {
         guard let expression else { return [] }
         let nsSource = source as NSString
+        let fullRange = NSRange(location: 0, length: nsSource.length)
+        let searchRange = requestedRange.map {
+            NSIntersectionRange($0, fullRange)
+        } ?? fullRange
         return expression.matches(
             in: source,
-            range: NSRange(location: 0, length: nsSource.length)
+            range: searchRange
         ).compactMap { match in
             guard match.numberOfRanges >= 2 else { return nil }
             let target = nsSource.substring(with: match.range(at: 1))

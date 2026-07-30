@@ -1,5 +1,10 @@
 import AppKit
 
+struct MarkdownLineNumberMarker: Equatable {
+    let lineNumber: Int
+    let rectInTextView: NSRect
+}
+
 final class MarkdownLineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
     private var lineRanges: [NSRange] = []
@@ -43,66 +48,102 @@ final class MarkdownLineNumberRulerView: NSRulerView {
     }
 
     @objc private func textDidChange(_ notification: Notification) {
+        invalidateLineNumberCache()
+    }
+
+    func invalidateLineNumberCache() {
         lineRanges.removeAll(keepingCapacity: true)
         cachedStringLength = -1
         needsDisplay = true
     }
 
     override func drawHashMarksAndLabels(in rect: NSRect) {
-        guard let textView,
-              let layoutManager = textView.layoutManager,
-              let textContainer = textView.textContainer else { return }
+        guard let textView else { return }
+
         NSColor.windowBackgroundColor.setFill()
         bounds.fill()
 
-        let visibleRect = textView.visibleRect
-        let string = textView.string as NSString
-        let ranges = cachedLineRanges(for: string)
-        guard !ranges.isEmpty else { return }
-
-        let visibleGlyphRange = layoutManager.glyphRange(
-            forBoundingRect: visibleRect,
-            in: textContainer
-        )
-        let visibleCharacterRange = layoutManager.characterRange(
-            forGlyphRange: visibleGlyphRange,
-            actualGlyphRange: nil
-        )
-        let firstLine = max(
-            0,
-            lineIndex(containing: visibleCharacterRange.location, in: ranges) - 1
-        )
-        let visibleUpperBound = NSMaxRange(visibleCharacterRange)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor.tertiaryLabelColor
         ]
-        for index in firstLine..<ranges.count {
-            let lineRange = ranges[index]
-            if lineRange.location > visibleUpperBound { break }
-            let glyphRange = layoutManager.glyphRange(
-                forCharacterRange: lineRange,
-                actualCharacterRange: nil
+        for marker in lineNumberMarkers(in: textView.visibleRect) {
+            let label = "\(marker.lineNumber)" as NSString
+            let labelSize = label.size(withAttributes: attributes)
+            let fragmentRect = convert(marker.rectInTextView, from: textView)
+            label.draw(
+                at: NSPoint(
+                    x: bounds.maxX - labelSize.width - 10,
+                    y: fragmentRect.midY - labelSize.height / 2
+                ),
+                withAttributes: attributes
             )
-            if glyphRange.location < layoutManager.numberOfGlyphs {
-                let fragment = layoutManager.lineFragmentRect(
-                    forGlyphAt: glyphRange.location,
-                    effectiveRange: nil
-                )
-                let y = fragment.minY + textView.textContainerOrigin.y
-                if y + fragment.height >= visibleRect.minY, y <= visibleRect.maxY {
-                    let label = "\(index + 1)" as NSString
-                    let point = convert(NSPoint(x: 0, y: y + 2), from: textView)
-                    label.draw(
-                        at: NSPoint(
-                            x: bounds.maxX - label.size(withAttributes: attributes).width - 10,
-                            y: point.y
-                        ),
-                        withAttributes: attributes
-                    )
-                }
+        }
+    }
+
+    func lineNumberMarkers(in visibleRect: NSRect) -> [MarkdownLineNumberMarker] {
+        guard let textView,
+              let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer else { return [] }
+
+        layoutManager.ensureLayout(for: textContainer)
+        let ranges = cachedLineRanges(for: textView.string as NSString)
+        guard !ranges.isEmpty else { return [] }
+
+        let textOrigin = textView.textContainerOrigin
+        let visibleContainerRect = visibleRect.offsetBy(
+            dx: -textOrigin.x,
+            dy: -textOrigin.y
+        )
+        let visibleGlyphRange = layoutManager.glyphRange(
+            forBoundingRect: visibleContainerRect,
+            in: textContainer
+        )
+        var markers: [MarkdownLineNumberMarker] = []
+
+        layoutManager.enumerateLineFragments(
+            forGlyphRange: visibleGlyphRange
+        ) { _, usedRect, _, glyphRange, _ in
+            guard glyphRange.location < layoutManager.numberOfGlyphs else { return }
+            let characterLocation = layoutManager.characterIndexForGlyph(
+                at: glyphRange.location
+            )
+            let lineIndex = self.lineIndex(
+                containing: characterLocation,
+                in: ranges
+            )
+
+            // A long source line can occupy several visual rows. Its number belongs
+            // only to the first fragment; each real blank line still has a fragment.
+            guard ranges[lineIndex].location == characterLocation else { return }
+            let rectInTextView = usedRect.offsetBy(
+                dx: textOrigin.x,
+                dy: textOrigin.y
+            )
+            guard rectInTextView.intersects(visibleRect) else { return }
+            markers.append(MarkdownLineNumberMarker(
+                lineNumber: lineIndex + 1,
+                rectInTextView: rectInTextView
+            ))
+        }
+
+        if let lastRange = ranges.last,
+           lastRange.length == 0,
+           lastRange.location == textView.string.utf16.count,
+           layoutManager.extraLineFragmentTextContainer === textContainer {
+            let extraRect = layoutManager.extraLineFragmentUsedRect.offsetBy(
+                dx: textOrigin.x,
+                dy: textOrigin.y
+            )
+            if extraRect.intersects(visibleRect) {
+                markers.append(MarkdownLineNumberMarker(
+                    lineNumber: ranges.count,
+                    rectInTextView: extraRect
+                ))
             }
         }
+
+        return markers
     }
 
     private func cachedLineRanges(for string: NSString) -> [NSRange] {
@@ -112,20 +153,29 @@ final class MarkdownLineNumberRulerView: NSRulerView {
 
         var ranges: [NSRange] = []
         var location = 0
-        repeat {
+        while location < string.length {
             let range = string.lineRange(
-                for: NSRange(location: min(location, string.length), length: 0)
+                for: NSRange(location: location, length: 0)
             )
             ranges.append(range)
-            if range.length == 0 || NSMaxRange(range) >= string.length {
-                break
-            }
+            guard range.length > 0 else { break }
             location = NSMaxRange(range)
-        } while location <= string.length
+        }
+
+        if string.length == 0 || endsWithLineBreak(string) {
+            ranges.append(NSRange(location: string.length, length: 0))
+        }
 
         lineRanges = ranges
         cachedStringLength = string.length
         return ranges
+    }
+
+    private func endsWithLineBreak(_ string: NSString) -> Bool {
+        guard string.length > 0 else { return false }
+        return CharacterSet.newlines.contains(
+            UnicodeScalar(string.character(at: string.length - 1))!
+        )
     }
 
     private func lineIndex(containing location: Int, in ranges: [NSRange]) -> Int {

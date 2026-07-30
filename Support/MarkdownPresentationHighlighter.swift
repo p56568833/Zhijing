@@ -1,5 +1,23 @@
 import AppKit
 
+enum MarkdownFenceStateResolver {
+    static func isInsideFence(before location: Int, in source: String) -> Bool {
+        guard location > 0 else { return false }
+        let nsSource = source as NSString
+        let prefix = nsSource.substring(
+            with: NSRange(location: 0, length: min(location, nsSource.length))
+        )
+        var inside = false
+        for line in prefix.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                inside.toggle()
+            }
+        }
+        return inside
+    }
+}
+
 enum MarkdownPresentationStyle {
     case heading
     case quote
@@ -82,7 +100,8 @@ enum MarkdownPresentationHighlighter {
     static func apply(
         to textView: NSTextView,
         links: [MarkdownEditorLink]? = nil,
-        characterRange requestedRange: NSRange? = nil
+        characterRange requestedRange: NSRange? = nil,
+        startsInsideFence resolvedFenceState: Bool? = nil
     ) {
         guard let layoutManager = textView.layoutManager else { return }
         let fullRange = NSRange(location: 0, length: textView.string.utf16.count)
@@ -108,10 +127,11 @@ enum MarkdownPresentationHighlighter {
             let nsSource = textView.string as NSString
             source = nsSource.substring(with: stylingRange)
             baseLocation = stylingRange.location
-            startsInsideFence = isInsideFence(
-                before: stylingRange.location,
-                in: nsSource
-            )
+            startsInsideFence = resolvedFenceState
+                ?? MarkdownFenceStateResolver.isInsideFence(
+                    before: stylingRange.location,
+                    in: textView.string
+                )
         }
 
         let resolvedLinks = links ?? MarkdownLinkDetector.links(in: textView.string)
@@ -235,18 +255,4 @@ enum MarkdownPresentationHighlighter {
         try? NSRegularExpression(pattern: pattern)
     }
 
-    private static func isInsideFence(before location: Int, in source: NSString) -> Bool {
-        guard location > 0 else { return false }
-        let prefix = source.substring(
-            with: NSRange(location: 0, length: min(location, source.length))
-        )
-        var inside = false
-        for line in prefix.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                inside.toggle()
-            }
-        }
-        return inside
-    }
 }

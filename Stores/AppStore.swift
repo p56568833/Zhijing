@@ -45,6 +45,8 @@ final class AppStore {
     private(set) var documentFindResult = DocumentFindResult()
     private(set) var documentFindNavigationRequest: DocumentFindNavigationRequest?
     var selectionEditRequest: SelectionEditRequest?
+    private(set) var annotationComposerRequestID: UUID?
+    private(set) var annotations: [String: [TextAnnotation]] = [:]
     var searchQuery = ""
     var searchResults: [SearchHit] = []
     var favorites: Set<String> = []
@@ -97,29 +99,49 @@ final class AppStore {
         }
     }
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private let knowledgeBase = KnowledgeBaseService()
     private let ai = AIService()
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
-    private let documentWriter = DocumentWriteCoordinator()
+    private let documentSession = DocumentSessionController()
     private let chatPersistence = ChatPersistenceService()
+    private let annotationPersistence = AnnotationPersistenceService()
+    @ObservationIgnored
     private var generationTask: Task<Void, Never>?
+    @ObservationIgnored
     private var generationID: UUID?
-    private var saveTask: Task<Void, Never>?
+    @ObservationIgnored
     private var wordCountTask: Task<Void, Never>?
+    @ObservationIgnored
     private var searchTask: Task<Void, Never>?
+    @ObservationIgnored
     private var externalRefreshTask: Task<Void, Never>?
+    @ObservationIgnored
     private var pendingLibraryChangeURLs: Set<URL> = []
-    private var loadedText = ""
+    @ObservationIgnored
     private var snapshottedProposalIDs: Set<UUID> = []
+    @ObservationIgnored
     private var documentByPath: [String: NoteDocument] = [:]
+    @ObservationIgnored
     private var lastBalanceRefresh: Date?
+    @ObservationIgnored
     private var libraryRefreshID = UUID()
 
     var currentMessages: [ChatMessage] {
         guard let key = selectedDocument?.persistenceKey else { return [] }
         return chats[key] ?? []
+    }
+
+    var currentAnnotations: [TextAnnotation] {
+        guard let key = selectedDocument?.persistenceKey else { return [] }
+        return annotations[key] ?? []
+    }
+
+    var currentResolvedAnnotations: [ResolvedTextAnnotation] {
+        currentAnnotations.compactMap {
+            TextAnnotationAnchorResolver.resolve($0, in: editorText)
+        }
     }
 
     var latestUsage: AIUsage? {
@@ -167,7 +189,8 @@ final class AppStore {
         documents.filter { $0.id != selectedDocument?.id }
     }
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         provider = AIProviderPreset(
             rawValue: defaults.string(forKey: Keys.provider) ?? ""
         ) ?? Self.inferProvider(from: defaults.string(forKey: Keys.endpoint))
@@ -178,6 +201,7 @@ final class AppStore {
         favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
         let legacyChats = defaults.data(forKey: Keys.chats)
         chats = chatPersistence.load(legacyData: legacyChats)
+        annotations = annotationPersistence.load()
         if legacyChats != nil {
             do {
                 try chatPersistence.saveSynchronously(chats)
@@ -386,7 +410,7 @@ final class AppStore {
                     // Keep an external tab selected while the library refreshes.
                 } else {
                     if externalConflict?.document.id != selectedDocument.id {
-                        saveTask?.cancel()
+                        documentSession.cancelAutosave()
                         clearDocumentSelection()
                         errorMessage = "当前文稿已不在知识库中，可能被其他应用移动或删除。"
                     } else {
@@ -425,7 +449,7 @@ final class AppStore {
         }
         do {
             replaceEditorText(try knowledgeBase.read(document))
-            loadedText = editorText
+            documentSession.loadedText = editorText
             selectedDocument = document
             addOpenDocument(document)
             ensureComparisonDiffersFromSelection()
@@ -443,8 +467,8 @@ final class AppStore {
         guard selectedDocument != nil else { return }
         editorText = text
         scheduleWordCount(for: text)
-        saveTask?.cancel()
-        guard editorText != loadedText else {
+        documentSession.cancelAutosave()
+        guard editorText != documentSession.loadedText else {
             saveState = .saved(.now)
             return
         }
@@ -457,6 +481,52 @@ final class AppStore {
 
     func editorSelectionDidChange(_ selection: EditorTextSelection?) {
         editorSelection = selection
+    }
+
+    func requestAnnotationComposer() {
+        guard validEditorSelection() != nil else {
+            errorMessage = "请先在编辑器中选中要批注的文字。"
+            return
+        }
+        annotationComposerRequestID = UUID()
+    }
+
+    func addAnnotation(
+        text: String,
+        selection: EditorTextSelection
+    ) {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty,
+              let document = selectedDocument,
+              let validSelection = validEditorSelection(selection),
+              let anchor = TextAnnotationAnchorResolver.makeAnchor(
+                  selection: validSelection,
+                  in: editorText
+              ) else { return }
+        annotations[document.persistenceKey, default: []].append(
+            TextAnnotation(anchor: anchor, text: value)
+        )
+        persistAnnotations()
+    }
+
+    func updateAnnotation(id: UUID, text: String) {
+        guard let key = selectedDocument?.persistenceKey,
+              let index = annotations[key]?.firstIndex(where: { $0.id == id })
+        else { return }
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        annotations[key]?[index].text = value
+        annotations[key]?[index].modifiedAt = .now
+        persistAnnotations()
+    }
+
+    func deleteAnnotation(id: UUID) {
+        guard let key = selectedDocument?.persistenceKey else { return }
+        annotations[key]?.removeAll { $0.id == id }
+        if annotations[key]?.isEmpty == true {
+            annotations[key] = nil
+        }
+        persistAnnotations()
     }
 
     func handleSelectionEditAction(_ action: AISelectionEditAction) {
@@ -492,6 +562,10 @@ final class AppStore {
             in: originalText,
             selection: selection.range
         )
+        let annotationContext = Self.annotationContext(
+            annotations: currentAnnotations,
+            in: originalText
+        )
         let query = "\(instruction)\n\(selection.text)"
         let documents = documents
         let config: AIConfiguration
@@ -526,6 +600,7 @@ final class AppStore {
                     currentText: originalText,
                     selectedText: selection.text,
                     surroundingContext: context,
+                    annotationContext: annotationContext,
                     sources: chunks,
                     configuration: config
                 )
@@ -561,19 +636,20 @@ final class AppStore {
 
     @discardableResult
     func saveNow(ignoringExternalConflict: Bool = false) -> Bool {
-        guard let document = selectedDocument, editorText != loadedText else { return true }
+        guard let document = selectedDocument,
+              editorText != documentSession.loadedText else { return true }
         if !ignoringExternalConflict,
            externalConflict?.document.id == document.id {
             saveState = .failed("等待处理外部修改")
             return false
         }
         do {
-            let refreshed = try documentWriter.writeSynchronously(
+            let refreshed = try documentSession.writeSynchronously(
                 editorText,
                 to: document,
                 using: knowledgeBase
             )
-            loadedText = editorText
+            documentSession.loadedText = editorText
             saveState = .saved(.now)
             updateDocumentMetadata(refreshed)
             return true
@@ -592,9 +668,10 @@ final class AppStore {
         guard saveNow() else { return false }
         do {
             try chatPersistence.saveSynchronously(chats)
+            try annotationPersistence.saveSynchronously(annotations)
             return true
         } catch {
-            errorMessage = "保存对话记录失败：\(error.localizedDescription)"
+            errorMessage = "保存对话或批注失败：\(error.localizedDescription)"
             return false
         }
     }
@@ -763,6 +840,7 @@ final class AppStore {
             defaults.set(Array(favorites), forKey: Keys.favorites)
             for key in affectedKeys {
                 chats[key] = nil
+                annotations[key] = nil
             }
             openDocumentPaths.removeAll { affectedPaths.contains($0) }
             persistOpenDocuments()
@@ -771,6 +849,7 @@ final class AppStore {
                 setComparisonDocument(nil)
             }
             persistChats()
+            persistAnnotations()
             if selectedIsAffected {
                 clearDocumentSelection()
             }
@@ -792,9 +871,11 @@ final class AppStore {
                 setComparisonDocument(nil)
             }
             chats[document.persistenceKey] = nil
+            annotations[document.persistenceKey] = nil
             persistChats()
+            persistAnnotations()
             if wasSelected {
-                saveTask?.cancel()
+                documentSession.cancelAutosave()
                 clearDocumentSelection()
             }
             Task { await refreshLibrary() }
@@ -857,6 +938,7 @@ final class AppStore {
 
         let currentText = editorText
         let currentSelection = validEditorSelection()
+        let currentAnnotations = currentAnnotations
         let scope = retrievalScope
         let allDocuments = documents
         let service = knowledgeBase
@@ -878,7 +960,8 @@ final class AppStore {
                 question: question,
                 document: document,
                 text: currentText,
-                selection: currentSelection
+                selection: currentSelection,
+                annotations: currentAnnotations
             )
             var streamedText = ""
             var didCreateAssistantMessage = false
@@ -1002,6 +1085,10 @@ final class AppStore {
             return
         }
         let originalText = editorText
+        let annotationContext = Self.annotationContext(
+            annotations: currentAnnotations,
+            in: originalText
+        )
         guard let generationID = beginGeneration() else { return }
         generationTask = Task {
             defer { finishGeneration(generationID) }
@@ -1009,6 +1096,7 @@ final class AppStore {
                 let replacement = try await ai.proposeEdit(
                     instruction: instruction,
                     currentText: originalText,
+                    annotationContext: annotationContext,
                     configuration: config
                 )
                 if !Task.isCancelled,
@@ -1078,14 +1166,14 @@ final class AppStore {
                 snapshottedProposalIDs.insert(proposal.id)
             }
 
-            saveTask?.cancel()
-            let refreshed = try documentWriter.writeSynchronously(
+            documentSession.cancelAutosave()
+            let refreshed = try documentSession.writeSynchronously(
                 resolution.settledText,
                 to: document,
                 using: knowledgeBase
             )
             replaceEditorText(resolution.settledText)
-            loadedText = resolution.settledText
+            documentSession.loadedText = resolution.settledText
             updateDocumentMetadata(refreshed)
             saveState = .saved(.now)
 
@@ -1373,10 +1461,19 @@ final class AppStore {
         question: String,
         document: NoteDocument,
         text: String,
-        selection: EditorTextSelection?
+        selection: EditorTextSelection?,
+        annotations: [TextAnnotation]
     ) -> String {
         let limit = 12_000
-        guard text.utf16.count > limit else { return text }
+        let annotationText = annotationContext(
+            annotations: annotations,
+            in: text
+        )
+        guard text.utf16.count > limit else {
+            return annotationText.isEmpty
+                ? text
+                : "\(text)\n\n---\n\n\(annotationText)"
+        }
 
         let nsText = text as NSString
         var sections: [String] = []
@@ -1417,7 +1514,34 @@ final class AppStore {
         )
         sections.append("[结尾]\n\(nsText.substring(with: tailRange))")
 
+        if !annotationText.isEmpty {
+            sections.append(annotationText)
+        }
+
         return sections.joined(separator: "\n\n---\n\n")
+    }
+
+    private static func annotationContext(
+        annotations: [TextAnnotation],
+        in text: String
+    ) -> String {
+        let resolved = annotations.compactMap {
+            TextAnnotationAnchorResolver.resolve($0, in: text)
+        }
+        guard !resolved.isEmpty else { return "" }
+        let items = resolved.prefix(30).enumerated().map { index, item in
+            """
+            [用户批注\(index + 1)]
+            对应原文：\(item.annotation.anchor.selectedText)
+            批注：\(item.annotation.text)
+            """
+        }.joined(separator: "\n\n")
+        return """
+        [用户批注]
+        以下内容是用户附在原文上的持久批注，代表用户的判断、问题或修改意图，不是文稿中的事实或引用来源。
+
+        \(items)
+        """
     }
 
     private static func rangesOverlap(_ lhs: Range<Int>, _ rhs: Range<Int>) -> Bool {
@@ -1477,12 +1601,12 @@ final class AppStore {
                     name: "外部修改（冲突备份）"
                 )
             }
-            let refreshed = try documentWriter.writeSynchronously(
+            let refreshed = try documentSession.writeSynchronously(
                 editorText,
                 to: conflict.document,
                 using: knowledgeBase
             )
-            loadedText = editorText
+            documentSession.loadedText = editorText
             updateDocumentMetadata(refreshed)
             externalConflict = nil
             saveState = .saved(.now)
@@ -1504,7 +1628,7 @@ final class AppStore {
                 name: "冲突前的本地版本"
             )
             replaceEditorText(diskText)
-            loadedText = diskText
+            documentSession.loadedText = diskText
             editProposal = nil
             externalConflict = nil
             saveState = .saved(.now)
@@ -1540,7 +1664,7 @@ final class AppStore {
             errorMessage = "请先接受或取消当前修改。"
             return false
         }
-        saveTask?.cancel()
+        documentSession.cancelAutosave()
         return saveNow()
     }
 
@@ -1649,11 +1773,12 @@ final class AppStore {
         }
         selectedDocument = nil
         editorSelection = nil
+        annotationComposerRequestID = nil
         hideDocumentFind()
         wordCountTask?.cancel()
         documentWordCount = 0
         replaceEditorText("")
-        loadedText = ""
+        documentSession.reset()
         revisions = []
         editProposal = nil
         externalConflict = nil
@@ -1663,10 +1788,8 @@ final class AppStore {
         saveState = .saving
         guard let document = selectedDocument else { return }
         let text = editorText
-        saveTask = Task {
-            try? await Task.sleep(for: .milliseconds(650))
-            guard !Task.isCancelled else { return }
-            await autosave(text: text, document: document)
+        documentSession.scheduleAutosave(delay: .milliseconds(650)) { [weak self] in
+            await self?.autosave(text: text, document: document)
         }
     }
 
@@ -1679,13 +1802,13 @@ final class AppStore {
         }
 
         do {
-            let refreshed = try await documentWriter.write(
+            let refreshed = try await documentSession.write(
                 text,
                 to: document,
                 using: knowledgeBase
             )
             guard selectedDocument?.id == document.id, editorText == text else { return }
-            loadedText = text
+            documentSession.loadedText = text
             saveState = .saved(.now)
             updateDocumentMetadata(refreshed)
         } catch {
@@ -1745,7 +1868,6 @@ final class AppStore {
             return
         }
 
-        saveTask?.cancel()
         if shouldCheckSelectedDocument(document, changedURLs: changedURLs) {
             let fileExists = FileManager.default.fileExists(atPath: document.url.path)
             let diskText: String?
@@ -1757,17 +1879,23 @@ final class AppStore {
             }
 
             switch ExternalFileReconciler.evaluate(
-                loadedText: loadedText,
+                loadedText: documentSession.loadedText,
                 editorText: editorText,
-                diskText: diskText
+                diskText: diskText,
+                knownLocalWriteSignatures: documentSession.localWriteSignatures(
+                    for: document
+                )
             ) {
             case .unchanged:
                 break
             case .localChangesOnly:
                 scheduleAutosave()
             case .synchronized(let text):
-                loadedText = text
+                documentSession.loadedText = text
                 saveState = .saved(.now)
+            case .localWriteObserved(let text):
+                documentSession.loadedText = text
+                scheduleAutosave()
             case .reloadFromDisk(let text):
                 if let proposal = editProposal,
                    proposal.source == .assistant {
@@ -1927,6 +2055,10 @@ final class AppStore {
             chats[newKey] = messages
             persistChats()
         }
+        if let documentAnnotations = annotations.removeValue(forKey: oldKey) {
+            annotations[newKey] = documentAnnotations
+            persistAnnotations()
+        }
         if let index = openDocumentPaths.firstIndex(of: oldPath) {
             openDocumentPaths[index] = newRelativePath
             persistOpenDocuments()
@@ -2069,6 +2201,10 @@ final class AppStore {
     private func persistChats() {
         chatPersistence.save(chats)
         defaults.removeObject(forKey: Keys.chats)
+    }
+
+    private func persistAnnotations() {
+        annotationPersistence.save(annotations)
     }
 
     private static func inferProvider(from endpoint: String?) -> AIProviderPreset {

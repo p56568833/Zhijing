@@ -1,13 +1,27 @@
 import CoreServices
 import Foundation
 
-final class LibraryWatcher: @unchecked Sendable {
+final class LibraryWatcher {
+    private final class EventHandlerBox {
+        let handle: @Sendable ([URL]) -> Void
+
+        init(handle: @escaping @Sendable ([URL]) -> Void) {
+            self.handle = handle
+        }
+    }
+
     private let queue = DispatchQueue(
         label: "com.zhijing.library-watcher",
         qos: .utility
     )
     private var stream: FSEventStreamRef?
-    private var onChange: (@Sendable ([URL]) -> Void)?
+    private var handlerBox: EventHandlerBox?
+
+    deinit {
+        queue.sync {
+            stopOnQueue()
+        }
+    }
 
     func start(
         root: URL,
@@ -15,8 +29,8 @@ final class LibraryWatcher: @unchecked Sendable {
         excludedFolders: [String],
         onChange: @escaping @Sendable ([URL]) -> Void
     ) {
-        stop()
-        let rootPath = root.standardizedFileURL.path
+        let root = root.standardizedFileURL
+        let rootPath = root.path
         let exclusions = Set(excludedFolders)
         let externalFilePaths = Set(
             additionalFiles.map { $0.standardizedFileURL.path }
@@ -26,11 +40,12 @@ final class LibraryWatcher: @unchecked Sendable {
                 $0.deletingLastPathComponent().standardizedFileURL.path
             }
         )
-        self.onChange = { urls in
-            let filtered = urls.filter {
-                let path = $0.standardizedFileURL.path
+        let watchedPaths = Array(Set([rootPath]).union(externalParentPaths)).sorted()
+        let handler = EventHandlerBox { urls in
+            let filtered = urls.filter { url in
+                let path = url.standardizedFileURL.path
                 return Self.shouldInclude(
-                    $0,
+                    url,
                     rootPath: rootPath,
                     excludedFolders: exclusions
                 ) || externalFilePaths.contains(path)
@@ -41,9 +56,23 @@ final class LibraryWatcher: @unchecked Sendable {
             }
         }
 
+        queue.sync {
+            stopOnQueue()
+            startOnQueue(paths: watchedPaths, handler: handler)
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            stopOnQueue()
+        }
+    }
+
+    private func startOnQueue(paths: [String], handler: EventHandlerBox) {
+        handlerBox = handler
         var context = FSEventStreamContext(
             version: 0,
-            info: Unmanaged.passUnretained(self).toOpaque(),
+            info: Unmanaged.passUnretained(handler).toOpaque(),
             retain: nil,
             release: nil,
             copyDescription: nil
@@ -53,46 +82,51 @@ final class LibraryWatcher: @unchecked Sendable {
             kFSEventStreamCreateFlagUseCFTypes |
             kFSEventStreamCreateFlagNoDefer
         )
-        let paths = ([root.standardizedFileURL.path] + Array(externalParentPaths))
-            .sorted() as CFArray
         guard let stream = FSEventStreamCreate(
             kCFAllocatorDefault,
             Self.handleEvents,
             &context,
-            paths,
+            paths as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
             0.35,
             flags
-        ) else { return }
+        ) else {
+            handlerBox = nil
+            return
+        }
 
         self.stream = stream
         FSEventStreamSetDispatchQueue(stream, queue)
-        FSEventStreamStart(stream)
-    }
-
-    func stop() {
-        guard let stream else {
-            onChange = nil
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            self.stream = nil
+            handlerBox = nil
             return
         }
-        FSEventStreamStop(stream)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        self.stream = nil
-        onChange = nil
+    }
+
+    private func stopOnQueue() {
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            self.stream = nil
+        }
+        handlerBox = nil
     }
 
     private static let handleEvents: FSEventStreamCallback = {
         _, info, eventCount, eventPaths, _, _ in
         guard let info else { return }
-        let watcher = Unmanaged<LibraryWatcher>
+        let handler = Unmanaged<EventHandlerBox>
             .fromOpaque(info)
             .takeUnretainedValue()
         let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
         let urls = paths.prefix(eventCount).map {
             URL(filePath: $0).standardizedFileURL
         }
-        watcher.onChange?(urls)
+        handler.handle(urls)
     }
 
     static func shouldInclude(

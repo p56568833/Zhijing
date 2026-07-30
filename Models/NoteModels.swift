@@ -226,6 +226,42 @@ struct EditorTextSelection: Equatable, Sendable {
     var isEmpty: Bool { range.length == 0 || text.isEmpty }
 }
 
+struct TextAnnotation: Identifiable, Hashable, Codable, Sendable {
+    let id: UUID
+    let anchor: TextAnnotationAnchor
+    var text: String
+    let createdAt: Date
+    var modifiedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        anchor: TextAnnotationAnchor,
+        text: String,
+        createdAt: Date = .now,
+        modifiedAt: Date = .now
+    ) {
+        self.id = id
+        self.anchor = anchor
+        self.text = text
+        self.createdAt = createdAt
+        self.modifiedAt = modifiedAt
+    }
+}
+
+struct TextAnnotationAnchor: Hashable, Codable, Sendable {
+    let selectedText: String
+    let utf16Location: Int
+    let prefix: String
+    let suffix: String
+}
+
+struct ResolvedTextAnnotation: Identifiable, Equatable, Sendable {
+    let annotation: TextAnnotation
+    let range: NSRange
+
+    var id: UUID { annotation.id }
+}
+
 struct DocumentFindOptions: Equatable, Sendable {
     var query = ""
     var matchCase = false

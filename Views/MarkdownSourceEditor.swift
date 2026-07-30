@@ -1,11 +1,39 @@
 import AppKit
 import SwiftUI
 
-final class MarkdownEditorTextView: NSTextView {
+final class MarkdownEditorTextView: NSTextView, NSPopoverDelegate {
     var markdownLinks: [MarkdownEditorLink] = []
     var onAIEditAction: ((AISelectionEditAction) -> Void)?
+    var onCreateAnnotation: ((String, EditorTextSelection) -> Void)?
+    var onUpdateAnnotation: ((UUID, String) -> Void)?
+    var onDeleteAnnotation: ((UUID) -> Void)?
     var onFindCommand: ((DocumentFindCommand) -> Void)?
+    var annotationDocumentID: String?
     private var linkTrackingArea: NSTrackingArea?
+    private var selectionAnnotationButton: NSButton?
+    private var annotationButtons: [UUID: NSButton] = [:]
+    private var resolvedAnnotations: [ResolvedTextAnnotation] = []
+    private var highlightedAnnotationRanges: [NSRange] = []
+    private var activePopover: NSPopover?
+    private var handledAnnotationRequestID: UUID?
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            discardUndoHistory()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    func discardUndoHistory() {
+        breakUndoCoalescing()
+        undoManager?.removeAllActions()
+    }
+
+    override func layout() {
+        super.layout()
+        layoutSelectionAnnotationButton()
+        layoutAnnotationButtons()
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -161,6 +189,13 @@ final class MarkdownEditorTextView: NSTextView {
         let menu = super.menu(for: event) ?? NSMenu()
         guard selectedRange().length > 0 else { return menu }
         menu.addItem(.separator())
+        let annotationItem = NSMenuItem(
+            title: "添加批注…",
+            action: #selector(showAnnotationComposer(_:)),
+            keyEquivalent: ""
+        )
+        annotationItem.target = self
+        menu.addItem(annotationItem)
         let parent = NSMenuItem(
             title: "AI 修改所选内容",
             action: nil,
@@ -190,6 +225,245 @@ final class MarkdownEditorTextView: NSTextView {
               let action = AISelectionEditAction(rawValue: rawValue) else { return }
         onAIEditAction?(action)
     }
+
+    func updateSelectionAnnotationButton() {
+        let range = selectedRange()
+        guard range.length > 0,
+              NSMaxRange(range) <= (string as NSString).length else {
+            selectionAnnotationButton?.isHidden = true
+            return
+        }
+        let button = selectionAnnotationButton ?? makeSelectionAnnotationButton()
+        button.isHidden = false
+        layoutSelectionAnnotationButton()
+    }
+
+    func updateAnnotations(_ annotations: [ResolvedTextAnnotation]) {
+        guard resolvedAnnotations != annotations else { return }
+        resolvedAnnotations = annotations
+        let validIDs = Set(annotations.map(\.id))
+        for (id, button) in annotationButtons where !validIDs.contains(id) {
+            button.removeFromSuperview()
+            annotationButtons[id] = nil
+        }
+        for item in annotations where annotationButtons[item.id] == nil {
+            annotationButtons[item.id] = makeAnnotationButton(for: item)
+        }
+        for item in annotations {
+            annotationButtons[item.id]?.toolTip = item.annotation.text
+        }
+        applyAnnotationHighlights()
+        layoutAnnotationButtons()
+    }
+
+    func handleAnnotationComposerRequest(_ requestID: UUID?) {
+        guard let requestID,
+              requestID != handledAnnotationRequestID else { return }
+        handledAnnotationRequestID = requestID
+        presentAnnotationComposer()
+    }
+
+    func applyAnnotationHighlights() {
+        guard let layoutManager else { return }
+        for range in highlightedAnnotationRanges where range.length > 0 {
+            layoutManager.removeTemporaryAttribute(
+                .backgroundColor,
+                forCharacterRange: range
+            )
+        }
+        highlightedAnnotationRanges = resolvedAnnotations.map(\.range)
+        for range in highlightedAnnotationRanges where range.length > 0 {
+            layoutManager.addTemporaryAttribute(
+                .backgroundColor,
+                value: NSColor.systemYellow.withAlphaComponent(0.18),
+                forCharacterRange: range
+            )
+        }
+    }
+
+    @objc private func showAnnotationComposer(_ sender: Any?) {
+        presentAnnotationComposer()
+    }
+
+    private func presentAnnotationComposer() {
+        guard let selection = currentEditorSelection() else {
+            NSSound.beep()
+            return
+        }
+        updateSelectionAnnotationButton()
+        let anchorView = selectionAnnotationButton ?? self
+        let anchorRect = selectionAnnotationButton?.bounds
+            ?? rectForAnnotationPopover(range: selection.range)
+        showPopover(
+            rootView: TextAnnotationComposerView(
+                selectedText: selection.text,
+                onSave: { [weak self] text in
+                    self?.onCreateAnnotation?(text, selection)
+                    self?.closeActivePopover()
+                },
+                onCancel: { [weak self] in self?.closeActivePopover() }
+            ),
+            relativeTo: anchorRect,
+            of: anchorView
+        )
+    }
+
+    @objc private func showAnnotationDetail(_ sender: NSButton) {
+        guard let rawID = sender.identifier?.rawValue,
+              let id = UUID(uuidString: rawID),
+              let item = resolvedAnnotations.first(where: { $0.id == id }) else {
+            return
+        }
+        showPopover(
+            rootView: TextAnnotationDetailView(
+                annotation: item.annotation,
+                onSave: { [weak self] text in
+                    self?.onUpdateAnnotation?(id, text)
+                    self?.closeActivePopover()
+                },
+                onDelete: { [weak self] in
+                    self?.onDeleteAnnotation?(id)
+                    self?.closeActivePopover()
+                },
+                onCancel: { [weak self] in self?.closeActivePopover() }
+            ),
+            relativeTo: sender.bounds,
+            of: sender
+        )
+    }
+
+    private func showPopover<Content: View>(
+        rootView: Content,
+        relativeTo rect: NSRect,
+        of view: NSView
+    ) {
+        closeActivePopover()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(rootView: rootView)
+        activePopover = popover
+        popover.show(relativeTo: rect, of: view, preferredEdge: .maxY)
+    }
+
+    private func closeActivePopover() {
+        activePopover?.close()
+        activePopover = nil
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        activePopover = nil
+    }
+
+    private func currentEditorSelection() -> EditorTextSelection? {
+        guard let annotationDocumentID else { return nil }
+        let range = selectedRange()
+        let source = string as NSString
+        guard range.length > 0, NSMaxRange(range) <= source.length else {
+            return nil
+        }
+        return EditorTextSelection(
+            documentID: annotationDocumentID,
+            range: range,
+            text: source.substring(with: range)
+        )
+    }
+
+    private func makeSelectionAnnotationButton() -> NSButton {
+        let button = NSButton(
+            title: "批注",
+            target: self,
+            action: #selector(showAnnotationComposer(_:))
+        )
+        button.image = NSImage(
+            systemSymbolName: "text.bubble",
+            accessibilityDescription: "添加批注"
+        )
+        button.imagePosition = .imageLeading
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.toolTip = "添加批注（⇧⌘M）"
+        button.frame.size = NSSize(width: 72, height: 26)
+        addSubview(button)
+        selectionAnnotationButton = button
+        return button
+    }
+
+    private func makeAnnotationButton(
+        for item: ResolvedTextAnnotation
+    ) -> NSButton {
+        let button = NSButton(
+            image: NSImage(
+                systemSymbolName: "text.bubble.fill",
+                accessibilityDescription: "查看批注"
+            ) ?? NSImage(),
+            target: self,
+            action: #selector(showAnnotationDetail(_:))
+        )
+        button.identifier = NSUserInterfaceItemIdentifier(item.id.uuidString)
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.contentTintColor = .systemYellow
+        button.toolTip = item.annotation.text
+        button.frame.size = NSSize(width: 26, height: 26)
+        addSubview(button)
+        return button
+    }
+
+    private func layoutSelectionAnnotationButton() {
+        guard let button = selectionAnnotationButton,
+              !button.isHidden,
+              let rect = cursorRectsForSelection().last else { return }
+        let visible = visibleRect
+        let x = min(
+            max(visible.minX + 8, rect.maxX + 7),
+            visible.maxX - button.frame.width - 36
+        )
+        var y = rect.minY - button.frame.height - 5
+        if y < visible.minY + 4 {
+            y = rect.maxY + 5
+        }
+        button.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func layoutAnnotationButtons() {
+        guard let layoutManager, let textContainer else { return }
+        let x = max(8, bounds.width - 32)
+        var nextAvailableY = -CGFloat.greatestFiniteMagnitude
+        for item in resolvedAnnotations.sorted(by: {
+            $0.range.location < $1.range.location
+        }) {
+            guard let button = annotationButtons[item.id],
+                  let rect = cursorRects(
+                      for: item.range,
+                      layoutManager: layoutManager,
+                      textContainer: textContainer
+                  ).first else { continue }
+            let y = max(rect.minY - 3, nextAvailableY)
+            button.setFrameOrigin(NSPoint(x: x, y: y))
+            nextAvailableY = y + button.frame.height + 2
+        }
+    }
+
+    private func cursorRectsForSelection() -> [NSRect] {
+        guard let layoutManager, let textContainer else { return [] }
+        return cursorRects(
+            for: selectedRange(),
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+    }
+
+    private func rectForAnnotationPopover(range: NSRange) -> NSRect {
+        guard let layoutManager, let textContainer else { return visibleRect }
+        return cursorRects(
+            for: range,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        ).last ?? visibleRect
+    }
 }
 
 struct MarkdownSourceEditor: NSViewRepresentable {
@@ -199,11 +473,16 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     let navigationRequest: EditorNavigationRequest?
     let findOptions: DocumentFindOptions
     let findNavigationRequest: DocumentFindNavigationRequest?
+    let annotations: [ResolvedTextAnnotation]
+    let annotationComposerRequestID: UUID?
     let onChange: (String) -> Void
     let onSelectionChange: (EditorTextSelection?) -> Void
     let onFindResultChange: (DocumentFindResult) -> Void
     let onFindCommand: (DocumentFindCommand) -> Void
     let onAIEditAction: (AISelectionEditAction) -> Void
+    let onCreateAnnotation: (String, EditorTextSelection) -> Void
+    let onUpdateAnnotation: (UUID, String) -> Void
+    let onDeleteAnnotation: (UUID) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -218,8 +497,13 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         let textView = makeTextView(in: scrollView)
         textView.delegate = context.coordinator
         textView.onAIEditAction = onAIEditAction
+        textView.onCreateAnnotation = onCreateAnnotation
+        textView.onUpdateAnnotation = onUpdateAnnotation
+        textView.onDeleteAnnotation = onDeleteAnnotation
+        textView.annotationDocumentID = documentID
         textView.onFindCommand = onFindCommand
         scrollView.documentView = textView
+        context.coordinator.observeScrolling(in: scrollView, textView: textView)
 
         let ruler = MarkdownLineNumberRulerView(textView: textView)
         scrollView.verticalRulerView = ruler
@@ -241,6 +525,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             navigationRequest: findNavigationRequest,
             in: textView
         )
+        textView.updateAnnotations(annotations)
+        textView.handleAnnotationComposerRequest(annotationComposerRequestID)
         return scrollView
     }
 
@@ -252,6 +538,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             return
         }
         textView.onAIEditAction = onAIEditAction
+        textView.onCreateAnnotation = onCreateAnnotation
+        textView.onUpdateAnnotation = onUpdateAnnotation
+        textView.onDeleteAnnotation = onDeleteAnnotation
+        textView.annotationDocumentID = documentID
         textView.onFindCommand = onFindCommand
         context.coordinator.synchronize(
             text: text,
@@ -268,6 +558,27 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             navigationRequest: findNavigationRequest,
             in: textView
         )
+        textView.updateAnnotations(annotations)
+        textView.handleAnnotationComposerRequest(annotationComposerRequestID)
+    }
+
+    static func dismantleNSView(
+        _ scrollView: NSScrollView,
+        coordinator: Coordinator
+    ) {
+        coordinator.prepareForDismantling()
+        guard let textView = scrollView.documentView as? MarkdownEditorTextView else {
+            return
+        }
+        textView.discardUndoHistory()
+        textView.allowsUndo = false
+        textView.delegate = nil
+        textView.onAIEditAction = nil
+        textView.onCreateAnnotation = nil
+        textView.onUpdateAnnotation = nil
+        textView.onDeleteAnnotation = nil
+        textView.onFindCommand = nil
+        scrollView.documentView = nil
     }
 
     private func makeScrollView() -> NSScrollView {
@@ -328,7 +639,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private var navigationRequestID: UUID?
         private var findNavigationRequestID: UUID?
         private var isApplyingExternalContent = false
-        private var presentationWork: DispatchWorkItem?
+        private var presentationTask: Task<Void, Never>?
+        private var presentationGeneration = 0
+        private var scrollObserver: NSObjectProtocol?
         private var tabStates: [String: TabEditorState] = [:]
         private var findOptions = DocumentFindOptions()
         private var findMatches: [NSRange] = []
@@ -351,6 +664,38 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             self.onFindResultChange = onFindResultChange
         }
 
+        func prepareForDismantling() {
+            presentationTask?.cancel()
+            presentationTask = nil
+            if let scrollObserver {
+                NotificationCenter.default.removeObserver(scrollObserver)
+                self.scrollObserver = nil
+            }
+        }
+
+        func observeScrolling(
+            in scrollView: NSScrollView,
+            textView: MarkdownEditorTextView
+        ) {
+            if let scrollObserver {
+                NotificationCenter.default.removeObserver(scrollObserver)
+            }
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            scrollObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView,
+                queue: .main
+            ) { [weak self, weak textView] _ in
+                Task { @MainActor [weak self, weak textView] in
+                    guard let self, let textView else { return }
+                    self.schedulePresentationUpdate(
+                        for: textView,
+                        delay: .milliseconds(80)
+                    )
+                }
+            }
+        }
+
         func textDidChange(_ notification: Notification) {
             guard !isApplyingExternalContent,
                   let textView = notification.object as? MarkdownEditorTextView else {
@@ -363,6 +708,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 in: textView
             )
             onChange(textView.string)
+            textView.updateSelectionAnnotationButton()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -373,6 +719,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             guard range.length > 0,
                   NSMaxRange(range) <= (textView.string as NSString).length else {
                 onSelectionChange(nil)
+                textView.updateSelectionAnnotationButton()
                 return
             }
             onSelectionChange(EditorTextSelection(
@@ -380,6 +727,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 range: range,
                 text: (textView.string as NSString).substring(with: range)
             ))
+            textView.updateSelectionAnnotationButton()
         }
 
         func synchronize(
@@ -430,6 +778,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
             documentID = newDocumentID
             contentRevision = newContentRevision
+            schedulePresentationUpdate(for: textView, delay: .zero)
+            textView.updateSelectionAnnotationButton()
             textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
         }
 
@@ -546,9 +896,17 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                     range: NSRange(location: 0, length: textStorage.length)
                 )
             }
-            let links = MarkdownLinkDetector.links(in: textView.string)
-            updateLinks(links, in: textView)
-            MarkdownPresentationHighlighter.apply(to: textView, links: links)
+            updateLinks([], in: textView)
+            let initialRange = visibleCharacterRange(in: textView) ?? NSRange(
+                location: 0,
+                length: min(textView.string.utf16.count, 20_000)
+            )
+            MarkdownPresentationHighlighter.apply(
+                to: textView,
+                links: [],
+                characterRange: initialRange,
+                startsInsideFence: false
+            )
             updateFind(
                 options: findOptions,
                 navigationRequest: nil,
@@ -567,27 +925,53 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         }
 
         private func schedulePresentationUpdate(
-            for textView: MarkdownEditorTextView
+            for textView: MarkdownEditorTextView,
+            delay: Duration = .milliseconds(180)
         ) {
-            presentationWork?.cancel()
-            let work = DispatchWorkItem { [weak textView] in
-                guard let textView,
+            presentationTask?.cancel()
+            presentationGeneration &+= 1
+            let generation = presentationGeneration
+            presentationTask = Task { @MainActor [weak textView] in
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled,
+                      let textView,
                       !textView.hasMarkedText() else { return }
-                let links = MarkdownLinkDetector.links(in: textView.string)
+                let source = textView.string
+                guard let visibleRange = self.visibleCharacterRange(in: textView) else {
+                    return
+                }
+                let result = await Task.detached(priority: .userInitiated) {
+                    let nsSource = source as NSString
+                    let safeRange = NSIntersectionRange(
+                        visibleRange,
+                        NSRange(location: 0, length: nsSource.length)
+                    )
+                    let stylingRange = nsSource.lineRange(for: safeRange)
+                    return (
+                        MarkdownLinkDetector.links(
+                            in: source,
+                            characterRange: stylingRange
+                        ),
+                        MarkdownFenceStateResolver.isInsideFence(
+                            before: stylingRange.location,
+                            in: source
+                        )
+                    )
+                }.value
+                guard !Task.isCancelled,
+                      generation == self.presentationGeneration else { return }
+                let (links, startsInsideFence) = result
                 self.updateLinks(links, in: textView)
                 MarkdownPresentationHighlighter.apply(
                     to: textView,
                     links: links,
-                    characterRange: self.visibleCharacterRange(in: textView)
+                    characterRange: visibleRange,
+                    startsInsideFence: startsInsideFence
                 )
                 self.applyFindHighlights(in: textView)
+                textView.applyAnnotationHighlights()
                 textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
             }
-            presentationWork = work
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 0.18,
-                execute: work
-            )
         }
 
         private func preserveViewportAndSelection(
@@ -632,8 +1016,22 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             navigationRequest: DocumentFindNavigationRequest?,
             in textView: MarkdownEditorTextView
         ) {
-            let source = textView.string
             let optionsChanged = newOptions != findOptions
+            if newOptions.trimmedQuery.isEmpty {
+                let needsReset = optionsChanged || !findMatches.isEmpty ||
+                    !highlightedFindRanges.isEmpty
+                findOptions = newOptions
+                lastFindSource = nil
+                guard needsReset else { return }
+                findMatches = []
+                selectedFindIndex = nil
+                applyFindHighlights(in: textView)
+                textView.applyAnnotationHighlights()
+                reportFindResult()
+                return
+            }
+
+            let source = textView.string
             let sourceChanged = source != lastFindSource
 
             if optionsChanged || sourceChanged {
@@ -665,6 +1063,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             }
 
             applyFindHighlights(in: textView)
+            textView.applyAnnotationHighlights()
             reportFindResult()
         }
 

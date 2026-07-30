@@ -4,6 +4,87 @@ import AppKit
 import PDFKit
 @testable import Zhijing
 
+@MainActor
+@Test func appStoreAutosaveDoesNotOverlapItsInternalWriteTrackingAccess() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let url = root.appending(path: "自动保存.md")
+    try "初始内容".write(to: url, atomically: true, encoding: .utf8)
+    let suiteName = "ZhijingTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let store = AppStore(defaults: defaults)
+    let document = NoteDocument(
+        url: url,
+        relativePath: url.path,
+        modifiedAt: .now,
+        size: 0
+    )
+    store.select(document)
+
+    for index in 0..<100 {
+        store.editorDidChange("连续输入 \(index)")
+    }
+    for _ in 0..<100 {
+        if case .saved = store.saveState,
+           try String(contentsOf: url, encoding: .utf8) == "连续输入 99" {
+            break
+        }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    #expect(try String(contentsOf: url, encoding: .utf8) == "连续输入 99")
+    guard case .saved = store.saveState else {
+        Issue.record("自动保存未完成")
+        return
+    }
+}
+
+@Test func textAnnotationsFollowTheirQuotedTextAfterNearbyEdits() throws {
+    let original = "开头\n需要批注的结论\n结尾"
+    let range = (original as NSString).range(of: "需要批注的结论")
+    let selection = EditorTextSelection(
+        documentID: "/tmp/note.md",
+        range: range,
+        text: "需要批注的结论"
+    )
+    let anchor = try #require(
+        TextAnnotationAnchorResolver.makeAnchor(selection: selection, in: original)
+    )
+    let annotation = TextAnnotation(anchor: anchor, text: "请让 AI 核实")
+    let edited = "新增的前言\n\(original)"
+
+    let resolved = try #require(
+        TextAnnotationAnchorResolver.resolve(annotation, in: edited)
+    )
+    #expect((edited as NSString).substring(with: resolved.range) == "需要批注的结论")
+    #expect(resolved.range.location > range.location)
+}
+
+@Test func textAnnotationsPersistOutsideTheMarkdownDocument() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let persistence = AnnotationPersistenceService(directoryOverride: root)
+    let annotation = TextAnnotation(
+        anchor: TextAnnotationAnchor(
+            selectedText: "原文",
+            utf16Location: 3,
+            prefix: "前文",
+            suffix: "后文"
+        ),
+        text: "这是给 AI 的批注"
+    )
+    let value = ["/tmp/note.md": [annotation]]
+
+    try persistence.saveSynchronously(value)
+
+    #expect(persistence.load() == value)
+}
+
 @Test func lineDiffFindsInsertionsAndRemovals() {
     let diff = LineDiff(
         original: "第一行\n旧内容\n最后一行",
@@ -538,6 +619,19 @@ import PDFKit
     ))
 }
 
+@Test func libraryWatcherSerializesRepeatedStartAndStop() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let watcher = LibraryWatcher()
+
+    for _ in 0..<100 {
+        watcher.start(root: root, excludedFolders: []) { _ in }
+        watcher.stop()
+    }
+}
+
 @Test func chatsPersistOutsideUserDefaultsAndKeepLatestSnapshot() throws {
     let root = URL(filePath: NSTemporaryDirectory())
         .appending(path: "ZhijingChats-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -807,6 +901,31 @@ import PDFKit
 }
 
 @MainActor
+@Test func editorRemovalClearsUndoActionsTargetingTheOldTextView() {
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+        styleMask: [.titled],
+        backing: .buffered,
+        defer: false
+    )
+    let textView = MarkdownEditorTextView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView = textView
+    window.makeFirstResponder(textView)
+    textView.allowsUndo = true
+
+    guard let undoManager = textView.undoManager else {
+        Issue.record("编辑器未创建撤销管理器")
+        return
+    }
+    undoManager.registerUndo(withTarget: textView) { _ in }
+    #expect(undoManager.canUndo)
+
+    textView.discardUndoHistory()
+
+    #expect(!undoManager.canUndo)
+}
+
+@MainActor
 @Test func editorNavigationSelectsTheRequestedSourceLine() {
     let textView = MarkdownEditorTextView()
     let coordinator = MarkdownSourceEditor.Coordinator(onChange: { _ in })
@@ -924,6 +1043,33 @@ import PDFKit
     #expect(textView.textStorage?.attribute(.link, at: 1, effectiveRange: nil) == nil)
 }
 
+@Test func markdownLinkDetectionOnlyScansTheRequestedViewport() {
+    let source = """
+    [第一个](https://first.example)
+    中间正文
+    [可见链接](https://visible.example)
+    """
+    let visibleRange = (source as NSString).range(of: "[可见链接]")
+    let links = MarkdownLinkDetector.links(
+        in: source,
+        characterRange: (source as NSString).lineRange(for: visibleRange)
+    )
+
+    #expect(links.count == 1)
+    #expect(links.first?.url.absoluteString == "https://visible.example")
+    #expect(links.first?.range.location == visibleRange.location)
+}
+
+@Test func markdownFenceStateCanBeResolvedOffTheMainThread() async {
+    let source = "前文\n```swift\n" + String(repeating: "let value = 1\n", count: 5_000)
+    let location = source.utf16.count
+    let isInside = await Task.detached {
+        MarkdownFenceStateResolver.isInsideFence(before: location, in: source)
+    }.value
+
+    #expect(isInside)
+}
+
 @MainActor
 @Test func presentationHighlightingUsesOnlyNonMetricTemporaryAttributes() {
     let source = """
@@ -1002,6 +1148,41 @@ import PDFKit
         )) == link)
     }
     #expect(textView.markdownLink(at: NSPoint(x: 1, y: 1)) == nil)
+}
+
+@MainActor
+@Test func lineNumbersFollowActualFragmentsWithoutNumberingWrappedRows() {
+    let source = "第一行很长，需要在狭窄编辑器里自动换成好几排文字来验证位置\n\n第三行"
+    let scrollView = NSScrollView(
+        frame: NSRect(x: 0, y: 0, width: 190, height: 240)
+    )
+    let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+    textView.textContainerInset = NSSize(width: 22, height: 24)
+    textView.isVerticallyResizable = true
+    textView.isHorizontallyResizable = false
+    textView.autoresizingMask = [.width]
+    textView.textContainer?.containerSize = NSSize(
+        width: scrollView.contentSize.width,
+        height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.textContainer?.widthTracksTextView = true
+    textView.string = source
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    scrollView.documentView = textView
+
+    guard let layoutManager = textView.layoutManager,
+          let textContainer = textView.textContainer else {
+        Issue.record("无法建立行号布局测试")
+        return
+    }
+    layoutManager.ensureLayout(for: textContainer)
+    let ruler = MarkdownLineNumberRulerView(textView: textView)
+    let markers = ruler.lineNumberMarkers(in: textView.bounds)
+
+    #expect(markers.map(\.lineNumber) == [1, 2, 3])
+    #expect(markers[1].rectInTextView.minY > markers[0].rectInTextView.minY)
+    #expect(markers[2].rectInTextView.minY > markers[1].rectInTextView.minY)
+    #expect(markers[0].rectInTextView.minY == textView.textContainerOrigin.y)
 }
 
 @Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {
@@ -1166,6 +1347,16 @@ import PDFKit
             editorText: "本地修改",
             diskText: "外部修改"
         ) == .conflict("外部修改")
+    )
+    #expect(
+        ExternalFileReconciler.evaluate(
+            loadedText: "更早的基线",
+            editorText: "当前编辑内容",
+            diskText: "刚刚由应用写入的旧内容",
+            knownLocalWriteSignatures: [
+                DocumentContentSignature("刚刚由应用写入的旧内容")
+            ]
+        ) == .localWriteObserved("刚刚由应用写入的旧内容")
     )
     #expect(
         ExternalFileReconciler.evaluate(

@@ -205,6 +205,7 @@ struct AIService: Sendable {
     func proposeEdit(
         instruction: String,
         currentText: String,
+        annotationContext: String,
         configuration: AIConfiguration
     ) async throws -> String {
         guard !configuration.apiKey.isEmpty else {
@@ -229,6 +230,9 @@ struct AIService: Sendable {
         5. 保持 Markdown 结构，不要使用行号或省略号代替原文。
 
         修改要求：\(instruction)
+
+        用户批注：
+        \(annotationContext.isEmpty ? "无。" : annotationContext)
 
         原文：
         \(currentText)
@@ -258,6 +262,7 @@ struct AIService: Sendable {
         currentText: String,
         selectedText: String,
         surroundingContext: String,
+        annotationContext: String,
         sources: [RetrievedChunk],
         configuration: AIConfiguration
     ) async throws -> AIEditPatchApplication {
@@ -292,6 +297,10 @@ struct AIService: Sendable {
         <surrounding_context>
         \(surroundingContext)
         </surrounding_context>
+
+        <user_annotations>
+        \(annotationContext.isEmpty ? "无。" : annotationContext)
+        </user_annotations>
 
         <knowledge_sources>
         \(sourceText.isEmpty ? "无相关资料。" : sourceText)
