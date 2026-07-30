@@ -135,11 +135,26 @@ final class AppStore {
         get { externalConflictController.conflict }
         set { externalConflictController.conflict = newValue }
     }
-    private(set) var openDocumentPaths: [String] = []
-    private(set) var externalDocuments: [NoteDocument] = []
-    var isComparisonVisible = false
-    private(set) var comparisonDocumentPath: String?
-    private(set) var comparisonText = ""
+    private(set) var openDocumentPaths: [String] {
+        get { workspaceNavigation.openDocumentPaths }
+        set { workspaceNavigation.openDocumentPaths = newValue }
+    }
+    private(set) var externalDocuments: [NoteDocument] {
+        get { workspaceNavigation.externalDocuments }
+        set { workspaceNavigation.externalDocuments = newValue }
+    }
+    var isComparisonVisible: Bool {
+        get { workspaceNavigation.isComparisonVisible }
+        set { workspaceNavigation.isComparisonVisible = newValue }
+    }
+    private(set) var comparisonDocumentPath: String? {
+        get { workspaceNavigation.comparisonDocumentPath }
+        set { workspaceNavigation.comparisonDocumentPath = newValue }
+    }
+    private(set) var comparisonText: String {
+        get { workspaceNavigation.comparisonText }
+        set { workspaceNavigation.comparisonText = newValue }
+    }
 
     var model: String {
         get { aiSettings.model }
@@ -170,6 +185,7 @@ final class AppStore {
     private let aiGenerationController: AIGenerationController
     private let editProposalController: EditProposalController
     private let workspaceCatalog: WorkspaceCatalogController
+    private let workspaceNavigation: WorkspaceNavigationController
     private let externalChangeMonitor: ExternalChangeMonitor
     private let externalConflictController: ExternalConflictController
     private let documentExporter = DocumentExportService()
@@ -221,12 +237,7 @@ final class AppStore {
     }
 
     var openDocuments: [NoteDocument] {
-        let libraryDocuments = openDocumentPaths.compactMap { path in
-            workspaceCatalog.document(at: path)
-        }
-        return libraryDocuments + externalDocuments.filter { external in
-            !libraryDocuments.contains(where: { $0.id == external.id })
-        }
+        workspaceNavigation.openDocuments(in: documents)
     }
 
     var selectedDocumentLocationLabel: String? {
@@ -258,6 +269,7 @@ final class AppStore {
         self.knowledgeBase = knowledgeBase
         self.documentSession = documentSession
         editorState = EditorSessionState()
+        workspaceNavigation = WorkspaceNavigationController(defaults: defaults)
         annotationController = AnnotationController(
             knowledgeBase: knowledgeBase
         )
@@ -314,11 +326,6 @@ final class AppStore {
             forKey: Keys.annotationRailVisible
         ) as? Bool ?? true
         colorScheme = AppColorScheme(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
-        openDocumentPaths = defaults.stringArray(forKey: Keys.openDocumentPaths) ?? []
-        externalDocuments = (defaults.stringArray(forKey: Keys.externalDocumentPaths) ?? [])
-            .compactMap { Self.makeExternalDocument(at: URL(filePath: $0)) }
-        isComparisonVisible = defaults.object(forKey: Keys.comparisonVisible) as? Bool ?? false
-        comparisonDocumentPath = defaults.string(forKey: Keys.comparisonDocumentPath)
         if let path = defaults.string(forKey: Keys.libraryPath) {
             let url = URL(filePath: path, directoryHint: .isDirectory)
             if FileManager.default.fileExists(atPath: url.path) {
@@ -381,7 +388,7 @@ final class AppStore {
         }
 
         let externalDocuments = request.externalURLs.compactMap {
-            Self.makeExternalDocument(at: $0)
+            WorkspaceNavigationController.makeExternalDocument(at: $0)
         }
         for document in externalDocuments {
             addOpenDocument(document)
@@ -1145,14 +1152,14 @@ final class AppStore {
         } else {
             clearDocumentSelection()
             isComparisonVisible = false
-            defaults.set(false, forKey: Keys.comparisonVisible)
+            workspaceNavigation.persistComparisonVisibility()
         }
     }
 
     func toggleComparison() {
         if isComparisonVisible {
             isComparisonVisible = false
-            defaults.set(false, forKey: Keys.comparisonVisible)
+            workspaceNavigation.persistComparisonVisibility()
             return
         }
         guard !comparisonCandidates.isEmpty else {
@@ -1168,7 +1175,7 @@ final class AppStore {
             reloadComparisonDocument()
         }
         isComparisonVisible = true
-        defaults.set(true, forKey: Keys.comparisonVisible)
+        workspaceNavigation.persistComparisonVisibility()
     }
 
     func setComparisonDocument(_ relativePath: String?) {
@@ -1177,11 +1184,11 @@ final class AppStore {
               documents.contains(where: { $0.relativePath == relativePath }) else {
             comparisonDocumentPath = nil
             comparisonText = ""
-            defaults.removeObject(forKey: Keys.comparisonDocumentPath)
+            workspaceNavigation.persistComparisonDocument()
             return
         }
         comparisonDocumentPath = relativePath
-        defaults.set(relativePath, forKey: Keys.comparisonDocumentPath)
+        workspaceNavigation.persistComparisonDocument()
         reloadComparisonDocument()
     }
 
@@ -1344,22 +1351,6 @@ final class AppStore {
         }
     }
 
-    private static func makeExternalDocument(at url: URL) -> NoteDocument? {
-        let url = url.standardizedFileURL
-        guard NoteDocument.isSupportedFile(url),
-              FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let values = try? url.resourceValues(forKeys: [
-            .contentModificationDateKey,
-            .fileSizeKey,
-        ])
-        return NoteDocument(
-            url: url,
-            relativePath: url.path,
-            modifiedAt: values?.contentModificationDate ?? .distantPast,
-            size: values?.fileSize ?? 0
-        )
-    }
-
     private func updateDocumentMetadata(_ refreshed: NoteDocument) {
         if isLibraryDocument(refreshed) {
             workspaceCatalog.updateDocumentMetadata(
@@ -1401,7 +1392,9 @@ final class AppStore {
         if isLibraryDocument(document) {
             Task { await refreshLibrary(selecting: document.relativePath) }
         } else {
-            if let refreshed = Self.makeExternalDocument(at: document.url),
+            if let refreshed = WorkspaceNavigationController.makeExternalDocument(
+                at: document.url
+            ),
                let index = externalDocuments.firstIndex(where: {
                    $0.id == document.id
                }) {
@@ -1552,7 +1545,9 @@ final class AppStore {
 
         if isLibraryDocument(document) {
             await refreshLibrary(selecting: document.relativePath)
-        } else if let refreshed = Self.makeExternalDocument(at: document.url),
+        } else if let refreshed = WorkspaceNavigationController.makeExternalDocument(
+            at: document.url
+        ),
                   let index = externalDocuments.firstIndex(where: {
                       $0.id == document.id
                   }) {
@@ -1625,7 +1620,7 @@ final class AppStore {
         }
         if comparisonDocumentPath == oldPath {
             comparisonDocumentPath = newRelativePath
-            defaults.set(newRelativePath, forKey: Keys.comparisonDocumentPath)
+            workspaceNavigation.persistComparisonDocument()
         }
         if updateSelection {
             defaults.set(newRelativePath, forKey: Keys.selectedPath)
@@ -1681,24 +1676,15 @@ final class AppStore {
     }
 
     private func persistOpenDocuments() {
-        defaults.set(openDocumentPaths, forKey: Keys.openDocumentPaths)
+        workspaceNavigation.persistOpenDocuments()
     }
 
     private func persistExternalDocuments() {
-        defaults.set(
-            externalDocuments.map { $0.url.standardizedFileURL.path },
-            forKey: Keys.externalDocumentPaths
-        )
+        workspaceNavigation.persistExternalDocuments()
     }
 
     private func resetWorkspaceNavigation() {
-        openDocumentPaths = []
-        comparisonDocumentPath = nil
-        comparisonText = ""
-        isComparisonVisible = false
-        defaults.removeObject(forKey: Keys.openDocumentPaths)
-        defaults.removeObject(forKey: Keys.comparisonDocumentPath)
-        defaults.set(false, forKey: Keys.comparisonVisible)
+        workspaceNavigation.resetForLibraryTransition()
     }
 
     private func transitionToLibrary(_ url: URL) {
@@ -1725,7 +1711,7 @@ final class AppStore {
         } else {
             setComparisonDocument(nil)
             isComparisonVisible = false
-            defaults.set(false, forKey: Keys.comparisonVisible)
+            workspaceNavigation.persistComparisonVisibility()
         }
     }
 
@@ -1734,7 +1720,7 @@ final class AppStore {
             comparisonText = ""
             if comparisonDocumentPath != nil {
                 comparisonDocumentPath = nil
-                defaults.removeObject(forKey: Keys.comparisonDocumentPath)
+                workspaceNavigation.persistComparisonDocument()
             }
             return
         }
@@ -1807,9 +1793,5 @@ final class AppStore {
         static let sidebarVisible = "sidebarVisible"
         static let annotationRailVisible = "annotationRailVisible"
         static let colorScheme = "colorScheme"
-        static let openDocumentPaths = "openDocumentPaths"
-        static let externalDocumentPaths = "externalDocumentPaths"
-        static let comparisonVisible = "comparisonVisible"
-        static let comparisonDocumentPath = "comparisonDocumentPath"
     }
 }

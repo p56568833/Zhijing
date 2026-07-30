@@ -14,6 +14,41 @@ private final class InertLibraryWatcher: LibraryWatching {
 }
 
 @MainActor
+@Test func workspaceNavigationOwnsTabsAndComparisonPersistence() throws {
+    let suite = "WorkspaceNavigationTests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(["one.md"], forKey: "openDocumentPaths")
+    defaults.set(true, forKey: "comparisonVisible")
+    defaults.set("two.md", forKey: "comparisonDocumentPath")
+    let controller = WorkspaceNavigationController(defaults: defaults)
+    let documents = [
+        NoteDocument(
+            url: URL(filePath: "/tmp/one.md"),
+            relativePath: "one.md",
+            modifiedAt: .now,
+            size: 0
+        ),
+        NoteDocument(
+            url: URL(filePath: "/tmp/two.md"),
+            relativePath: "two.md",
+            modifiedAt: .now,
+            size: 0
+        ),
+    ]
+
+    #expect(controller.openDocuments(in: documents) == [documents[0]])
+    #expect(controller.isComparisonVisible)
+    #expect(controller.comparisonDocumentPath == "two.md")
+
+    controller.resetForLibraryTransition()
+    #expect(controller.openDocumentPaths.isEmpty)
+    #expect(controller.comparisonDocumentPath == nil)
+    #expect(defaults.stringArray(forKey: "openDocumentPaths") == nil)
+    #expect(defaults.bool(forKey: "comparisonVisible") == false)
+}
+
+@MainActor
 @Test func annotationControllerOwnsMutationAndReanchoring() throws {
     let document = NoteDocument(
         url: URL(filePath: "/tmp/annotation-controller.md"),
