@@ -328,15 +328,6 @@ struct MarkdownReadingBlock: Identifiable {
     let content: String
 }
 
-enum MarkdownInlineRenderer {
-    static func render(_ source: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: source,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(source)
-    }
-}
-
 enum MarkdownReadingParser {
     static func parse(_ source: String) -> [MarkdownReadingBlock] {
         let lines = source.components(separatedBy: .newlines)

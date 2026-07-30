@@ -226,26 +226,46 @@ struct EditorTextSelection: Equatable, Sendable {
     var isEmpty: Bool { range.length == 0 || text.isEmpty }
 }
 
+struct AnnotationComposerRequest: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let selection: EditorTextSelection
+
+    init(id: UUID = UUID(), selection: EditorTextSelection) {
+        self.id = id
+        self.selection = selection
+    }
+}
+
+struct EditorTextMutation: Equatable, Sendable {
+    let range: NSRange
+    let replacementText: String
+}
+
 struct TextAnnotation: Identifiable, Hashable, Codable, Sendable {
     let id: UUID
-    let anchor: TextAnnotationAnchor
+    var anchor: TextAnnotationAnchor
     var text: String
     let createdAt: Date
     var modifiedAt: Date
+    var resolvedAt: Date?
 
     init(
         id: UUID = UUID(),
         anchor: TextAnnotationAnchor,
         text: String,
         createdAt: Date = .now,
-        modifiedAt: Date = .now
+        modifiedAt: Date = .now,
+        resolvedAt: Date? = nil
     ) {
         self.id = id
         self.anchor = anchor
         self.text = text
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
+        self.resolvedAt = resolvedAt
     }
+
+    var isResolved: Bool { resolvedAt != nil }
 }
 
 struct TextAnnotationAnchor: Hashable, Codable, Sendable {
@@ -260,6 +280,14 @@ struct ResolvedTextAnnotation: Identifiable, Equatable, Sendable {
     let range: NSRange
 
     var id: UUID { annotation.id }
+}
+
+struct TextAnnotationDisplayItem: Identifiable, Equatable, Sendable {
+    let annotation: TextAnnotation
+    let range: NSRange?
+
+    var id: UUID { annotation.id }
+    var isOrphaned: Bool { range == nil }
 }
 
 struct DocumentFindOptions: Equatable, Sendable {

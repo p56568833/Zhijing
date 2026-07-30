@@ -13,15 +13,20 @@ final class ChatPersistenceService: @unchecked Sendable {
     }
 
     func load(legacyData: Data? = nil) -> [String: [ChatMessage]] {
+        (try? loadStrict(legacyData: legacyData)) ?? [:]
+    }
+
+    func loadStrict(
+        legacyData: Data? = nil
+    ) throws -> [String: [ChatMessage]] {
         let decoder = JSONDecoder()
-        if let data = try? Data(contentsOf: storageURL()),
-           let value = try? decoder.decode([String: [ChatMessage]].self, from: data) {
-            return value
+        let url = try storageURL()
+        if FileManager.default.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            return try decoder.decode([String: [ChatMessage]].self, from: data)
         }
-        guard let legacyData,
-              let value = try? decoder.decode([String: [ChatMessage]].self, from: legacyData)
-        else { return [:] }
-        return value
+        guard let legacyData else { return [:] }
+        return try decoder.decode([String: [ChatMessage]].self, from: legacyData)
     }
 
     func save(_ chats: [String: [ChatMessage]]) {
@@ -74,11 +79,27 @@ final class ChatPersistenceService: @unchecked Sendable {
 
     private func write(_ chats: [String: [ChatMessage]]) throws {
         let url = try storageURL()
+        let existingData: Data?
+        if FileManager.default.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            _ = try JSONDecoder().decode(
+                [String: [ChatMessage]].self,
+                from: data
+            )
+            existingData = data
+        } else {
+            existingData = nil
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(chats)
+        guard data != existingData else { return }
+
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let data = try JSONEncoder().encode(chats)
         try data.write(to: url, options: .atomic)
     }
 

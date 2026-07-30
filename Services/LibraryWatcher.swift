@@ -137,6 +137,9 @@ final class LibraryWatcher {
         let path = url.standardizedFileURL.path
         guard path == rootPath || path.hasPrefix(rootPath + "/") else { return false }
         guard path != rootPath else { return true }
+        guard !AnnotationPersistenceService.isPersistenceFile(url) else {
+            return false
+        }
         let relative = path.dropFirst(rootPath.count + 1)
         let components = relative.split(separator: "/").map(String.init)
         return components.allSatisfy { !excludedFolders.contains($0) }

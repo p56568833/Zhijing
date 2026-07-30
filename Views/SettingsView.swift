@@ -73,7 +73,7 @@ struct SettingsView: View {
                             Label("连接成功，设置已保存", systemImage: "checkmark.circle.fill")
                                 .foregroundStyle(.green)
                         } else {
-                            Text("密钥只保存在这台 Mac 的钥匙串中")
+                            Text("密钥保存在这台 Mac 的用户专属配置中，不访问钥匙串")
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()

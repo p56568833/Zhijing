@@ -56,6 +56,9 @@ struct KnowledgeBaseService: Sendable {
                 folders.append(relative)
                 continue
             }
+            if AnnotationPersistenceService.isPersistenceFile(url) {
+                continue
+            }
             guard values.isRegularFile == true,
                   allowedExtensions.contains(url.pathExtension.lowercased()) else { continue }
             notes.append(NoteDocument(

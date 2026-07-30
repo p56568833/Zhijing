@@ -20,6 +20,26 @@ enum AIStreamEvent: Sendable {
     case finished(AIResponse)
 }
 
+enum AIRequestPolicy {
+    static let connectionTimeout: TimeInterval = 20
+    static let generationTimeout: TimeInterval = 60
+
+    static func jsonPOST(
+        url: URL,
+        apiKey: String,
+        body: [String: Any],
+        timeout: TimeInterval
+    ) throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+}
+
 struct AIService: Sendable {
     func fetchDeepSeekBalance(apiKey: String) async throws -> [AIAccountBalance] {
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -71,12 +91,12 @@ struct AIService: Sendable {
                 ["role": "user", "content": "这是连接测试。请只回复 OK。"]
             ],
         ]
-        var request = URLRequest(url: configuration.endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let request = try AIRequestPolicy.jsonPOST(
+            url: configuration.endpoint,
+            apiKey: configuration.apiKey,
+            body: body,
+            timeout: AIRequestPolicy.connectionTimeout
+        )
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -131,17 +151,12 @@ struct AIService: Sendable {
                         body["stream_options"] = ["include_usage": true]
                     }
 
-                    var request = URLRequest(url: configuration.endpoint)
-                    request.httpMethod = "POST"
-                    request.setValue(
-                        "Bearer \(configuration.apiKey)",
-                        forHTTPHeaderField: "Authorization"
+                    let request = try AIRequestPolicy.jsonPOST(
+                        url: configuration.endpoint,
+                        apiKey: configuration.apiKey,
+                        body: body,
+                        timeout: AIRequestPolicy.generationTimeout
                     )
-                    request.setValue(
-                        "application/json",
-                        forHTTPHeaderField: "Content-Type"
-                    )
-                    request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
                     let (bytes, response) = try await URLSession.shared.bytes(for: request)
                     guard let http = response as? HTTPURLResponse,
@@ -241,11 +256,12 @@ struct AIService: Sendable {
             "model": configuration.model,
             "messages": [["role": "user", "content": prompt]]
         ]
-        var request = URLRequest(url: configuration.endpoint)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let request = try AIRequestPolicy.jsonPOST(
+            url: configuration.endpoint,
+            apiKey: configuration.apiKey,
+            body: body,
+            timeout: AIRequestPolicy.generationTimeout
+        )
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw NSError(domain: "AIService", code: 4, userInfo: [NSLocalizedDescriptionKey: "模型服务请求失败"])
@@ -310,11 +326,12 @@ struct AIService: Sendable {
             "model": configuration.model,
             "messages": [["role": "user", "content": prompt]]
         ]
-        var request = URLRequest(url: configuration.endpoint)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let request = try AIRequestPolicy.jsonPOST(
+            url: configuration.endpoint,
+            apiKey: configuration.apiKey,
+            body: body,
+            timeout: AIRequestPolicy.generationTimeout
+        )
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw connectionError("模型服务请求失败。")

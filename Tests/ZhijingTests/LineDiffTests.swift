@@ -85,6 +85,238 @@ import PDFKit
     #expect(persistence.load() == value)
 }
 
+@Test func apiKeyUsesALocalOwnerOnlyFileWithoutKeychainAccess() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try LocalSecretStore.save(
+        "sk-local-test",
+        account: "openai-api-key",
+        directoryOverride: root
+    )
+
+    #expect(LocalSecretStore.read(
+        account: "openai-api-key",
+        directoryOverride: root
+    ) == "sk-local-test")
+    let url = try LocalSecretStore.storageURL(directoryOverride: root)
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    #expect(attributes[.posixPermissions] as? Int == 0o600)
+
+    try LocalSecretStore.save(
+        "",
+        account: "openai-api-key",
+        directoryOverride: root
+    )
+    #expect(LocalSecretStore.read(
+        account: "openai-api-key",
+        directoryOverride: root
+    ).isEmpty)
+}
+
+@Test func textAnnotationReanchorsWhenItsQuotedTextIsEdited() throws {
+    let original = "开头\n需要批注的结论\n结尾"
+    let selectedRange = (original as NSString).range(of: "需要批注的结论")
+    let selection = EditorTextSelection(
+        documentID: "/tmp/note.md",
+        range: selectedRange,
+        text: "需要批注的结论"
+    )
+    let anchor = try #require(
+        TextAnnotationAnchorResolver.makeAnchor(selection: selection, in: original)
+    )
+    let annotation = TextAnnotation(anchor: anchor, text: "确认措辞")
+    let edited = original.replacingOccurrences(of: "结论", with: "判断")
+    let mutation = EditorTextMutation(
+        range: (original as NSString).range(of: "结论"),
+        replacementText: "判断"
+    )
+
+    let updated = TextAnnotationAnchorResolver.reanchor(
+        annotation,
+        from: original,
+        to: edited,
+        mutation: mutation
+    )
+    let resolved = try #require(
+        TextAnnotationAnchorResolver.resolve(updated, in: edited)
+    )
+
+    #expect(updated.anchor.selectedText == "需要批注的判断")
+    #expect((edited as NSString).substring(with: resolved.range) == "需要批注的判断")
+}
+
+@Test func deletedAnnotationQuoteRemainsAvailableAsAnOrphan() throws {
+    let original = "开头\n需要保留的批注原文\n结尾"
+    let selectedRange = (original as NSString).range(of: "需要保留的批注原文")
+    let anchor = try #require(TextAnnotationAnchorResolver.makeAnchor(
+        selection: EditorTextSelection(
+            documentID: "/tmp/note.md",
+            range: selectedRange,
+            text: "需要保留的批注原文"
+        ),
+        in: original
+    ))
+    let annotation = TextAnnotation(anchor: anchor, text: "这条批注不能消失")
+    let edited = (original as NSString).replacingCharacters(
+        in: selectedRange,
+        with: ""
+    )
+
+    let updated = TextAnnotationAnchorResolver.reanchor(
+        annotation,
+        from: original,
+        to: edited,
+        mutation: EditorTextMutation(range: selectedRange, replacementText: "")
+    )
+
+    #expect(updated.text == annotation.text)
+    #expect(TextAnnotationAnchorResolver.resolve(updated, in: edited) == nil)
+}
+
+@Test func portableAnnotationsFollowTheLibraryToAnotherPath() throws {
+    let parent = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    let originalRoot = parent.appending(path: "原知识库", directoryHint: .isDirectory)
+    let movedRoot = parent.appending(path: "新知识库", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: originalRoot, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: parent) }
+
+    let note = originalRoot.appending(path: "稿子/文稿.md")
+    try FileManager.default.createDirectory(
+        at: note.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try "正文".write(to: note, atomically: true, encoding: .utf8)
+    let annotation = TextAnnotation(
+        anchor: TextAnnotationAnchor(
+            selectedText: "正文",
+            utf16Location: 0,
+            prefix: "",
+            suffix: ""
+        ),
+        text: "外部 AI 必须看到"
+    )
+    let persistence = AnnotationPersistenceService(directoryOverride: parent)
+    try persistence.saveSynchronously(
+        [note.standardizedFileURL.path: [annotation]],
+        libraryRoot: originalRoot
+    )
+
+    let indexURL = originalRoot.appending(
+        path: AnnotationPersistenceService.portableFilename
+    )
+    let indexText = try String(contentsOf: indexURL, encoding: .utf8)
+    #expect(indexText.contains("给外部 AI"))
+    #expect(indexText.contains("稿子/文稿.md"))
+    #expect(indexText.contains("外部 AI 必须看到"))
+    #expect(indexText.contains("**状态**：待处理"))
+
+    try FileManager.default.moveItem(at: originalRoot, to: movedRoot)
+    let loaded = try persistence.loadLibrary(at: movedRoot)
+    let movedNotePath = movedRoot.appending(path: "稿子/文稿.md")
+        .standardizedFileURL.path
+    #expect(loaded[movedNotePath] == [annotation])
+}
+
+@Test func annotationIndexDoesNotAppearAsANote() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try "正文".write(
+        to: root.appending(path: "正文.md"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "批注索引".write(
+        to: root.appending(path: AnnotationPersistenceService.portableFilename),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let scanned = try KnowledgeBaseService().scanLibrary(
+        root: root,
+        excludedFolders: []
+    )
+
+    #expect(scanned.documents.map(\.url.lastPathComponent) == ["正文.md"])
+}
+
+@MainActor
+@Test func annotationShortcutLetsTheEditorReadTheLiveSelection() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appending(path: "快捷键.md")
+    try "选中这段文字".write(to: url, atomically: true, encoding: .utf8)
+    let defaultsName = "ZhijingTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer { defaults.removePersistentDomain(forName: defaultsName) }
+    let store = AppStore(defaults: defaults)
+    let document = NoteDocument(
+        url: url,
+        relativePath: url.lastPathComponent,
+        modifiedAt: .now,
+        size: 0
+    )
+    store.select(document)
+    let selectedText = "选中这段文字"
+    store.editorSelectionDidChange(EditorTextSelection(
+        documentID: document.id,
+        range: NSRange(location: 0, length: (selectedText as NSString).length),
+        text: selectedText
+    ))
+
+    store.requestAnnotationComposer()
+
+    #expect(store.annotationComposerRequest?.selection.text == "选中这段文字")
+    #expect(store.isAnnotationRailVisible)
+    #expect(store.errorMessage == nil)
+
+    let request = try #require(store.annotationComposerRequest)
+    store.addAnnotation(text: "这里需要补充证据", selection: request.selection)
+    let annotation = try #require(store.currentAnnotations.first)
+    #expect(store.annotationComposerRequest == nil)
+    #expect(!annotation.isResolved)
+
+    store.toggleAnnotationResolution(id: annotation.id)
+    #expect(store.currentAnnotations.first?.isResolved == true)
+}
+
+@MainActor
+@Test func selectionBubbleSendsTheAnnotationToTheRailInsteadOfOpeningAPopover() {
+    let textView = MarkdownEditorTextView()
+    textView.annotationDocumentID = "文章.md"
+    textView.string = "前文，需要批注的结论，后文。"
+    let range = (textView.string as NSString).range(of: "需要批注的结论")
+    textView.setSelectedRange(range)
+    var requestedSelection: EditorTextSelection?
+    textView.onRequestAnnotation = { requestedSelection = $0 }
+
+    textView.requestAnnotationForCurrentSelection()
+
+    #expect(requestedSelection?.documentID == "文章.md")
+    #expect(requestedSelection?.range == range)
+    #expect(requestedSelection?.text == "需要批注的结论")
+}
+
+@MainActor
+@Test func editorKeepsLongFormTextLeftAlignedAtEveryWindowWidth() {
+    let textView = MarkdownEditorTextView(
+        frame: NSRect(x: 0, y: 0, width: 1_200, height: 700)
+    )
+    textView.textContainerInset = NSSize(width: 22, height: 24)
+    textView.layout()
+    #expect(textView.textContainerInset.width == 22)
+
+    textView.frame.size.width = 600
+    textView.layout()
+    #expect(textView.textContainerInset.width == 22)
+}
+
 @Test func lineDiffFindsInsertionsAndRemovals() {
     let diff = LineDiff(
         original: "第一行\n旧内容\n最后一行",
@@ -1211,10 +1443,7 @@ import PDFKit
 
     [链接文字](https://example.com)
     """
-    let blocks = MarkdownReadingParser.parse(source)
-    let visibleText = blocks
-        .map { String(MarkdownInlineRenderer.render($0.content).characters) }
-        .joined(separator: "\n")
+    let visibleText = MarkdownReadingAttributedRenderer.render(source).string
 
     #expect(visibleText.contains("标题"))
     #expect(visibleText.contains("一段引用"))

@@ -9,6 +9,12 @@ struct EditorView: View {
         default: 420,
         range: 340...700
     )
+    @AppStorage("annotationPaneWidth") private var savedAnnotationPaneWidth = 300.0
+    @State private var annotationPaneWidth = PaneWidthPreference.load(
+        key: "annotationPaneWidth",
+        default: 300,
+        range: 270...380
+    )
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,7 +31,7 @@ struct EditorView: View {
                     .id(proposal.id)
             } else if store.isComparisonVisible {
                 HStack(spacing: 0) {
-                    primaryEditor
+                    annotatedPrimaryEditor
                         .frame(
                             minWidth: 360,
                             maxWidth: .infinity,
@@ -45,7 +51,7 @@ struct EditorView: View {
                 }
                 .clipped()
             } else {
-                primaryEditor
+                annotatedPrimaryEditor
                     .clipped()
             }
             Divider()
@@ -94,6 +100,29 @@ struct EditorView: View {
                 .help("左右分屏对照另一篇文稿")
                 .buttonStyle(.plain)
                 .disabled(store.editProposal != nil)
+                Button {
+                    if store.currentAnnotations.isEmpty,
+                       store.annotationComposerRequest == nil {
+                        store.requestAnnotationComposer()
+                    } else {
+                        store.toggleAnnotationRail()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isAnnotationPanePresented
+                              ? "text.bubble.fill"
+                              : "text.bubble")
+                        if !store.currentAnnotations.isEmpty {
+                            Text("\(store.currentAnnotations.count)")
+                                .font(.caption2.monospacedDigit())
+                        }
+                    }
+                }
+                .accessibilityLabel("批注")
+                .help(annotationButtonHelp)
+                .buttonStyle(.plain)
+                .foregroundStyle(isAnnotationPanePresented ? Color.orange : Color.primary)
+                .disabled(store.editProposal != nil)
                 Menu {
                     Button("导出 PDF…") {
                         store.exportCurrentDocument(as: .pdf)
@@ -124,6 +153,53 @@ struct EditorView: View {
     }
 
     @ViewBuilder
+    private var annotatedPrimaryEditor: some View {
+        HStack(spacing: 0) {
+            primaryEditor
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let document = store.selectedDocument,
+               isAnnotationPanePresented {
+                ResizablePaneDivider(
+                    paneWidth: $annotationPaneWidth,
+                    range: 270...380,
+                    dragDirection: -1,
+                    onDragEnded: { width in
+                        savedAnnotationPaneWidth = width
+                    }
+                )
+                AnnotationRailView(
+                    documentTitle: document.title,
+                    items: store.currentAnnotationDisplayItems,
+                    composerRequest: store.annotationComposerRequest,
+                    onCreate: { text, selection in
+                        store.addAnnotation(text: text, selection: selection)
+                    },
+                    onCancelComposer: store.cancelAnnotationComposer,
+                    onReveal: store.revealAnnotation,
+                    onUpdate: store.updateAnnotation,
+                    onToggleResolved: store.toggleAnnotationResolution,
+                    onRelink: store.relinkAnnotation,
+                    onDelete: store.deleteAnnotation,
+                    onClose: store.toggleAnnotationRail
+                )
+                .frame(width: annotationPaneWidth)
+            }
+        }
+    }
+
+    private var isAnnotationPanePresented: Bool {
+        store.isAnnotationRailVisible
+            && (!store.currentAnnotationDisplayItems.isEmpty
+                || store.annotationComposerRequest != nil)
+    }
+
+    private var annotationButtonHelp: String {
+        if isAnnotationPanePresented { return "隐藏批注" }
+        if store.currentAnnotations.isEmpty { return "选中文字后添加批注（⇧⌘M）" }
+        return "显示批注"
+    }
+
+    @ViewBuilder
     private var primaryEditor: some View {
         if let document = store.selectedDocument {
             if store.isPreviewMode {
@@ -137,17 +213,12 @@ struct EditorView: View {
                     findOptions: store.documentFindOptions,
                     findNavigationRequest: store.documentFindNavigationRequest,
                     annotations: store.currentResolvedAnnotations,
-                    annotationComposerRequestID: store.annotationComposerRequestID,
                     onChange: store.editorDidChange,
                     onSelectionChange: store.editorSelectionDidChange,
                     onFindResultChange: store.updateDocumentFindResult,
                     onFindCommand: store.handleDocumentFindCommand,
                     onAIEditAction: store.handleSelectionEditAction,
-                    onCreateAnnotation: { text, selection in
-                        store.addAnnotation(text: text, selection: selection)
-                    },
-                    onUpdateAnnotation: store.updateAnnotation,
-                    onDeleteAnnotation: store.deleteAnnotation
+                    onRequestAnnotation: store.beginAnnotation
                 )
                 .accessibilityLabel("\(document.title) 编辑器")
             }
