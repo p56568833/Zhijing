@@ -3,6 +3,44 @@ import Testing
 @testable import Zhijing
 
 @MainActor
+@Test func aiGenerationControllerOwnsChatMigrationAndPersistence() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+        path: "AIGenerationControllerTests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let persistence = ChatPersistenceService(directoryOverride: root)
+    let legacyChats = [
+        "/old.md": [ChatMessage(role: .user, text: "保留这段对话")]
+    ]
+    let legacyData = try JSONEncoder().encode(legacyChats)
+    let controller = AIGenerationController(
+        knowledgeBase: KnowledgeBaseService(),
+        persistence: persistence
+    )
+
+    try controller.loadChats(legacyData: legacyData)
+    controller.moveChat(from: "/old.md", to: "/new.md")
+    try controller.saveSynchronously()
+
+    let reloaded = AIGenerationController(
+        knowledgeBase: KnowledgeBaseService(),
+        persistence: persistence
+    )
+    try reloaded.loadChats(legacyData: nil)
+    #expect(reloaded.messages(for: "/old.md").isEmpty)
+    #expect(reloaded.messages(for: "/new.md").map(\.text) == ["保留这段对话"])
+
+    reloaded.clearChat(for: "/new.md")
+    try reloaded.saveSynchronously()
+    #expect(reloaded.messages(for: "/new.md").isEmpty)
+}
+
+@MainActor
 @Test func librarySearchControllerOwnsCancellationAndEmptyQueryState() async throws {
     let root = FileManager.default.temporaryDirectory.appending(
         path: "LibrarySearchControllerTests-\(UUID().uuidString)",

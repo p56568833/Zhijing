@@ -76,9 +76,12 @@ final class AppStore {
     }
     var isPreviewMode = false
     var retrievalScope: RetrievalScope = .library
-    var chats: [String: [ChatMessage]] = [:]
-    var isGenerating = false
-    var retrievalStatus = ""
+    var chats: [String: [ChatMessage]] {
+        get { aiGenerationController.chats }
+        set { aiGenerationController.chats = newValue }
+    }
+    var isGenerating: Bool { aiGenerationController.isGenerating }
+    var retrievalStatus: String { aiGenerationController.retrievalStatus }
     var errorMessage: String?
     var editProposal: EditProposal?
     var revisions: [Revision] {
@@ -131,17 +134,12 @@ final class AppStore {
     private let knowledgeBase: KnowledgeBaseService
     private let librarySearchController: LibrarySearchController
     private let revisionController: RevisionController
-    private let ai = AIService()
+    private let aiGenerationController: AIGenerationController
     private let libraryWatcher = LibraryWatcher()
     private let documentExporter = DocumentExportService()
     private let documentSession = DocumentSessionController()
     private let documentFindController = DocumentFindController()
-    private let chatPersistence = ChatPersistenceService()
     private let annotationRepository = AnnotationRepository()
-    @ObservationIgnored
-    private var generationTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var generationID: UUID?
     @ObservationIgnored
     private var wordCountTask: Task<Void, Never>?
     @ObservationIgnored
@@ -155,8 +153,9 @@ final class AppStore {
     @ObservationIgnored
     private var libraryRefreshID = UUID()
     var currentMessages: [ChatMessage] {
-        guard let key = selectedDocument?.persistenceKey else { return [] }
-        return chats[key] ?? []
+        aiGenerationController.messages(
+            for: selectedDocument?.persistenceKey
+        )
     }
 
     var currentAnnotations: [TextAnnotation] {
@@ -195,7 +194,7 @@ final class AppStore {
     }
 
     var canCancelGeneration: Bool {
-        generationTask != nil
+        aiGenerationController.canCancel
     }
 
     var openDocuments: [NoteDocument] {
@@ -227,7 +226,9 @@ final class AppStore {
 
     init(
         defaults: UserDefaults = .standard,
-        knowledgeBase: KnowledgeBaseService = .init()
+        knowledgeBase: KnowledgeBaseService = .init(),
+        aiService: AIService = .init(),
+        chatPersistence: ChatPersistenceService = .init()
     ) {
         self.defaults = defaults
         self.knowledgeBase = knowledgeBase
@@ -235,12 +236,17 @@ final class AppStore {
             service: knowledgeBase
         )
         revisionController = RevisionController(service: knowledgeBase)
+        aiGenerationController = AIGenerationController(
+            ai: aiService,
+            knowledgeBase: knowledgeBase,
+            persistence: chatPersistence
+        )
         aiSettings = AISettingsController(defaults: defaults)
         excludedFoldersText = defaults.string(forKey: Keys.excludedFolders) ?? ".git, node_modules"
         favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
         let legacyChats = defaults.data(forKey: Keys.chats)
         do {
-            chats = try chatPersistence.loadStrict(legacyData: legacyChats)
+            try aiGenerationController.loadChats(legacyData: legacyChats)
         } catch {
             chats = [:]
             errorMessage = "对话记录无法读取，已停止覆盖原文件：\(error.localizedDescription)"
@@ -255,7 +261,7 @@ final class AppStore {
         }
         if legacyChats != nil {
             do {
-                try chatPersistence.saveSynchronously(chats)
+                try aiGenerationController.saveSynchronously()
                 defaults.removeObject(forKey: Keys.chats)
             } catch {
                 errorMessage = "迁移对话记录失败：\(error.localizedDescription)"
@@ -630,20 +636,6 @@ final class AppStore {
               validEditorSelection(selection) != nil,
               !isGenerating else { return }
         let originalText = editorText
-        let selectionLineRange = AIContextBuilder.lineRange(
-            for: selection.range,
-            in: originalText
-        )
-        let context = AIContextBuilder.surroundingContext(
-            in: originalText,
-            selection: selection.range
-        )
-        let annotationContext = AIContextBuilder.annotationContext(
-            annotations: currentAnnotations,
-            in: originalText
-        )
-        let query = "\(instruction)\n\(selection.text)"
-        let documents = documents
         let config: AIConfiguration
         do {
             config = try resolvedConfiguration()
@@ -651,63 +643,27 @@ final class AppStore {
             errorMessage = error.localizedDescription
             return
         }
-        let service = knowledgeBase
-        guard let generationID = beginGeneration() else { return }
-        retrievalStatus = "正在理解选区并判断所需上下文…"
-
-        generationTask = Task {
-            defer { finishGeneration(generationID) }
-            let chunks = await Task.detached(priority: .userInitiated) {
-                service.retrieve(
-                    query: query,
-                    documents: documents,
-                    currentDocument: document,
-                    scope: .library,
-                    limit: 5
-                )
-            }.value
-            guard !Task.isCancelled, self.generationID == generationID else { return }
-            retrievalStatus = chunks.isEmpty
-                ? "未使用知识库资料"
-                : "AI 已自行筛选 \(Set(chunks.map(\.filePath)).count) 篇相关资料"
-            do {
-                let application = try await ai.proposeSelectionEdit(
-                    instruction: instruction,
-                    currentText: originalText,
-                    selectedText: selection.text,
-                    surroundingContext: context,
-                    annotationContext: annotationContext,
-                    sources: chunks,
-                    configuration: config
-                )
-                guard !Task.isCancelled, self.generationID == generationID else { return }
-                let outsideEdits = application.edits.filter {
-                    !AIContextBuilder.contains(selection.range, range: $0.range)
-                }
-                let reasons = outsideEdits.compactMap(\.reason)
-                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                if selectedDocument?.relativePath == document.relativePath,
-                   editProposal == nil,
-                   editorText == originalText {
-                    editProposal = EditProposal(
-                        documentPath: document.relativePath,
-                        original: originalText,
-                        replacement: application.replacement,
-                        instruction: instruction,
-                        selectionLineRange: selectionLineRange,
-                        selectionRange: selection.range,
-                        outsideSelectionReason: reasons.isEmpty && !outsideEdits.isEmpty
-                            ? "为保证上下文衔接，AI 建议同时调整这部分。"
-                            : reasons.joined(separator: "；")
-                    )
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                guard self.generationID == generationID else { return }
-                errorMessage = error.localizedDescription
+        aiGenerationController.proposeSelectionEdit(
+            AISelectionProposalRequest(
+                instruction: instruction,
+                document: document,
+                originalText: originalText,
+                selection: selection,
+                annotations: currentAnnotations,
+                documents: documents,
+                configuration: config
+            ),
+            onProposal: { [weak self] proposal in
+                guard let self,
+                      selectedDocument?.relativePath == document.relativePath,
+                      editProposal == nil,
+                      editorText == originalText else { return }
+                editProposal = proposal
+            },
+            onError: { [weak self] message in
+                self?.errorMessage = message
             }
-        }
+        )
     }
 
     @discardableResult
@@ -744,7 +700,7 @@ final class AppStore {
         }
         guard saveNow() else { return false }
         do {
-            try chatPersistence.saveSynchronously(chats)
+            try aiGenerationController.saveSynchronously()
             try annotationRepository.saveSynchronously(
                 annotations,
                 libraryRoot: libraryURL,
@@ -920,16 +876,16 @@ final class AppStore {
             favorites.subtract(affectedKeys)
             defaults.set(Array(favorites), forKey: Keys.favorites)
             for key in affectedKeys {
-                chats[key] = nil
                 annotations[key] = nil
             }
+            aiGenerationController.removeChats(for: affectedKeys)
+            defaults.removeObject(forKey: Keys.chats)
             openDocumentPaths.removeAll { affectedPaths.contains($0) }
             persistOpenDocuments()
             if let comparisonDocumentPath,
                affectedPaths.contains(comparisonDocumentPath) {
                 setComparisonDocument(nil)
             }
-            persistChats()
             persistAnnotations()
             if selectedIsAffected {
                 clearDocumentSelection()
@@ -951,9 +907,11 @@ final class AppStore {
             if comparisonDocumentPath == document.relativePath {
                 setComparisonDocument(nil)
             }
-            chats[document.persistenceKey] = nil
+            aiGenerationController.removeChats(
+                for: CollectionOfOne(document.persistenceKey)
+            )
+            defaults.removeObject(forKey: Keys.chats)
             annotations[document.persistenceKey] = nil
-            persistChats()
             persistAnnotations()
             if wasSelected {
                 documentSession.cancelAutosave()
@@ -984,205 +942,80 @@ final class AppStore {
         guard let document = selectedDocument else { return }
         let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty, !isGenerating else { return }
-        let config: AIConfiguration
+        let configuration: AIConfiguration
         do {
-            config = try resolvedConfiguration()
+            configuration = try resolvedConfiguration()
         } catch {
             errorMessage = error.localizedDescription
             return
         }
-        guard let generationID = beginGeneration() else { return }
-        let key = document.persistenceKey
-        let history = chats[key] ?? []
-        let userMessage = ChatMessage(role: .user, text: question)
-        chats[key, default: []].append(userMessage)
-        persistChats()
-        retrievalStatus = "正在搜索知识库…"
-
         let currentText = editorText
-        let currentSelection = validEditorSelection()
-        let currentAnnotations = currentAnnotations
-        let scope = retrievalScope
-        let allDocuments = documents
-        let service = knowledgeBase
-        let assistantMessageID = UUID()
-
-        generationTask = Task {
-            defer { finishGeneration(generationID) }
-            let chunks = await Task.detached {
-                service.retrieve(
-                    query: question,
-                    documents: allDocuments,
-                    currentDocument: document,
-                    scope: scope
-                )
-            }.value
-            guard !Task.isCancelled, self.generationID == generationID else { return }
-            retrievalStatus = "搜索了 \(Set(chunks.map(\.filePath)).count) 篇笔记，引用了 \(chunks.count) 个片段"
-            let currentContext = AIContextBuilder.answerContext(
+        aiGenerationController.sendMessage(
+            AIChatGenerationRequest(
                 question: question,
                 document: document,
-                text: currentText,
-                selection: currentSelection,
-                annotations: currentAnnotations
-            )
-            var streamedText = ""
-            var didCreateAssistantMessage = false
-            do {
-                let stream = ai.answerStream(
-                    question: question,
-                    currentContext: currentContext,
-                    history: history,
-                    sources: chunks,
-                    configuration: config
-                )
-                for try await event in stream {
-                    try Task.checkCancellation()
-                    switch event {
-                    case .delta(let delta):
-                        streamedText += delta
-                        if !didCreateAssistantMessage {
-                            chats[key, default: []].append(ChatMessage(
-                                id: assistantMessageID,
-                                role: .assistant,
-                                text: streamedText,
-                                sources: chunks
-                            ))
-                            didCreateAssistantMessage = true
-                        } else {
-                            updateAssistantMessage(
-                                id: assistantMessageID,
-                                documentPath: key,
-                                text: streamedText,
-                                sources: chunks
-                            )
-                        }
-                    case .finished(let response):
-                        let (displayText, extractedEdit) = try AIEditPatchProcessor.extractFromChat(
-                            response.text,
-                            original: currentText
-                        )
-                        if didCreateAssistantMessage {
-                            updateAssistantMessage(
-                                id: assistantMessageID,
-                                documentPath: key,
-                                text: displayText,
-                                sources: response.sources,
-                                isGeneralKnowledge: response.usedGeneralKnowledge,
-                                usage: response.usage,
-                                cost: response.cost
-                            )
-                        } else {
-                            chats[key, default: []].append(ChatMessage(
-                                id: assistantMessageID,
-                                role: .assistant,
-                                text: displayText,
-                                sources: response.sources,
-                                isGeneralKnowledge: response.usedGeneralKnowledge,
-                                usage: response.usage,
-                                cost: response.cost
-                            ))
-                        }
-                        persistChats()
-                        if let editText = extractedEdit {
-                            if selectedDocument?.id == document.id,
-                               editProposal == nil,
-                               editorText == currentText {
-                                editProposal = EditProposal(
-                                    documentPath: document.relativePath,
-                                    original: currentText,
-                                    replacement: editText,
-                                    instruction: question
-                                )
-                            }
-                        }
-                    }
-                }
-                if provider == .deepSeek {
-                    await refreshAccountBalance(force: true)
-                }
-            } catch is CancellationError {
-                if didCreateAssistantMessage {
-                    updateAssistantMessage(
-                        id: assistantMessageID,
-                        documentPath: key,
-                        text: streamedText.isEmpty ? "已停止生成。" : streamedText
-                    )
-                    persistChats()
-                }
-            } catch {
-                guard self.generationID == generationID else { return }
-                chats[key, default: []].append(ChatMessage(
-                    role: .assistant,
-                    text: "回答失败：\(error.localizedDescription)"
-                ))
-                persistChats()
+                currentText: currentText,
+                selection: validEditorSelection(),
+                annotations: currentAnnotations,
+                scope: retrievalScope,
+                documents: documents,
+                configuration: configuration
+            ),
+            onProposal: { [weak self] proposal in
+                guard let self,
+                      selectedDocument?.id == document.id,
+                      editProposal == nil,
+                      editorText == currentText else { return }
+                editProposal = proposal
+            },
+            onDeepSeekCompletion: { [weak self] in
+                guard let self else { return }
+                await refreshAccountBalance(force: true)
             }
-        }
+        )
     }
-
     func cancelGeneration() {
-        generationID = nil
-        let task = generationTask
-        generationTask = nil
-        task?.cancel()
-        isGenerating = false
-        retrievalStatus = "已停止生成"
+        aiGenerationController.cancelGeneration()
     }
 
     func clearCurrentChat() {
         guard let key = selectedDocument?.persistenceKey else { return }
-        chats[key] = []
-        persistChats()
+        aiGenerationController.clearChat(for: key)
+        defaults.removeObject(forKey: Keys.chats)
     }
 
     func proposeEdit(instruction: String) {
         guard let documentPath = selectedDocument?.relativePath,
               !editorText.isEmpty,
               editProposal == nil else { return }
-        let config: AIConfiguration
+        let configuration: AIConfiguration
         do {
-            config = try resolvedConfiguration()
+            configuration = try resolvedConfiguration()
         } catch {
             errorMessage = error.localizedDescription
             return
         }
         let originalText = editorText
-        let annotationContext = AIContextBuilder.annotationContext(
-            annotations: currentAnnotations,
-            in: originalText
-        )
-        guard let generationID = beginGeneration() else { return }
-        generationTask = Task {
-            defer { finishGeneration(generationID) }
-            do {
-                let replacement = try await ai.proposeEdit(
-                    instruction: instruction,
-                    currentText: originalText,
-                    annotationContext: annotationContext,
-                    configuration: config
-                )
-                if !Task.isCancelled,
-                   self.generationID == generationID,
-                   selectedDocument?.relativePath == documentPath,
-                   editProposal == nil,
-                   editorText == originalText {
-                    editProposal = EditProposal(
-                        documentPath: documentPath,
-                        original: originalText,
-                        replacement: replacement,
-                        instruction: instruction
-                    )
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                guard self.generationID == generationID else { return }
-                errorMessage = error.localizedDescription
+        aiGenerationController.proposeDocumentEdit(
+            AIDocumentProposalRequest(
+                instruction: instruction,
+                documentPath: documentPath,
+                originalText: originalText,
+                annotations: currentAnnotations,
+                configuration: configuration
+            ),
+            onProposal: { [weak self] proposal in
+                guard let self,
+                      selectedDocument?.relativePath == documentPath,
+                      editProposal == nil,
+                      editorText == originalText else { return }
+                editProposal = proposal
+            },
+            onError: { [weak self] message in
+                self?.errorMessage = message
             }
-        }
+        )
     }
-
     func resolveProposalHunk(
         hunkID: LineDiffHunk.ID,
         accepted: Bool,
@@ -1479,46 +1312,6 @@ final class AppStore {
 
     func updateDocumentFindResult(_ result: DocumentFindResult) {
         documentFindController.updateResult(result)
-    }
-
-    private func updateAssistantMessage(
-        id: UUID,
-        documentPath: String,
-        text: String,
-        sources: [RetrievedChunk]? = nil,
-        isGeneralKnowledge: Bool? = nil,
-        usage: AIUsage? = nil,
-        cost: AIUsageCost? = nil
-    ) {
-        guard let index = chats[documentPath]?.firstIndex(where: { $0.id == id }) else {
-            return
-        }
-        let old = chats[documentPath]?[index]
-        chats[documentPath]?[index] = ChatMessage(
-            id: id,
-            role: .assistant,
-            text: text,
-            createdAt: old?.createdAt ?? .now,
-            sources: sources ?? old?.sources ?? [],
-            isGeneralKnowledge: isGeneralKnowledge ?? old?.isGeneralKnowledge ?? false,
-            usage: usage ?? old?.usage,
-            cost: cost ?? old?.cost
-        )
-    }
-
-    private func beginGeneration() -> UUID? {
-        guard generationID == nil else { return nil }
-        let id = UUID()
-        generationID = id
-        isGenerating = true
-        return id
-    }
-
-    private func finishGeneration(_ id: UUID) {
-        guard generationID == id else { return }
-        generationID = nil
-        generationTask = nil
-        isGenerating = false
     }
 
     private func resolvedConfiguration() throws -> AIConfiguration {
@@ -2006,10 +1799,8 @@ final class AppStore {
             favorites.insert(newKey)
             defaults.set(Array(favorites), forKey: Keys.favorites)
         }
-        if let messages = chats.removeValue(forKey: oldKey) {
-            chats[newKey] = messages
-            persistChats()
-        }
+        aiGenerationController.moveChat(from: oldKey, to: newKey)
+        defaults.removeObject(forKey: Keys.chats)
         if let documentAnnotations = annotations.removeValue(forKey: oldKey) {
             annotations[newKey] = documentAnnotations
             persistAnnotations()
@@ -2153,7 +1944,7 @@ final class AppStore {
     }
 
     private func persistChats() {
-        chatPersistence.save(chats)
+        aiGenerationController.persistChats()
         defaults.removeObject(forKey: Keys.chats)
     }
 
