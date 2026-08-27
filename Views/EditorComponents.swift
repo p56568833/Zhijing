@@ -5,44 +5,111 @@ struct DocumentTabBar: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 3) {
+            HStack(spacing: 4) {
                 ForEach(store.openDocuments) { document in
-                    HStack(spacing: 5) {
-                        Button {
-                            store.select(document)
-                        } label: {
-                            Text(document.title)
-                                .lineLimit(1)
-                                .frame(maxWidth: 180)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            store.closeDocumentTab(document)
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 16, height: 16)
-                        }
-                        .buttonStyle(.plain)
-                        .help("关闭标签页")
-                    }
-                    .padding(.leading, 10)
-                    .padding(.trailing, 5)
-                    .frame(height: 28)
-                    .background(
-                        store.selectedDocument?.id == document.id
-                            ? Color.accentColor.opacity(0.16)
-                            : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 6)
+                    DocumentTabItem(
+                        title: document.title,
+                        isSelected: store.selectedDocument?.id == document.id,
+                        select: { store.select(document) },
+                        close: { store.closeDocumentTab(document) }
                     )
-                    .contentShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
             .padding(.horizontal, 8)
         }
         .frame(height: 40)
+    }
+}
+
+private struct DocumentTabItem: View {
+    let title: String
+    let isSelected: Bool
+    let select: () -> Void
+    let close: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Button(action: select) {
+                Text(title)
+                    .font(.callout.weight(isSelected ? .medium : .regular))
+                    .lineLimit(1)
+                    .frame(maxWidth: 180)
+            }
+            .buttonStyle(.plain)
+
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("关闭标签页")
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 5)
+        .frame(height: 28)
+        .background(tabBackground, in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(isSelected ? ZhijingTheme.accent.opacity(0.18) : .clear)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 7))
+        .onHover { isHovering = $0 }
+        .animation(.easeOut(duration: 0.14), value: isHovering)
+    }
+
+    private var tabBackground: Color {
+        if isSelected { return ZhijingTheme.paper }
+        if isHovering { return ZhijingTheme.paper.opacity(0.58) }
+        return .clear
+    }
+}
+
+struct DocumentActionsMenu: View {
+    let isComparisonVisible: Bool
+    let legacyAnnotationCount: Int
+    let isLegacyAnnotationPaneVisible: Bool
+    let isDisabled: Bool
+    let showVersions: () -> Void
+    let toggleComparison: () -> Void
+    let addAnnotation: () -> Void
+    let toggleLegacyAnnotations: () -> Void
+    let exportPDF: () -> Void
+    let exportWord: () -> Void
+
+    var body: some View {
+        Menu {
+            Button("添加批注…", systemImage: "text.bubble", action: addAnnotation)
+            Button("版本历史", systemImage: "clock.arrow.circlepath", action: showVersions)
+            Button(
+                isComparisonVisible ? "关闭分屏对照" : "打开分屏对照",
+                systemImage: "rectangle.split.2x1",
+                action: toggleComparison
+            )
+            if legacyAnnotationCount > 0 {
+                Button(
+                    isLegacyAnnotationPaneVisible ? "隐藏旧版批注" : "显示旧版批注（\(legacyAnnotationCount)）",
+                    systemImage: isLegacyAnnotationPaneVisible ? "archivebox.fill" : "archivebox",
+                    action: toggleLegacyAnnotations
+                )
+            }
+            Divider()
+            Menu("导出", systemImage: "square.and.arrow.up") {
+                Button("导出 PDF…", action: exportPDF)
+                Button("导出 Word…", action: exportWord)
+            }
+        } label: {
+            Label("文稿工具", systemImage: "ellipsis.circle")
+                .labelStyle(.iconOnly)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(isDisabled)
+        .help("版本、对照、批注与导出")
+        .accessibilityLabel("文稿工具")
     }
 }
 
@@ -122,7 +189,7 @@ struct DocumentFindBar: View {
         .font(.callout)
         .padding(.horizontal, 12)
         .frame(height: 38)
-        .background(.bar)
+        .background(ZhijingTheme.chrome)
         .onAppear { isFocused = true }
     }
 
@@ -199,16 +266,45 @@ struct DocumentMetricsBar: View {
                 }
             }
             Spacer()
-            Label("\(store.documentWordCount.formatted()) 字", systemImage: "textformat")
+            metricsSummary
         }
         .font(.caption)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 14)
         .frame(height: 30)
-        .background(.bar)
+        .background(ZhijingTheme.chrome)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(store.saveState.label)，\(store.documentWordCount.formatted()) 字"
-        )
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    @ViewBuilder
+    private var metricsSummary: some View {
+        HStack(spacing: 6) {
+            if let selection = store.selectionMetrics {
+                Label(
+                    "已选 \(selection.count.formatted()) 字",
+                    systemImage: "selection.pin.in.out"
+                )
+                Text("·")
+                Text("口播\(selection.speakingDurationLabel)")
+                Text("·")
+                Text("全文 \(store.documentWordCount.formatted()) 字")
+            } else {
+                Label(
+                    "\(store.documentWordCount.formatted()) 字",
+                    systemImage: "textformat"
+                )
+                Text("·")
+                Text("口播\(store.documentSpeakingDurationLabel)")
+            }
+        }
+        .lineLimit(1)
+    }
+
+    private var accessibilitySummary: String {
+        if let selection = store.selectionMetrics {
+            return "\(store.saveState.label)，已选 \(selection.count.formatted()) 字，口播\(selection.speakingDurationLabel)，全文 \(store.documentWordCount.formatted()) 字"
+        }
+        return "\(store.saveState.label)，\(store.documentWordCount.formatted()) 字，口播\(store.documentSpeakingDurationLabel)"
     }
 }

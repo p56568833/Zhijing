@@ -37,6 +37,10 @@ final class AppStore {
         set { editorState.updateSelection(newValue) }
     }
     var documentWordCount: Int { editorState.wordCount }
+    var documentSpeakingDurationLabel: String {
+        editorState.speakingDurationLabel
+    }
+    var selectionMetrics: DocumentMetrics? { editorState.selectionMetrics }
     var isDocumentFindVisible: Bool {
         get { documentFindController.isVisible }
         set { documentFindController.isVisible = newValue }
@@ -51,10 +55,10 @@ final class AppStore {
     var documentFindNavigationRequest: DocumentFindNavigationRequest? {
         documentFindController.navigationRequest
     }
-    var selectionEditRequest: SelectionEditRequest?
     var annotationComposerRequest: AnnotationComposerRequest? {
         annotationController.composerRequest
     }
+    private(set) var inlineAnnotationRequestID = 0
     var searchQuery: String {
         get { librarySearchController.query }
         set { librarySearchController.query = newValue }
@@ -75,10 +79,6 @@ final class AppStore {
         get { workspaceCatalog.isIndexing }
         set { workspaceCatalog.isIndexing = newValue }
     }
-    var isAssistantVisible: Bool {
-        get { preferences.isAssistantVisible }
-        set { preferences.isAssistantVisible = newValue }
-    }
     var isSidebarVisible: Bool {
         get { preferences.isSidebarVisible }
         set { preferences.isSidebarVisible = newValue }
@@ -92,13 +92,6 @@ final class AppStore {
         set { preferences.colorScheme = newValue }
     }
     var isPreviewMode = false
-    var retrievalScope: RetrievalScope = .library
-    var chats: [String: [ChatMessage]] {
-        get { aiGenerationController.chats }
-        set { aiGenerationController.chats = newValue }
-    }
-    var isGenerating: Bool { aiGenerationController.isGenerating }
-    var retrievalStatus: String { aiGenerationController.retrievalStatus }
     var errorMessage: String?
     var editProposal: EditProposal? {
         get { editProposalController.proposal }
@@ -108,19 +101,6 @@ final class AppStore {
         get { revisionController.revisions }
         set { revisionController.revisions = newValue }
     }
-    var provider: AIProviderPreset {
-        get { aiSettings.provider }
-        set { aiSettings.provider = newValue }
-    }
-    var isTestingConnection: Bool { aiSettings.isTestingConnection }
-    var connectionTestSucceeded: Bool { aiSettings.connectionTestSucceeded }
-    var connectionTestError: String? {
-        get { aiSettings.connectionTestError }
-        set { aiSettings.connectionTestError = newValue }
-    }
-    var accountBalances: [AIAccountBalance] { aiSettings.accountBalances }
-    var balanceError: String? { aiSettings.balanceError }
-    var isRefreshingBalance: Bool { aiSettings.isRefreshingBalance }
     var externalConflict: ExternalFileConflict? {
         get { externalConflictController.conflict }
         set { externalConflictController.conflict = newValue }
@@ -146,35 +126,15 @@ final class AppStore {
         set { workspaceNavigation.comparisonText = newValue }
     }
 
-    var model: String {
-        get { aiSettings.model }
-        set { aiSettings.model = newValue }
-    }
-    var endpoint: String {
-        get { aiSettings.endpoint }
-        set { aiSettings.endpoint = newValue }
-    }
     var excludedFoldersText: String {
         get { preferences.excludedFoldersText }
         set { preferences.excludedFoldersText = newValue }
     }
-    var apiKey: String {
-        get { aiSettings.apiKey }
-        set {
-            aiSettings.apiKey = newValue
-            if let persistenceError = aiSettings.secretPersistenceError {
-                errorMessage = persistenceError
-            }
-        }
-    }
-
     private let defaults: UserDefaults
     private let preferences: AppPreferencesController
-    private let aiSettings: AISettingsController
     private let knowledgeBase: KnowledgeBaseService
     private let librarySearchController: LibrarySearchController
     private let revisionController: RevisionController
-    private let aiGenerationController: AIGenerationController
     private let editProposalController: EditProposalController
     private let workspaceCatalog: WorkspaceCatalogController
     private let workspaceNavigation: WorkspaceNavigationController
@@ -185,12 +145,7 @@ final class AppStore {
     private let editorState: EditorSessionState
     private let documentFindController = DocumentFindController()
     private let annotationController: AnnotationController
-    var currentMessages: [ChatMessage] {
-        aiGenerationController.messages(
-            for: selectedDocument?.persistenceKey
-        )
-    }
-
+    private var documentSelectionRefreshTask: Task<Void, Never>?
     var currentAnnotations: [TextAnnotation] {
         annotationController.annotations(for: selectedDocument)
     }
@@ -208,24 +163,6 @@ final class AppStore {
             for: selectedDocument,
             text: editorText
         )
-    }
-
-    var latestUsage: AIUsage? {
-        currentMessages.reversed().compactMap(\.usage).first
-    }
-
-    var currentConversationCost: AIUsageCost? {
-        let costs = currentMessages.compactMap(\.cost)
-        guard let currency = costs.first?.currency,
-              costs.allSatisfy({ $0.currency == currency }) else { return nil }
-        return AIUsageCost(
-            amount: costs.reduce(0) { $0 + $1.amount },
-            currency: currency
-        )
-    }
-
-    var canCancelGeneration: Bool {
-        aiGenerationController.canCancel
     }
 
     var openDocuments: [NoteDocument] {
@@ -253,8 +190,6 @@ final class AppStore {
     init(
         defaults: UserDefaults = .standard,
         knowledgeBase: KnowledgeBaseService = .init(),
-        aiService: AIService = .init(),
-        chatPersistence: ChatPersistenceService = .init(),
         documentSession: DocumentSessionController = .init()
     ) {
         self.defaults = defaults
@@ -282,19 +217,6 @@ final class AppStore {
             documentSession: documentSession,
             revisions: revisionController
         )
-        aiGenerationController = AIGenerationController(
-            ai: aiService,
-            knowledgeBase: knowledgeBase,
-            persistence: chatPersistence
-        )
-        aiSettings = AISettingsController(defaults: defaults)
-        let legacyChats = defaults.data(forKey: Keys.chats)
-        do {
-            try aiGenerationController.loadChats(legacyData: legacyChats)
-        } catch {
-            chats = [:]
-            errorMessage = "对话记录无法读取，已停止覆盖原文件：\(error.localizedDescription)"
-        }
         do {
             try annotationController.loadCachedAnnotations()
         } catch {
@@ -303,19 +225,13 @@ final class AppStore {
                 errorMessage = "批注缓存无法读取，已停止覆盖原文件：\(error.localizedDescription)"
             }
         }
-        if legacyChats != nil {
-            do {
-                try aiGenerationController.saveSynchronously()
-                defaults.removeObject(forKey: Keys.chats)
-            } catch {
-                errorMessage = "迁移对话记录失败：\(error.localizedDescription)"
-            }
-        }
         if let path = defaults.string(forKey: Keys.libraryPath) {
             let url = URL(filePath: path, directoryHint: .isDirectory)
             if FileManager.default.fileExists(atPath: url.path) {
                 libraryURL = url
-                Task { await refreshLibrary(selecting: defaults.string(forKey: Keys.selectedPath)) }
+                scheduleDocumentSelectionRefresh(
+                    selecting: defaults.string(forKey: Keys.selectedPath)
+                )
             }
         }
     }
@@ -333,29 +249,6 @@ final class AppStore {
         Task { await refreshLibrary() }
     }
 
-    func selectProvider(_ newProvider: AIProviderPreset) {
-        aiSettings.selectProvider(newProvider)
-    }
-
-    func selectModel(_ newModel: String) {
-        aiSettings.selectModel(newModel)
-    }
-
-    func testAIConnection(apiKey: String) async {
-        await aiSettings.testConnection(apiKey: apiKey)
-        if let persistenceError = aiSettings.secretPersistenceError {
-            errorMessage = persistenceError
-        }
-    }
-
-    func resetConnectionTest() {
-        aiSettings.resetConnectionTest()
-    }
-
-    func refreshAccountBalance(force: Bool = false) async {
-        await aiSettings.refreshAccountBalance(force: force)
-    }
-
     func openDocuments(at urls: [URL]) {
         guard let request = DocumentOpenRequestResolver.resolve(
             urls: urls,
@@ -367,6 +260,7 @@ final class AppStore {
 
         let root = request.root
         let isInCurrentLibrary = libraryURL?.standardizedFileURL == root
+        documentSelectionRefreshTask?.cancel()
         if !isInCurrentLibrary {
             guard flushSave() else { return }
             transitionToLibrary(root)
@@ -387,15 +281,23 @@ final class AppStore {
                $0.id == request.firstURL.standardizedFileURL.path
            }) {
             select(first)
+        } else if let firstPath = request.relativePaths.first,
+                  let first = workspaceCatalog.document(at: firstPath) {
+            // When the library is already loaded, honor the Finder/open request
+            // immediately instead of briefly showing the restored document.
+            select(first)
+        } else if !firstIsExternal,
+                  !request.relativePaths.isEmpty,
+                  selectedDocument != nil {
+            guard flushSave() else { return }
+            clearDocumentSelection()
         }
 
-        Task {
-            if !request.relativePaths.isEmpty || !isInCurrentLibrary {
-                await refreshLibrary(
-                    selecting: firstIsExternal ? nil : request.relativePaths.first,
-                    opening: request.relativePaths
-                )
-            }
+        if !request.relativePaths.isEmpty || !isInCurrentLibrary {
+            scheduleDocumentSelectionRefresh(
+                selecting: firstIsExternal ? nil : request.relativePaths.first,
+                opening: request.relativePaths
+            )
         }
     }
 
@@ -403,6 +305,7 @@ final class AppStore {
         selecting relativePath: String? = nil,
         opening relativePaths: [String] = []
     ) async {
+        guard !Task.isCancelled else { return }
         guard let libraryURL else { return }
         loadPortableAnnotationsIfNeeded(at: libraryURL)
         do {
@@ -410,6 +313,7 @@ final class AppStore {
                 excludedFolders: excludedFolders,
                 favorites: favorites
             ) else { return }
+            guard !Task.isCancelled else { return }
             migrateExternalDocumentsIntoLibrary()
             refreshDerivedLibraryState()
             reconcileMovedAnnotationDocuments(in: libraryURL)
@@ -469,9 +373,6 @@ final class AppStore {
             return
         }
         guard flushSave() else { return }
-        if isGenerating {
-            cancelGeneration()
-        }
         annotationController.cancelComposing()
         editorSelection = nil
         do {
@@ -525,12 +426,17 @@ final class AppStore {
         editorSelection = selection
     }
 
+    func readingSelectionDidChange(_ text: String?) {
+        editorState.updateMetricSelection(text)
+    }
+
     func requestAnnotationComposer() {
         guard !isPreviewMode, let selection = validEditorSelection() else {
             NSSound.beep()
             return
         }
-        beginAnnotation(for: selection)
+        editorSelection = selection
+        inlineAnnotationRequestID &+= 1
     }
 
     func beginAnnotation(for selection: EditorTextSelection) {
@@ -617,61 +523,6 @@ final class AppStore {
         )
     }
 
-    func handleSelectionEditAction(_ action: AISelectionEditAction) {
-        guard let selection = validEditorSelection() else {
-            errorMessage = "请先在编辑器中选中要修改的文字。"
-            return
-        }
-        if action == .custom {
-            selectionEditRequest = SelectionEditRequest(selection: selection)
-        } else if let instruction = action.instruction {
-            proposeSelectionEdit(instruction: instruction, selection: selection)
-        }
-    }
-
-    func requestCustomSelectionEdit() {
-        handleSelectionEditAction(.custom)
-    }
-
-    func proposeSelectionEdit(
-        instruction: String,
-        selection: EditorTextSelection
-    ) {
-        guard let document = selectedDocument,
-              selection.documentID == document.id,
-              validEditorSelection(selection) != nil,
-              !isGenerating else { return }
-        let originalText = editorText
-        let config: AIConfiguration
-        do {
-            config = try resolvedConfiguration()
-        } catch {
-            errorMessage = error.localizedDescription
-            return
-        }
-        aiGenerationController.proposeSelectionEdit(
-            AISelectionProposalRequest(
-                instruction: instruction,
-                document: document,
-                originalText: originalText,
-                selection: selection,
-                annotations: currentAnnotations,
-                documents: documents,
-                configuration: config
-            ),
-            onProposal: { [weak self] proposal in
-                guard let self,
-                      selectedDocument?.relativePath == document.relativePath,
-                      editProposal == nil,
-                      editorText == originalText else { return }
-                editProposal = proposal
-            },
-            onError: { [weak self] message in
-                self?.errorMessage = message
-            }
-        )
-    }
-
     @discardableResult
     func saveNow(ignoringExternalConflict: Bool = false) -> Bool {
         guard let document = selectedDocument,
@@ -706,14 +557,13 @@ final class AppStore {
         }
         guard saveNow() else { return false }
         do {
-            try aiGenerationController.saveSynchronously()
             try annotationController.saveSynchronously(
                 libraryRoot: libraryURL,
                 externalDocuments: externalDocuments
             )
             return true
         } catch {
-            errorMessage = "保存对话或批注失败：\(error.localizedDescription)"
+            errorMessage = "保存批注失败：\(error.localizedDescription)"
             return false
         }
     }
@@ -880,8 +730,6 @@ final class AppStore {
             try knowledgeBase.trashFolder(root: root, relativePath: folder)
             favorites.subtract(affectedKeys)
             annotationController.removeAnnotations(for: affectedKeys)
-            aiGenerationController.removeChats(for: affectedKeys)
-            defaults.removeObject(forKey: Keys.chats)
             openDocumentPaths.removeAll { affectedPaths.contains($0) }
             persistOpenDocuments()
             if let comparisonDocumentPath,
@@ -908,10 +756,6 @@ final class AppStore {
             if comparisonDocumentPath == document.relativePath {
                 setComparisonDocument(nil)
             }
-            aiGenerationController.removeChats(
-                for: CollectionOfOne(document.persistenceKey)
-            )
-            defaults.removeObject(forKey: Keys.chats)
             annotationController.removeAnnotations(
                 for: CollectionOfOne(document.persistenceKey)
             )
@@ -940,84 +784,6 @@ final class AppStore {
         librarySearchController.perform(documents: documents)
     }
 
-    func sendMessage(_ text: String) {
-        guard let document = selectedDocument else { return }
-        let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !question.isEmpty, !isGenerating else { return }
-        let configuration: AIConfiguration
-        do {
-            configuration = try resolvedConfiguration()
-        } catch {
-            errorMessage = error.localizedDescription
-            return
-        }
-        let currentText = editorText
-        aiGenerationController.sendMessage(
-            AIChatGenerationRequest(
-                question: question,
-                document: document,
-                currentText: currentText,
-                selection: validEditorSelection(),
-                annotations: currentAnnotations,
-                scope: retrievalScope,
-                documents: documents,
-                configuration: configuration
-            ),
-            onProposal: { [weak self] proposal in
-                guard let self,
-                      selectedDocument?.id == document.id,
-                      editProposal == nil,
-                      editorText == currentText else { return }
-                editProposal = proposal
-            },
-            onDeepSeekCompletion: { [weak self] in
-                guard let self else { return }
-                await refreshAccountBalance(force: true)
-            }
-        )
-    }
-    func cancelGeneration() {
-        aiGenerationController.cancelGeneration()
-    }
-
-    func clearCurrentChat() {
-        guard let key = selectedDocument?.persistenceKey else { return }
-        aiGenerationController.clearChat(for: key)
-        defaults.removeObject(forKey: Keys.chats)
-    }
-
-    func proposeEdit(instruction: String) {
-        guard let documentPath = selectedDocument?.relativePath,
-              !editorText.isEmpty,
-              editProposal == nil else { return }
-        let configuration: AIConfiguration
-        do {
-            configuration = try resolvedConfiguration()
-        } catch {
-            errorMessage = error.localizedDescription
-            return
-        }
-        let originalText = editorText
-        aiGenerationController.proposeDocumentEdit(
-            AIDocumentProposalRequest(
-                instruction: instruction,
-                documentPath: documentPath,
-                originalText: originalText,
-                annotations: currentAnnotations,
-                configuration: configuration
-            ),
-            onProposal: { [weak self] proposal in
-                guard let self,
-                      selectedDocument?.relativePath == documentPath,
-                      editProposal == nil,
-                      editorText == originalText else { return }
-                editProposal = proposal
-            },
-            onError: { [weak self] message in
-                self?.errorMessage = message
-            }
-        )
-    }
     func resolveProposalHunk(
         hunkID: LineDiffHunk.ID,
         accepted: Bool,
@@ -1096,17 +862,15 @@ final class AppStore {
         }
     }
 
-    func openSource(_ source: RetrievedChunk) {
-        if let document = documents.first(where: { $0.relativePath == source.filePath }) {
-            select(document)
-            isPreviewMode = false
-            editorState.navigate(
-                to: EditorNavigationRequest(
-                    documentID: document.id,
-                    line: source.line
-                )
+    func navigateToOutlineItem(_ item: DocumentOutlineItem) {
+        guard let document = selectedDocument else { return }
+        isPreviewMode = false
+        editorState.navigate(
+            to: EditorNavigationRequest(
+                documentID: document.id,
+                line: item.line
             )
-        }
+        )
     }
 
     func revealInFinder(_ document: NoteDocument) {
@@ -1187,10 +951,6 @@ final class AppStore {
         }
     }
 
-    func toggleAssistant() {
-        isAssistantVisible.toggle()
-    }
-
     func toggleSidebar() {
         isSidebarVisible.toggle()
     }
@@ -1241,10 +1001,6 @@ final class AppStore {
 
     func updateDocumentFindResult(_ result: DocumentFindResult) {
         documentFindController.updateResult(result)
-    }
-
-    private func resolvedConfiguration() throws -> AIConfiguration {
-        try aiSettings.configuration()
     }
 
     private var excludedFolders: [String] {
@@ -1386,9 +1142,6 @@ final class AppStore {
     }
 
     private func clearDocumentSelection() {
-        if isGenerating {
-            cancelGeneration()
-        }
         editorState.clearDocument()
         annotationController.cancelComposing()
         hideDocumentFind()
@@ -1473,21 +1226,11 @@ final class AppStore {
                 documentSession.loadedText = text
                 scheduleAutosave()
             case .reloadFromDisk(let text):
-                if let proposal = editProposal,
-                   proposal.source == .assistant {
-                    externalConflictController.recordConflict(
-                        document: document,
-                        localText: editorText,
-                        diskText: text
-                    )
-                    saveState = .failed("检测到外部修改")
-                } else if editProposal?.replacement != text {
+                if editProposal?.replacement != text {
                     editProposal = EditProposal(
                         documentPath: document.relativePath,
                         original: editorText,
-                        replacement: text,
-                        instruction: "外部工具已完成文件修改，请确认差异",
-                        source: .externalFile
+                        replacement: text
                     )
                     hideDocumentFind()
                     saveState = .reviewingExternalChange
@@ -1587,8 +1330,6 @@ final class AppStore {
         if favorites.remove(oldKey) != nil {
             favorites.insert(newKey)
         }
-        aiGenerationController.moveChat(from: oldKey, to: newKey)
-        defaults.removeObject(forKey: Keys.chats)
         if annotationController.moveAnnotations(from: oldKey, to: newKey) {
             persistAnnotations()
         }
@@ -1608,13 +1349,10 @@ final class AppStore {
     private func migrateLegacyDocumentStateIfNeeded() {
         let migration = DocumentStateStore.migrateLegacyKeys(
             favorites: favorites,
-            chats: chats,
             documents: documents
         )
         guard migration.didChange else { return }
         favorites = migration.favorites
-        chats = migration.chats
-        persistChats()
     }
 
     private func addOpenDocument(_ document: NoteDocument) {
@@ -1665,6 +1403,7 @@ final class AppStore {
     }
 
     private func transitionToLibrary(_ url: URL) {
+        documentSelectionRefreshTask?.cancel()
         workspaceCatalog.cancelRefresh()
         externalChangeMonitor.stop()
         librarySearchController.reset()
@@ -1674,6 +1413,20 @@ final class AppStore {
         annotationController.transitionToLibrary()
         workspaceCatalog.transition(to: standardizedURL)
         defaults.set(standardizedURL.path, forKey: Keys.libraryPath)
+    }
+
+    private func scheduleDocumentSelectionRefresh(
+        selecting relativePath: String?,
+        opening relativePaths: [String] = []
+    ) {
+        documentSelectionRefreshTask?.cancel()
+        documentSelectionRefreshTask = Task { [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshLibrary(
+                selecting: relativePath,
+                opening: relativePaths
+            )
+        }
     }
 
     private func ensureComparisonDiffersFromSelection() {
@@ -1707,11 +1460,6 @@ final class AppStore {
             comparisonText = ""
             errorMessage = "无法打开对照文稿：\(error.localizedDescription)"
         }
-    }
-
-    private func persistChats() {
-        aiGenerationController.persistChats()
-        defaults.removeObject(forKey: Keys.chats)
     }
 
     @discardableResult
@@ -1763,6 +1511,5 @@ final class AppStore {
     private enum Keys {
         static let libraryPath = "libraryPath"
         static let selectedPath = "selectedPath"
-        static let chats = "chats"
     }
 }

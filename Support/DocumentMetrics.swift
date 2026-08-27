@@ -2,6 +2,7 @@ import Foundation
 
 struct DocumentMetrics: Equatable, Sendable {
     let count: Int
+    let estimatedSpeakingSeconds: Double
     private static let linkExpression = try? NSRegularExpression(
         pattern: #"\[([^\]]+)\]\([^)]+\)"#
     )
@@ -26,16 +27,27 @@ struct DocumentMetrics: Equatable, Sendable {
             }
             .count
         count = cjkCount + latinWordCount
+        estimatedSpeakingSeconds =
+            (Double(cjkCount) / 250 * 60) +
+            (Double(latinWordCount) / 150 * 60)
     }
 
     var countLabel: String {
         "\(count.formatted()) 字"
     }
 
+    var speakingDurationLabel: String {
+        guard count > 0 else { return "0 分钟" }
+        guard estimatedSpeakingSeconds >= 60 else { return "不足 1 分钟" }
+        let minutes = max(1, Int((estimatedSpeakingSeconds / 60).rounded()))
+        return "约 \(minutes.formatted()) 分钟"
+    }
+
     private static func plainText(from markdown: String) -> String {
-        var text = replacing(
+        var text = InlineTextMarkMarkdown.removingSyntax(from: markdown)
+        text = replacing(
             linkExpression,
-            in: markdown,
+            in: text,
             with: "$1"
         )
         text = replacing(

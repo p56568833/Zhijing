@@ -2,6 +2,9 @@ import SwiftUI
 
 struct SidebarView: View {
     @Bindable var store: AppStore
+    @State private var contentMode = SidebarContentMode.library
+    @State private var outlineItems: [DocumentOutlineItem] = []
+    @State private var selectedOutlineItemID: String?
     @State private var renameText = ""
     @State private var deleteTarget: NoteDocument?
     @State private var renameTargetRowKey: String?
@@ -25,20 +28,42 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            searchBar
-            if store.searchQuery.isEmpty {
-                libraryFilterPicker
+            contentModePicker
+            switch contentMode {
+            case .library:
+                searchBar
+                if store.searchQuery.isEmpty {
+                    libraryFilterPicker
+                }
+            case .outline:
+                outlineHeader
             }
-            Divider()
-            if store.searchQuery.isEmpty {
-                libraryList
-            } else {
-                searchResults
+            Divider().opacity(0.58)
+            switch contentMode {
+            case .library:
+                if store.searchQuery.isEmpty {
+                    libraryList
+                } else {
+                    searchResults
+                }
+            case .outline:
+                documentOutline
             }
-            Divider()
+            Divider().opacity(0.58)
             statusBar
         }
-        .background(.regularMaterial)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(ZhijingTheme.sidebar)
+        .animation(.snappy(duration: 0.24), value: contentMode)
+        .task(id: outlineRefreshID) {
+            await refreshOutline()
+        }
+        .onChange(of: store.selectedDocument?.id) { _, documentID in
+            selectedOutlineItemID = nil
+            if documentID == nil {
+                contentMode = .library
+            }
+        }
         .confirmationDialog(
             "要将“\(deleteTarget?.title ?? "")”移到废纸篓吗？",
             isPresented: Binding(
@@ -69,6 +94,20 @@ struct SidebarView: View {
         } message: {
             Text("其中的所有文件（含 \(documents(in: deleteFolderTarget ?? "").count) 篇文稿）也会一起移入废纸篓。")
         }
+    }
+
+    private var contentModePicker: some View {
+        Picker("侧栏内容", selection: $contentMode) {
+            Label("文库", systemImage: "books.vertical")
+                .tag(SidebarContentMode.library)
+            Label("大纲", systemImage: "list.bullet.indent")
+                .tag(SidebarContentMode.outline)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
+        .disabled(store.selectedDocument == nil)
     }
 
     private var searchBar: some View {
@@ -146,6 +185,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
         .overlay {
             if libraryFilter == .favorites && store.favoriteDocuments.isEmpty {
                 ContentUnavailableView(
@@ -179,6 +219,7 @@ struct SidebarView: View {
             }
             .buttonStyle(.plain)
         }
+        .scrollContentBackground(.hidden)
         .overlay {
             if store.searchResults.isEmpty {
                 ContentUnavailableView.search(text: store.searchQuery)
@@ -186,30 +227,119 @@ struct SidebarView: View {
         }
     }
 
+    private var outlineHeader: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(store.selectedDocument?.title ?? "未选择文稿")
+                .font(.system(size: 15, weight: .semibold))
+                .lineLimit(1)
+            HStack(spacing: 6) {
+                Text("\(store.documentWordCount.formatted()) 字")
+                Circle()
+                    .fill(Color.secondary.opacity(0.45))
+                    .frame(width: 3, height: 3)
+                Text("\(outlineItems.count) 个标题")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.top, 13)
+        .padding(.bottom, 12)
+    }
+
+    @ViewBuilder
+    private var documentOutline: some View {
+        if store.selectedDocument == nil {
+            DocumentOutlineEmptyState(isSubtitle: false) {
+                contentMode = .library
+            }
+        } else if outlineItems.isEmpty {
+            DocumentOutlineEmptyState(isSubtitle: selectedDocumentIsSubtitle) {
+                withAnimation(.snappy(duration: 0.22)) {
+                    contentMode = .library
+                }
+            }
+        } else {
+            DocumentOutlineNavigationView(
+                items: outlineItems,
+                selectedItemID: selectedOutlineItemID
+            ) { item in
+                withAnimation(.snappy(duration: 0.2)) {
+                    selectedOutlineItemID = item.id
+                }
+                store.navigateToOutlineItem(item)
+            }
+        }
+    }
+
     private var statusBar: some View {
         HStack {
-            if store.isIndexing {
+            if contentMode == .outline {
+                Text(outlineItems.isEmpty ? "等待标题" : "点击标题快速定位")
+            } else if store.isIndexing {
                 ProgressView().controlSize(.small)
                 Text("正在更新索引")
             } else {
                 Text("\(store.documents.count) 篇文稿")
             }
             Spacer()
-            Menu {
-                Button("新建文稿", systemImage: "doc.badge.plus") { store.createNote() }
-                Button("新建文件夹", systemImage: "folder.badge.plus") { store.createFolder() }
-                Divider()
-                Button("更换知识库…") { store.chooseLibrary() }
-            } label: {
-                Image(systemName: "plus")
+            if contentMode == .outline {
+                Button {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        contentMode = .library
+                    }
+                } label: {
+                    Image(systemName: "books.vertical")
+                }
+                .buttonStyle(.plain)
+                .help("返回文库")
+            } else {
+                Menu {
+                    Button("新建文稿", systemImage: "doc.badge.plus") { store.createNote() }
+                    Button("新建文件夹", systemImage: "folder.badge.plus") { store.createFolder() }
+                    Divider()
+                    Button("更换知识库…") { store.chooseLibrary() }
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
         }
         .font(.caption)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .frame(height: 34)
+    }
+
+    private var outlineRefreshID: String {
+        "\(store.selectedDocument?.id ?? "none"):\(store.editorContentRevision)"
+    }
+
+    private func refreshOutline() async {
+        guard let documentID = store.selectedDocument?.id else {
+            outlineItems = []
+            return
+        }
+        let source = store.editorText
+        let parsed = await Task.detached(priority: .userInitiated) {
+            DocumentOutlineParser.parse(source)
+        }.value
+        guard !Task.isCancelled,
+              store.selectedDocument?.id == documentID,
+              store.editorText == source else { return }
+        withAnimation(.easeOut(duration: 0.2)) {
+            outlineItems = parsed
+            if let selectedOutlineItemID,
+               !parsed.contains(where: { $0.id == selectedOutlineItemID }) {
+                self.selectedOutlineItemID = nil
+            }
+        }
+    }
+
+    private var selectedDocumentIsSubtitle: Bool {
+        store.selectedDocument?.url.pathExtension.lowercased() == "srt"
     }
 
     private func noteRow(

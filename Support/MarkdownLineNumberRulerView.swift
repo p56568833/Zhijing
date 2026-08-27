@@ -60,8 +60,12 @@ final class MarkdownLineNumberRulerView: NSRulerView {
     override func drawHashMarksAndLabels(in rect: NSRect) {
         guard let textView else { return }
 
-        NSColor.windowBackgroundColor.setFill()
+        ZhijingTheme.gutterNSColor.setFill()
         bounds.fill()
+
+        ZhijingTheme.hairlineNSColor.setFill()
+        NSRect(x: bounds.maxX - 1, y: bounds.minY, width: 1, height: bounds.height)
+            .fill()
 
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),

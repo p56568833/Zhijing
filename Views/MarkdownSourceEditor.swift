@@ -3,18 +3,23 @@ import SwiftUI
 
 final class MarkdownEditorTextView: NSTextView {
     var markdownLinks: [MarkdownEditorLink] = []
-    var onAIEditAction: ((AISelectionEditAction) -> Void)?
-    var onRequestAnnotation: ((EditorTextSelection) -> Void)?
     var onFindCommand: ((DocumentFindCommand) -> Void)?
     var annotationDocumentID: String?
     private var linkTrackingArea: NSTrackingArea?
-    private var selectionAnnotationButton: NSButton?
+    private var selectionAnnotationButton: SelectionAnnotationButton?
+    private var selectionMarkButtons: [InlineTextMarkKind: SelectionMarkButton] = [:]
+    private var selectionClearMarkButton: SelectionMarkButton?
+    private var textMarkSyntaxVisibilityController:
+        MarkdownTextMarkSyntaxVisibilityController?
+    private var annotationPopover: NSPopover?
     private var resolvedAnnotations: [ResolvedTextAnnotation] = []
     private var highlightedAnnotationRanges: [NSRange] = []
     private var pendingTextMutation: EditorTextMutation?
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
+            annotationPopover?.close()
+            annotationPopover = nil
             discardUndoHistory()
         }
         super.viewWillMove(toWindow: newWindow)
@@ -197,12 +202,18 @@ final class MarkdownEditorTextView: NSTextView {
             onFindCommand?(modifiers.contains(.shift) ? .previous : .next)
             return true
         }
+        if characters == "h", modifiers.contains(.shift) {
+            _ = applyTextMark(.highlight)
+            return true
+        }
         return super.performKeyEquivalent(with: event)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event) ?? NSMenu()
         guard selectedRange().length > 0 else { return menu }
+        menu.addItem(.separator())
+        appendTextMarkItems(to: menu)
         menu.addItem(.separator())
         let annotationItem = NSMenuItem(
             title: "添加批注…",
@@ -211,46 +222,186 @@ final class MarkdownEditorTextView: NSTextView {
         )
         annotationItem.target = self
         menu.addItem(annotationItem)
-        let parent = NSMenuItem(
-            title: "AI 修改所选内容",
-            action: nil,
-            keyEquivalent: ""
-        )
-        let submenu = NSMenu(title: "AI 修改所选内容")
-        for action in AISelectionEditAction.allCases {
-            let item = NSMenuItem(
-                title: action.title,
-                action: #selector(performAISelectionEdit(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = action.rawValue
-            submenu.addItem(item)
-            if action == .logic {
-                submenu.addItem(.separator())
-            }
-        }
-        parent.submenu = submenu
-        menu.addItem(parent)
         return menu
     }
 
-    @objc private func performAISelectionEdit(_ sender: NSMenuItem) {
-        guard let rawValue = sender.representedObject as? String,
-              let action = AISelectionEditAction(rawValue: rawValue) else { return }
-        onAIEditAction?(action)
-    }
-
     func updateSelectionAnnotationButton() {
+        updateTextMarkSyntaxVisibility()
         let range = selectedRange()
         guard range.length > 0,
               NSMaxRange(range) <= (string as NSString).length else {
             selectionAnnotationButton?.isHidden = true
+            selectionMarkButtons.values.forEach { $0.isHidden = true }
+            selectionClearMarkButton?.isHidden = true
             return
         }
-        let button = selectionAnnotationButton ?? makeSelectionAnnotationButton()
-        button.isHidden = false
+        let annotationButton = selectionAnnotationButton
+            ?? makeSelectionAnnotationButton()
+        if selectionMarkButtons.isEmpty {
+            selectionMarkButtons = makeSelectionMarkButtons()
+        }
+        let clearButton = selectionClearMarkButton
+            ?? makeSelectionClearMarkButton()
+        let activeKind = InlineTextMarkMarkdown.kind(
+            in: string,
+            at: range
+        )
+        let canApplyTextMark = activeKind != nil || InlineTextMarkMarkdown.mutation(
+            in: string,
+            selection: range,
+            applying: .highlight
+        ) != nil
+        for (kind, button) in selectionMarkButtons {
+            button.isHidden = false
+            button.isEnabled = canApplyTextMark
+            button.isActive = activeKind == kind
+        }
+        clearButton.isHidden = false
+        clearButton.isEnabled = activeKind != nil
+        clearButton.isActive = false
+        annotationButton.isHidden = false
         layoutSelectionAnnotationButton()
+    }
+
+    func enableTextMarkSyntaxFolding() {
+        guard textMarkSyntaxVisibilityController == nil,
+              let layoutManager else { return }
+        let controller = MarkdownTextMarkSyntaxVisibilityController()
+        controller.connect(to: layoutManager)
+        textMarkSyntaxVisibilityController = controller
+        updateTextMarkSyntaxVisibility()
+    }
+
+    private func updateTextMarkSyntaxVisibility() {
+        guard let textMarkSyntaxVisibilityController else { return }
+        let selection = selectedRange()
+        let hiddenRanges = InlineTextMarkMarkdown.spans(in: string).flatMap { span in
+            shouldRevealTextMarkSyntax(span, selection: selection)
+                ? []
+                : [span.prefixRange, span.suffixRange]
+        }
+        textMarkSyntaxVisibilityController.updateHiddenRanges(
+            hiddenRanges,
+            textLength: (string as NSString).length
+        )
+    }
+
+    private func shouldRevealTextMarkSyntax(
+        _ span: InlineTextMarkSpan,
+        selection: NSRange
+    ) -> Bool {
+        if selection.length == 0 {
+            return selection.location >= span.fullRange.location
+                && selection.location < NSMaxRange(span.fullRange)
+        }
+        return NSIntersectionRange(selection, span.fullRange).length > 0
+    }
+
+    @objc private func applyTextMarkFromMenu(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let kind = InlineTextMarkKind(rawValue: rawValue) else { return }
+        _ = applyTextMark(kind)
+    }
+
+    @objc private func applyTextMarkFromButton(_ sender: SelectionMarkButton) {
+        guard let kind = sender.kind else { return }
+        _ = applyTextMark(kind)
+    }
+
+    @objc private func clearTextMark(_ sender: Any?) {
+        _ = applyTextMark(nil)
+    }
+
+    @discardableResult
+    private func applyTextMark(_ kind: InlineTextMarkKind?) -> Bool {
+        let selection = selectedRange()
+        guard let mutation = InlineTextMarkMarkdown.mutation(
+            in: string,
+            selection: selection,
+            applying: kind
+        ), shouldChangeText(
+            in: mutation.range,
+            replacementString: mutation.replacementText
+        ) else {
+            NSSound.beep()
+            return false
+        }
+
+        textStorage?.replaceCharacters(
+            in: mutation.range,
+            with: mutation.replacementText
+        )
+        didChangeText()
+        setSelectedRange(mutation.selectionRange)
+        scrollRangeToVisible(mutation.selectionRange)
+        window?.makeFirstResponder(self)
+        updateSelectionAnnotationButton()
+        return true
+    }
+
+    private func appendTextMarkItems(to menu: NSMenu) {
+        menu.autoenablesItems = false
+        let activeKind = InlineTextMarkMarkdown.kind(
+            in: string,
+            at: selectedRange()
+        )
+        let canApplyTextMark = activeKind != nil || InlineTextMarkMarkdown.mutation(
+            in: string,
+            selection: selectedRange(),
+            applying: .highlight
+        ) != nil
+
+        for kind in InlineTextMarkKind.allCases {
+            let item = NSMenuItem(
+                title: kind.title,
+                action: #selector(applyTextMarkFromMenu(_:)),
+                keyEquivalent: kind == .highlight ? "h" : ""
+            )
+            if kind == .highlight {
+                item.keyEquivalentModifierMask = [.command, .shift]
+            }
+            item.target = self
+            item.representedObject = kind.rawValue
+            item.state = activeKind == kind ? .on : .off
+            item.isEnabled = canApplyTextMark
+            item.toolTip = kind.accessibilityDescription
+            styleTextMarkMenuItem(item, kind: kind)
+            menu.addItem(item)
+        }
+
+        let clearItem = NSMenuItem(
+            title: "清除标记",
+            action: #selector(clearTextMark(_:)),
+            keyEquivalent: ""
+        )
+        clearItem.target = self
+        clearItem.isEnabled = activeKind != nil
+        menu.addItem(clearItem)
+    }
+
+    private func styleTextMarkMenuItem(
+        _ item: NSMenuItem,
+        kind: InlineTextMarkKind
+    ) {
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+        ]
+        switch kind {
+        case .highlight:
+            attributes[.backgroundColor] = ZhijingTheme.highlightNSColor
+                .withAlphaComponent(0.36)
+        case .important:
+            attributes[.foregroundColor] = ZhijingTheme.importantNSColor
+        case .concept:
+            attributes[.foregroundColor] = ZhijingTheme.conceptNSColor
+        case .underline:
+            attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            attributes[.underlineColor] = ZhijingTheme.underlineNSColor
+        }
+        item.attributedTitle = NSAttributedString(
+            string: item.title,
+            attributes: attributes
+        )
     }
 
     func updateAnnotations(_ annotations: [ResolvedTextAnnotation]) {
@@ -280,8 +431,8 @@ final class MarkdownEditorTextView: NSTextView {
             layoutManager.addTemporaryAttributes(
                 [
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
-                    .underlineColor: NSColor.systemOrange.withAlphaComponent(0.7),
-                    .backgroundColor: NSColor.systemYellow.withAlphaComponent(0.12)
+                    .underlineColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.7),
+                    .backgroundColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.075)
                 ],
                 forCharacterRange: range
             )
@@ -297,8 +448,68 @@ final class MarkdownEditorTextView: NSTextView {
             NSSound.beep()
             return
         }
-        selectionAnnotationButton?.isHidden = true
-        onRequestAnnotation?(selection)
+        presentInlineAnnotationComposer(for: selection)
+    }
+
+    func presentInlineAnnotationComposer() {
+        guard let selection = currentEditorSelection() else {
+            NSSound.beep()
+            return
+        }
+        presentInlineAnnotationComposer(for: selection)
+    }
+
+    private func presentInlineAnnotationComposer(
+        for selection: EditorTextSelection
+    ) {
+        annotationPopover?.close()
+        updateSelectionAnnotationButton()
+        guard let button = selectionAnnotationButton else { return }
+
+        let popover = NSPopover()
+        popover.behavior = .semitransient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 400, height: 310)
+        popover.contentViewController = NSHostingController(
+            rootView: InlineAnnotationComposerView(
+                selectedText: selection.text,
+                onSave: { [weak self, weak popover] text in
+                    popover?.close()
+                    self?.insertInlineAnnotation(text, for: selection.range)
+                },
+                onCancel: { [weak popover] in
+                    popover?.close()
+                }
+            )
+        )
+        annotationPopover = popover
+        popover.show(
+            relativeTo: button.bounds,
+            of: button,
+            preferredEdge: .maxY
+        )
+    }
+
+    @discardableResult
+    func insertInlineAnnotation(_ text: String, for selection: NSRange) -> Bool {
+        guard let insertion = InlineAnnotationMarkdown.insertion(
+            in: string,
+            selection: selection,
+            annotation: text
+        ), shouldChangeText(
+            in: insertion.range,
+            replacementString: insertion.replacementText
+        ) else { return false }
+
+        textStorage?.replaceCharacters(
+            in: insertion.range,
+            with: insertion.replacementText
+        )
+        didChangeText()
+        setSelectedRange(NSRange(location: insertion.cursorLocation, length: 0))
+        scrollRangeToVisible(selectedRange())
+        window?.makeFirstResponder(self)
+        return true
     }
 
     private func currentEditorSelection() -> EditorTextSelection? {
@@ -315,40 +526,69 @@ final class MarkdownEditorTextView: NSTextView {
         )
     }
 
-    private func makeSelectionAnnotationButton() -> NSButton {
-        let button = NSButton(
-            title: "",
-            target: self,
-            action: #selector(showAnnotationComposer(_:))
-        )
-        button.image = NSImage(
-            systemSymbolName: "text.bubble",
-            accessibilityDescription: "添加批注"
-        )
-        button.imagePosition = .imageOnly
-        button.bezelStyle = .roundRect
-        button.controlSize = .small
-        button.toolTip = "添加批注（⇧⌘M）"
-        button.frame.size = NSSize(width: 30, height: 24)
+    private func makeSelectionAnnotationButton() -> SelectionAnnotationButton {
+        let button = SelectionAnnotationButton()
+        button.target = self
+        button.action = #selector(showAnnotationComposer(_:))
         addSubview(button)
         selectionAnnotationButton = button
         return button
     }
 
+    private func makeSelectionMarkButtons(
+    ) -> [InlineTextMarkKind: SelectionMarkButton] {
+        var buttons: [InlineTextMarkKind: SelectionMarkButton] = [:]
+        for kind in InlineTextMarkKind.allCases {
+            let button = SelectionMarkButton(kind: kind)
+            button.target = self
+            button.action = #selector(applyTextMarkFromButton(_:))
+            addSubview(button)
+            buttons[kind] = button
+        }
+        return buttons
+    }
+
+    private func makeSelectionClearMarkButton() -> SelectionMarkButton {
+        let button = SelectionMarkButton(clearAction: ())
+        button.target = self
+        button.action = #selector(clearTextMark(_:))
+        addSubview(button)
+        selectionClearMarkButton = button
+        return button
+    }
+
     private func layoutSelectionAnnotationButton() {
-        guard let button = selectionAnnotationButton,
-              !button.isHidden,
+        guard let annotationButton = selectionAnnotationButton,
+              let clearButton = selectionClearMarkButton,
+              !annotationButton.isHidden,
+              !clearButton.isHidden,
               let rect = cursorRectsForSelection().last else { return }
+        var buttons: [NSButton] = InlineTextMarkKind.allCases.compactMap {
+            selectionMarkButtons[$0]
+        }
+        buttons.append(annotationButton)
+        buttons.append(clearButton)
         let visible = visibleRect
+        let spacing: CGFloat = 3
+        let groupWidth = buttons.reduce(0) { $0 + $1.frame.width }
+            + spacing * CGFloat(max(0, buttons.count - 1))
+        let maximumX = max(
+            visible.minX + 8,
+            visible.maxX - groupWidth - 8
+        )
         let x = min(
             max(visible.minX + 8, rect.maxX + 7),
-            visible.maxX - button.frame.width - 36
+            maximumX
         )
-        var y = rect.minY - button.frame.height - 5
+        var y = rect.minY - annotationButton.frame.height - 5
         if y < visible.minY + 4 {
             y = rect.maxY + 5
         }
-        button.setFrameOrigin(NSPoint(x: x, y: y))
+        var buttonX = x
+        for button in buttons {
+            button.setFrameOrigin(NSPoint(x: buttonX, y: y))
+            buttonX += button.frame.width + spacing
+        }
     }
 
     private func cursorRectsForSelection() -> [NSRect] {
@@ -370,12 +610,11 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     let findOptions: DocumentFindOptions
     let findNavigationRequest: DocumentFindNavigationRequest?
     let annotations: [ResolvedTextAnnotation]
+    let inlineAnnotationRequestID: Int
     let onChange: (String, EditorTextMutation?) -> Void
     let onSelectionChange: (EditorTextSelection?) -> Void
     let onFindResultChange: (DocumentFindResult) -> Void
     let onFindCommand: (DocumentFindCommand) -> Void
-    let onAIEditAction: (AISelectionEditAction) -> Void
-    let onRequestAnnotation: (EditorTextSelection) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -389,8 +628,6 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         let scrollView = makeScrollView()
         let textView = makeTextView(in: scrollView)
         textView.delegate = context.coordinator
-        textView.onAIEditAction = onAIEditAction
-        textView.onRequestAnnotation = onRequestAnnotation
         textView.annotationDocumentID = documentID
         textView.onFindCommand = onFindCommand
         scrollView.documentView = textView
@@ -427,8 +664,6 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         guard let textView = scrollView.documentView as? MarkdownEditorTextView else {
             return
         }
-        textView.onAIEditAction = onAIEditAction
-        textView.onRequestAnnotation = onRequestAnnotation
         textView.annotationDocumentID = documentID
         textView.onFindCommand = onFindCommand
         context.coordinator.synchronize(
@@ -447,6 +682,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             in: textView
         )
         textView.updateAnnotations(annotations)
+        context.coordinator.presentInlineAnnotationIfNeeded(
+            requestID: inlineAnnotationRequestID,
+            in: textView
+        )
     }
 
     static func dismantleNSView(
@@ -460,8 +699,6 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         textView.discardUndoHistory()
         textView.allowsUndo = false
         textView.delegate = nil
-        textView.onAIEditAction = nil
-        textView.onRequestAnnotation = nil
         textView.onFindCommand = nil
         scrollView.documentView = nil
     }
@@ -469,7 +706,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     private func makeScrollView() -> NSScrollView {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = ZhijingTheme.paperNSColor
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
@@ -478,6 +715,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
     private func makeTextView(in scrollView: NSScrollView) -> MarkdownEditorTextView {
         let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+        textView.enableTextMarkSyntaxFolding()
         textView.isEditable = true
         textView.isSelectable = true
         textView.isRichText = false
@@ -523,6 +761,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private(set) var contentRevision: Int?
         private var navigationRequestID: UUID?
         private var findNavigationRequestID: UUID?
+        private var inlineAnnotationRequestID = 0
         private var isApplyingExternalContent = false
         private var presentationTask: Task<Void, Never>?
         private var presentationGeneration = 0
@@ -743,6 +982,16 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             }
             textView.showFindIndicator(for: selection)
             textView.window?.makeFirstResponder(textView)
+        }
+
+        func presentInlineAnnotationIfNeeded(
+            requestID: Int,
+            in textView: MarkdownEditorTextView
+        ) {
+            guard requestID > 0,
+                  requestID != inlineAnnotationRequestID else { return }
+            inlineAnnotationRequestID = requestID
+            textView.presentInlineAnnotationComposer()
         }
 
         private func position(
@@ -1037,7 +1286,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 layoutManager.addTemporaryAttributes(
                     [
                         .backgroundColor: isCurrent
-                            ? NSColor.systemOrange.withAlphaComponent(0.34)
+                            ? ZhijingTheme.annotationNSColor.withAlphaComponent(0.34)
                             : NSColor.systemYellow.withAlphaComponent(0.25)
                     ],
                     forCharacterRange: range

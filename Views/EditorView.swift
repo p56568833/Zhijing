@@ -15,6 +15,7 @@ struct EditorView: View {
         default: 300,
         range: 270...380
     )
+    @State private var isLegacyAnnotationPaneVisible = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,9 +58,15 @@ struct EditorView: View {
             Divider()
             DocumentMetricsBar(store: store)
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(ZhijingTheme.paper)
         .sheet(isPresented: $showVersions) {
             VersionHistoryView(store: store)
+        }
+        .onChange(of: store.selectedDocument?.id) {
+            isLegacyAnnotationPaneVisible = false
+        }
+        .onChange(of: store.isPreviewMode) {
+            store.editorSelectionDidChange(nil)
         }
     }
 
@@ -79,64 +86,20 @@ struct EditorView: View {
                 .help("查找当前文稿（⌘F）")
                 .buttonStyle(.plain)
                 .disabled(store.editProposal != nil)
-                Button {
-                    showVersions.toggle()
-                } label: {
-                    Label("版本", systemImage: "clock.arrow.circlepath")
-                        .labelStyle(.iconOnly)
-                }
-                .help("版本历史")
-                .buttonStyle(.plain)
-                .disabled(store.editProposal != nil)
-                Button {
-                    store.toggleComparison()
-                } label: {
-                    Label(
-                        store.isComparisonVisible ? "关闭对照" : "分屏对照",
-                        systemImage: "rectangle.split.2x1"
-                    )
-                    .labelStyle(.iconOnly)
-                }
-                .help("左右分屏对照另一篇文稿")
-                .buttonStyle(.plain)
-                .disabled(store.editProposal != nil)
-                Button {
-                    if store.currentAnnotations.isEmpty,
-                       store.annotationComposerRequest == nil {
-                        store.requestAnnotationComposer()
-                    } else {
-                        store.toggleAnnotationRail()
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: isAnnotationPanePresented
-                              ? "text.bubble.fill"
-                              : "text.bubble")
-                        if !store.currentAnnotations.isEmpty {
-                            Text("\(store.currentAnnotations.count)")
-                                .font(.caption2.monospacedDigit())
-                        }
-                    }
-                }
-                .accessibilityLabel("批注")
-                .help(annotationButtonHelp)
-                .buttonStyle(.plain)
-                .foregroundStyle(isAnnotationPanePresented ? Color.orange : Color.primary)
-                .disabled(store.editProposal != nil)
-                Menu {
-                    Button("导出 PDF…") {
-                        store.exportCurrentDocument(as: .pdf)
-                    }
-                    Button("导出 Word…") {
-                        store.exportCurrentDocument(as: .word)
-                    }
-                } label: {
-                    Label("导出", systemImage: "square.and.arrow.up")
-                        .labelStyle(.iconOnly)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(store.editProposal != nil)
+                DocumentActionsMenu(
+                    isComparisonVisible: store.isComparisonVisible,
+                    legacyAnnotationCount: store.currentAnnotations.count,
+                    isLegacyAnnotationPaneVisible: legacyAnnotationPanePresented,
+                    isDisabled: store.editProposal != nil,
+                    showVersions: { showVersions = true },
+                    toggleComparison: store.toggleComparison,
+                    addAnnotation: store.requestAnnotationComposer,
+                    toggleLegacyAnnotations: {
+                        isLegacyAnnotationPaneVisible.toggle()
+                    },
+                    exportPDF: { store.exportCurrentDocument(as: .pdf) },
+                    exportWord: { store.exportCurrentDocument(as: .word) }
+                )
                 Picker("编辑模式", selection: $store.isPreviewMode) {
                     Text("编辑").tag(false)
                     Text("阅读").tag(true)
@@ -149,7 +112,7 @@ struct EditorView: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 40)
-        .background(.bar)
+        .background(ZhijingTheme.chrome)
     }
 
     @ViewBuilder
@@ -158,7 +121,7 @@ struct EditorView: View {
             primaryEditor
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if let document = store.selectedDocument,
-               isAnnotationPanePresented {
+               legacyAnnotationPanePresented {
                 ResizablePaneDivider(
                     paneWidth: $annotationPaneWidth,
                     range: 270...380,
@@ -170,40 +133,33 @@ struct EditorView: View {
                 AnnotationRailView(
                     documentTitle: document.title,
                     items: store.currentAnnotationDisplayItems,
-                    composerRequest: store.annotationComposerRequest,
-                    onCreate: { text, selection in
-                        store.addAnnotation(text: text, selection: selection)
-                    },
-                    onCancelComposer: store.cancelAnnotationComposer,
+                    composerRequest: nil,
+                    onCreate: { _, _ in },
+                    onCancelComposer: {},
                     onReveal: store.revealAnnotation,
                     onUpdate: store.updateAnnotation,
                     onToggleResolved: store.toggleAnnotationResolution,
                     onRelink: store.relinkAnnotation,
                     onDelete: store.deleteAnnotation,
-                    onClose: store.toggleAnnotationRail
+                    onClose: { isLegacyAnnotationPaneVisible = false }
                 )
                 .frame(width: annotationPaneWidth)
             }
         }
     }
 
-    private var isAnnotationPanePresented: Bool {
-        store.isAnnotationRailVisible
-            && (!store.currentAnnotationDisplayItems.isEmpty
-                || store.annotationComposerRequest != nil)
-    }
-
-    private var annotationButtonHelp: String {
-        if isAnnotationPanePresented { return "隐藏批注" }
-        if store.currentAnnotations.isEmpty { return "选中文字后添加批注（⇧⌘M）" }
-        return "显示批注"
+    private var legacyAnnotationPanePresented: Bool {
+        isLegacyAnnotationPaneVisible && !store.currentAnnotationDisplayItems.isEmpty
     }
 
     @ViewBuilder
     private var primaryEditor: some View {
         if let document = store.selectedDocument {
             if store.isPreviewMode {
-                MarkdownReadingView(text: store.editorText)
+                MarkdownReadingView(
+                    text: store.editorText,
+                    onSelectionChange: store.readingSelectionDidChange
+                )
             } else {
                 MarkdownSourceEditor(
                     text: store.editorText,
@@ -213,12 +169,11 @@ struct EditorView: View {
                     findOptions: store.documentFindOptions,
                     findNavigationRequest: store.documentFindNavigationRequest,
                     annotations: store.currentResolvedAnnotations,
+                    inlineAnnotationRequestID: store.inlineAnnotationRequestID,
                     onChange: store.editorDidChange,
                     onSelectionChange: store.editorSelectionDidChange,
                     onFindResultChange: store.updateDocumentFindResult,
-                    onFindCommand: store.handleDocumentFindCommand,
-                    onAIEditAction: store.handleSelectionEditAction,
-                    onRequestAnnotation: store.beginAnnotation
+                    onFindCommand: store.handleDocumentFindCommand
                 )
                 .accessibilityLabel("\(document.title) 编辑器")
             }

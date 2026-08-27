@@ -86,7 +86,21 @@ struct ResizablePaneDivider: View {
         }
         .accessibilityElement()
         .accessibilityLabel("调整分栏宽度")
-        .accessibilityHint("左右拖动")
+        .accessibilityValue("\(Int(paneWidth)) 点")
+        .accessibilityHint("左右拖动，或使用辅助功能增减宽度")
+        .accessibilityAdjustableAction { direction in
+            let newWidth: Double
+            switch direction {
+            case .increment:
+                newWidth = min(range.upperBound, paneWidth + 20)
+            case .decrement:
+                newWidth = max(range.lowerBound, paneWidth - 20)
+            @unknown default:
+                return
+            }
+            paneWidth = min(range.upperBound, max(range.lowerBound, newWidth))
+            onDragEnded?(paneWidth)
+        }
     }
 
     @discardableResult

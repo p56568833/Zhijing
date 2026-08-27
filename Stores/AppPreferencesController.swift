@@ -29,9 +29,6 @@ final class AppPreferencesController {
     var favorites: Set<String> {
         didSet { defaults.set(Array(favorites), forKey: Keys.favorites) }
     }
-    var isAssistantVisible: Bool {
-        didSet { defaults.set(isAssistantVisible, forKey: Keys.assistantVisible) }
-    }
     var isSidebarVisible: Bool {
         didSet { defaults.set(isSidebarVisible, forKey: Keys.sidebarVisible) }
     }
@@ -52,9 +49,6 @@ final class AppPreferencesController {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         favorites = Set(defaults.stringArray(forKey: Keys.favorites) ?? [])
-        isAssistantVisible = defaults.object(
-            forKey: Keys.assistantVisible
-        ) as? Bool ?? true
         isSidebarVisible = defaults.object(
             forKey: Keys.sidebarVisible
         ) as? Bool ?? true
@@ -72,7 +66,6 @@ final class AppPreferencesController {
     private enum Keys {
         static let favorites = "favorites"
         static let excludedFolders = "excludedFolders"
-        static let assistantVisible = "assistantVisible"
         static let sidebarVisible = "sidebarVisible"
         static let annotationRailVisible = "annotationRailVisible"
         static let colorScheme = "colorScheme"

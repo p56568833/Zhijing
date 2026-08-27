@@ -3,23 +3,28 @@ import SwiftUI
 
 struct MarkdownReadingView: View {
     let text: String
+    var onSelectionChange: (String?) -> Void = { _ in }
 
     var body: some View {
-        MarkdownSelectableReadingView(text: text)
+        MarkdownSelectableReadingView(
+            text: text,
+            onSelectionChange: onSelectionChange
+        )
     }
 }
 
 private struct MarkdownSelectableReadingView: NSViewRepresentable {
     let text: String
+    let onSelectionChange: (String?) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onSelectionChange: onSelectionChange)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = ZhijingTheme.paperNSColor
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
@@ -46,6 +51,7 @@ private struct MarkdownSelectableReadingView: NSViewRepresentable {
         )
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineFragmentPadding = 0
+        textView.delegate = context.coordinator
         scrollView.documentView = textView
         context.coordinator.render(text, into: textView)
         return scrollView
@@ -58,9 +64,27 @@ private struct MarkdownSelectableReadingView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         var source: String?
         private var renderTask: Task<Void, Never>?
+        private let onSelectionChange: (String?) -> Void
+
+        init(onSelectionChange: @escaping (String?) -> Void) {
+            self.onSelectionChange = onSelectionChange
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            let range = textView.selectedRange()
+            guard range.length > 0,
+                  NSMaxRange(range) <= (textView.string as NSString).length else {
+                onSelectionChange(nil)
+                return
+            }
+            onSelectionChange(
+                (textView.string as NSString).substring(with: range)
+            )
+        }
 
         func render(_ text: String, into textView: MarkdownReadingTextView) {
             guard source != text else { return }
@@ -165,7 +189,7 @@ enum MarkdownReadingAttributedRenderer {
                         ofSize: size,
                         weight: level <= 2 ? .bold : .semibold
                     ),
-                    color: .systemBlue,
+                    color: ZhijingTheme.accentNSColor,
                     spacingBefore: level == 1 ? 4 : 14,
                     spacingAfter: level == 1 ? 18 : 9
                 )
@@ -182,12 +206,14 @@ enum MarkdownReadingAttributedRenderer {
                     "│  \(block.content)",
                     to: result,
                     font: .systemFont(ofSize: 16).italic,
-                    color: .systemGreen,
-                    backgroundColor: .systemGreen.withAlphaComponent(0.055),
+                    color: ZhijingTheme.quoteNSColor,
+                    backgroundColor: ZhijingTheme.quoteNSColor.withAlphaComponent(0.05),
                     leftIndent: 14,
                     spacingBefore: 10,
                     spacingAfter: 14
                 )
+            case .annotation:
+                appendAnnotation(block.content, to: result)
             case .unorderedList(let indentation):
                 append(
                     "•  \(block.content)",
@@ -213,7 +239,7 @@ enum MarkdownReadingAttributedRenderer {
                     block.content,
                     to: result,
                     font: .monospacedSystemFont(ofSize: 14, weight: .regular),
-                    color: .systemPurple,
+                    color: ZhijingTheme.codeNSColor,
                     backgroundColor: .secondaryLabelColor.withAlphaComponent(0.08),
                     leftIndent: 14,
                     lineSpacing: 3,
@@ -225,7 +251,7 @@ enum MarkdownReadingAttributedRenderer {
                     "────────────────────────────────────────",
                     to: result,
                     font: .systemFont(ofSize: 10),
-                    color: .systemBlue.withAlphaComponent(0.3),
+                    color: ZhijingTheme.accentNSColor.withAlphaComponent(0.28),
                     spacingBefore: 20,
                     spacingAfter: 20
                 )
@@ -234,6 +260,51 @@ enum MarkdownReadingAttributedRenderer {
             }
         }
         return result
+    }
+
+    private static func appendAnnotation(
+        _ source: String,
+        to result: NSMutableAttributedString
+    ) {
+        var lines = source.components(separatedBy: .newlines)
+        let context = lines.first ?? ""
+        if !lines.isEmpty { lines.removeFirst() }
+        while lines.first?.isEmpty == true { lines.removeFirst() }
+        let body = lines.joined(separator: "\n")
+        let background = ZhijingTheme.annotationNSColor.withAlphaComponent(0.045)
+
+        append(
+            "●  批注",
+            to: result,
+            font: .systemFont(ofSize: 13, weight: .semibold),
+            color: ZhijingTheme.annotationNSColor,
+            backgroundColor: background,
+            leftIndent: 16,
+            spacingBefore: 10,
+            spacingAfter: 4
+        )
+        if !context.isEmpty {
+            append(
+                context,
+                to: result,
+                font: .systemFont(ofSize: 13),
+                color: .secondaryLabelColor,
+                backgroundColor: background,
+                leftIndent: 30,
+                lineSpacing: 3,
+                spacingAfter: 7
+            )
+        }
+        append(
+            body,
+            to: result,
+            font: .systemFont(ofSize: 15.5),
+            color: .labelColor,
+            backgroundColor: background,
+            leftIndent: 30,
+            lineSpacing: 5,
+            spacingAfter: 16
+        )
     }
 
     private static func append(
@@ -292,6 +363,10 @@ enum MarkdownReadingAttributedRenderer {
                 )
             }
         }
+        InlineTextMarkAttributedRenderer.applyStyles(
+            to: rendered,
+            context: .screen
+        )
         rendered.append(NSAttributedString(string: "\n"))
         result.append(rendered)
     }
@@ -299,15 +374,7 @@ enum MarkdownReadingAttributedRenderer {
     private static func inlineMarkdown(
         _ source: String
     ) -> NSMutableAttributedString {
-        guard let attributed = try? AttributedString(
-            markdown: source,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) else {
-            return NSMutableAttributedString(string: source)
-        }
-        return NSMutableAttributedString(
-            attributedString: NSAttributedString(attributed)
-        )
+        InlineTextMarkAttributedRenderer.renderInlineMarkdown(source)
     }
 }
 
@@ -316,6 +383,7 @@ struct MarkdownReadingBlock: Identifiable {
         case heading(level: Int)
         case paragraph
         case quote
+        case annotation
         case unorderedList(indentation: Int)
         case orderedList(marker: String, indentation: Int)
         case code
@@ -334,7 +402,9 @@ enum MarkdownReadingParser {
         var blocks: [MarkdownReadingBlock] = []
         var paragraphLines: [String] = []
         var codeLines: [String] = []
+        var annotationLines: [String] = []
         var isInsideCodeFence = false
+        var isInsideAnnotation = false
 
         func append(_ kind: MarkdownReadingBlock.Kind, _ content: String = "") {
             blocks.append(.init(id: blocks.count, kind: kind, content: content))
@@ -346,8 +416,29 @@ enum MarkdownReadingParser {
             paragraphLines.removeAll(keepingCapacity: true)
         }
 
+        func flushAnnotation() {
+            guard isInsideAnnotation else { return }
+            while annotationLines.last?.isEmpty == true {
+                annotationLines.removeLast()
+            }
+            append(.annotation, annotationLines.joined(separator: "\n"))
+            annotationLines.removeAll(keepingCapacity: true)
+            isInsideAnnotation = false
+        }
+
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if isInsideAnnotation {
+                if trimmed.hasPrefix(">") {
+                    annotationLines.append(
+                        String(trimmed.dropFirst())
+                            .trimmingCharacters(in: .whitespaces)
+                    )
+                    continue
+                }
+                flushAnnotation()
+            }
 
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 flushParagraph()
@@ -378,6 +469,9 @@ enum MarkdownReadingParser {
             } else if isDivider(trimmed) {
                 flushParagraph()
                 append(.divider)
+            } else if InlineAnnotationMarkdown.isHeading(trimmed) {
+                flushParagraph()
+                isInsideAnnotation = true
             } else if trimmed.hasPrefix(">") {
                 flushParagraph()
                 let content = String(trimmed.dropFirst())
@@ -401,6 +495,7 @@ enum MarkdownReadingParser {
         }
 
         flushParagraph()
+        flushAnnotation()
         if isInsideCodeFence && !codeLines.isEmpty {
             append(.code, codeLines.joined(separator: "\n"))
         }

@@ -233,31 +233,6 @@ struct KnowledgeBaseService: Sendable {
         }
     }
 
-    func retrieve(
-        query: String,
-        documents: [NoteDocument],
-        currentDocument: NoteDocument?,
-        scope: RetrievalScope,
-        limit: Int = 6
-    ) -> [RetrievedChunk] {
-        let folder = scope == .currentFolder ? currentDocument?.folder : nil
-        let hits = search(query: query, documents: documents, currentFolder: folder, limit: limit * 3)
-        var acceptedLines: [String: [Int]] = [:]
-        return hits.compactMap { hit in
-            let nearbyLines = acceptedLines[hit.document.relativePath, default: []]
-            guard !nearbyLines.contains(where: { abs($0 - hit.line) <= 2 }) else { return nil }
-            acceptedLines[hit.document.relativePath, default: []].append(hit.line)
-            return RetrievedChunk(
-                filePath: hit.document.relativePath,
-                fileName: hit.document.url.lastPathComponent,
-                heading: nearestHeading(in: hit.document, before: hit.line),
-                text: hit.excerpt,
-                line: hit.line,
-                score: hit.score
-            )
-        }.prefix(limit).map { $0 }
-    }
-
     func createSnapshot(
         text: String,
         document: NoteDocument,
@@ -331,12 +306,6 @@ struct KnowledgeBaseService: Sendable {
             return
         }
         try mergeRevisionDirectory(source, into: destination)
-    }
-
-    private func nearestHeading(in document: NoteDocument, before line: Int) -> String? {
-        searchIndex.heading(in: document, before: line) { document in
-            cachedOrRead(document)
-        }
     }
 
     private func cachedOrRead(_ document: NoteDocument) -> String? {

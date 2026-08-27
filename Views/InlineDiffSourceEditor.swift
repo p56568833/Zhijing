@@ -232,7 +232,7 @@ struct InlineDiffSourceEditor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = ZhijingTheme.paperNSColor
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true

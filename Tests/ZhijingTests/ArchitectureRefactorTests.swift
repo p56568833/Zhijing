@@ -21,12 +21,10 @@ private final class InertLibraryWatcher: LibraryWatching {
     let preferences = AppPreferencesController(defaults: defaults)
 
     preferences.favorites.insert("/tmp/favorite.md")
-    preferences.isAssistantVisible = false
     preferences.colorScheme = .dark
     preferences.excludedFoldersText = ".git, build"
 
     #expect(defaults.stringArray(forKey: "favorites") == ["/tmp/favorite.md"])
-    #expect(defaults.bool(forKey: "assistantVisible") == false)
     #expect(defaults.string(forKey: "colorScheme") == "dark")
     #expect(defaults.string(forKey: "excludedFolders") == ".git, build")
 }
@@ -120,12 +118,27 @@ private final class InertLibraryWatcher: LibraryWatching {
     #expect(state.text == "你好 world")
     #expect(state.contentRevision == 1)
     #expect(state.wordCount == DocumentMetrics(markdown: "你好 world").count)
+    #expect(state.speakingDurationLabel == "不足 1 分钟")
+
+    state.updateSelection(EditorTextSelection(
+        documentID: document.id,
+        range: NSRange(location: 0, length: 2),
+        text: "你好"
+    ))
+    #expect(state.selectionMetrics?.count == 2)
+    #expect(state.selectionMetrics?.speakingDurationLabel == "不足 1 分钟")
+
+    state.updateMetricSelection("阅读模式中的选区")
+    #expect(state.selectionMetrics?.count == 8)
+    state.updateMetricSelection(nil)
+    #expect(state.selectionMetrics == nil)
 
     state.clearDocument()
     #expect(state.selectedDocument == nil)
     #expect(state.text.isEmpty)
     #expect(state.contentRevision == 2)
     #expect(state.wordCount == 0)
+    #expect(state.selectionMetrics == nil)
 }
 
 @MainActor
@@ -285,9 +298,9 @@ private final class InertLibraryWatcher: LibraryWatching {
     controller.proposal = EditProposal(
         documentPath: document.relativePath,
         original: original,
-        replacement: replacement,
-        instruction: "更新内容"
+        replacement: replacement
     )
+    try replacement.write(to: documentURL, atomically: true, encoding: .utf8)
     let hunk = try #require(
         LineDiff(original: original, replacement: replacement).hunks.first
     )
@@ -309,45 +322,7 @@ private final class InertLibraryWatcher: LibraryWatching {
     #expect(controller.proposal == nil)
     #expect(session.loadedText == replacement)
     #expect(try String(contentsOf: documentURL, encoding: .utf8) == replacement)
-    #expect(revisions.revisions.count == 1)
-}
-
-@MainActor
-@Test func aiGenerationControllerOwnsChatMigrationAndPersistence() throws {
-    let root = FileManager.default.temporaryDirectory.appending(
-        path: "AIGenerationControllerTests-\(UUID().uuidString)",
-        directoryHint: .isDirectory
-    )
-    try FileManager.default.createDirectory(
-        at: root,
-        withIntermediateDirectories: true
-    )
-    defer { try? FileManager.default.removeItem(at: root) }
-    let persistence = ChatPersistenceService(directoryOverride: root)
-    let legacyChats = [
-        "/old.md": [ChatMessage(role: .user, text: "保留这段对话")]
-    ]
-    let legacyData = try JSONEncoder().encode(legacyChats)
-    let controller = AIGenerationController(
-        knowledgeBase: KnowledgeBaseService(),
-        persistence: persistence
-    )
-
-    try controller.loadChats(legacyData: legacyData)
-    controller.moveChat(from: "/old.md", to: "/new.md")
-    try controller.saveSynchronously()
-
-    let reloaded = AIGenerationController(
-        knowledgeBase: KnowledgeBaseService(),
-        persistence: persistence
-    )
-    try reloaded.loadChats(legacyData: nil)
-    #expect(reloaded.messages(for: "/old.md").isEmpty)
-    #expect(reloaded.messages(for: "/new.md").map(\.text) == ["保留这段对话"])
-
-    reloaded.clearChat(for: "/new.md")
-    try reloaded.saveSynchronously()
-    #expect(reloaded.messages(for: "/new.md").isEmpty)
+    #expect(revisions.revisions.count == 2)
 }
 
 @MainActor
@@ -426,35 +401,6 @@ private final class InertLibraryWatcher: LibraryWatching {
 }
 
 @MainActor
-@Test func aiSettingsControllerOwnsProviderConfigurationAndSecretWrites() throws {
-    let suiteName = "AISettingsControllerTests-\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-    defaults.set("https://example.com/v1", forKey: "endpoint")
-    defaults.set("custom-model", forKey: "model")
-    var savedKey = ""
-    let controller = AISettingsController(
-        defaults: defaults,
-        loadAPIKey: { "" },
-        saveAPIKey: { savedKey = $0 }
-    )
-
-    #expect(controller.provider == .custom)
-    controller.apiKey = "test-key"
-    #expect(savedKey == "test-key")
-    let customConfiguration = try controller.configuration()
-    #expect(
-        customConfiguration.endpoint.absoluteString
-            == "https://example.com/v1/chat/completions"
-    )
-
-    controller.selectProvider(.deepSeek)
-    #expect(controller.endpoint == "https://api.deepseek.com")
-    #expect(controller.model == AIProviderPreset.deepSeek.defaultModel)
-    #expect(defaults.string(forKey: "provider") == "deepSeek")
-}
-
-@MainActor
 @Test func documentFindControllerKeepsTransitionsConsistent() {
     let controller = DocumentFindController()
     controller.options = DocumentFindOptions(
@@ -521,49 +467,4 @@ private final class InertLibraryWatcher: LibraryWatching {
         text: text + "丙。"
     )
     #expect(cache.cacheMissCount == 2)
-}
-
-@Test func aiContextBuilderKeepsSelectionAndRelevantLongDocumentSections() {
-    let lines = (0..<1_800).map { index in
-        index == 900 ? "目标主题出现在这里" : "普通内容 \(index)"
-    }
-    let text = lines.joined(separator: "\n")
-    let selectionText = "目标主题出现在这里"
-    let selectionRange = (text as NSString).range(of: selectionText)
-    let document = NoteDocument(
-        url: URL(filePath: "/tmp/context.md"),
-        relativePath: "context.md",
-        modifiedAt: .distantPast,
-        size: text.utf8.count
-    )
-    let selection = EditorTextSelection(
-        documentID: document.id,
-        range: selectionRange,
-        text: selectionText
-    )
-
-    let context = AIContextBuilder.answerContext(
-        question: "目标主题",
-        document: document,
-        text: text,
-        selection: selection,
-        annotations: []
-    )
-
-    #expect(context.contains("[当前选区]"))
-    #expect(context.contains(selectionText))
-    #expect(context.contains("[相关片段"))
-    #expect(context.contains("[结尾]"))
-    #expect(context.utf16.count < text.utf16.count)
-}
-
-@Test func aiContextBuilderCalculatesSelectionLineRanges() {
-    let text = "第一行\n第二行\n第三行\n第四行"
-    let range = (text as NSString).range(of: "第二行\n第三行")
-
-    #expect(AIContextBuilder.lineRange(for: range, in: text) == 1..<3)
-    #expect(AIContextBuilder.contains(range, range: NSRange(
-        location: range.location,
-        length: 3
-    )))
 }

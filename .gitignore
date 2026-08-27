@@ -1,4 +1,5 @@
 .build/
+dist/
 知境.app/
 tmp/
 Assets/AppIcon-keyed.png

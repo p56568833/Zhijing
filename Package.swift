@@ -16,6 +16,8 @@ let package = Package(
                 "script",
                 "知境.app",
                 "Assets",
+                "dist",
+                "残梅记",
                 "fm26-expert-skill",
                 "tmp",
                 "知识库笔记软件-MVP产品需求文档.md",

@@ -161,34 +161,6 @@ enum LibraryTreeBuilder {
     }
 }
 
-struct RetrievedChunk: Identifiable, Hashable, Codable, Sendable {
-    let id: UUID
-    let filePath: String
-    let fileName: String
-    let heading: String?
-    let text: String
-    let line: Int
-    let score: Double
-
-    init(
-        id: UUID = UUID(),
-        filePath: String,
-        fileName: String,
-        heading: String?,
-        text: String,
-        line: Int,
-        score: Double
-    ) {
-        self.id = id
-        self.filePath = filePath
-        self.fileName = fileName
-        self.heading = heading
-        self.text = text
-        self.line = line
-        self.score = score
-    }
-}
-
 struct EditorNavigationRequest: Equatable, Sendable {
     let id: UUID
     let documentID: String
@@ -326,81 +298,6 @@ struct DocumentFindNavigationRequest: Equatable, Sendable {
     let direction: DocumentFindDirection
 }
 
-enum AISelectionEditAction: String, CaseIterable, Sendable {
-    case polish
-    case condense
-    case expand
-    case logic
-    case custom
-
-    var title: String {
-        switch self {
-        case .polish: "润色表达"
-        case .condense: "压缩冗余"
-        case .expand: "扩写说明"
-        case .logic: "调整逻辑"
-        case .custom: "自定义修改…"
-        }
-    }
-
-    var instruction: String? {
-        switch self {
-        case .polish: "润色所选内容，使表达清晰自然，保持原意、事实和 Markdown 结构。"
-        case .condense: "压缩所选内容的重复和冗余表达，保留重要信息。"
-        case .expand: "扩写所选内容，只展开已有观点，不添加无来源的新事实。"
-        case .logic: "调整所选内容的论证和句子顺序，使逻辑更清楚。"
-        case .custom: nil
-        }
-    }
-}
-
-struct SelectionEditRequest: Identifiable, Sendable {
-    let id = UUID()
-    let selection: EditorTextSelection
-}
-
-enum MessageRole: String, Codable, Sendable {
-    case user
-    case assistant
-}
-
-struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
-    let id: UUID
-    let role: MessageRole
-    let text: String
-    let createdAt: Date
-    let sources: [RetrievedChunk]
-    let isGeneralKnowledge: Bool
-    let usage: AIUsage?
-    let cost: AIUsageCost?
-
-    init(
-        id: UUID = UUID(),
-        role: MessageRole,
-        text: String,
-        createdAt: Date = .now,
-        sources: [RetrievedChunk] = [],
-        isGeneralKnowledge: Bool = false,
-        usage: AIUsage? = nil,
-        cost: AIUsageCost? = nil
-    ) {
-        self.id = id
-        self.role = role
-        self.text = text
-        self.createdAt = createdAt
-        self.sources = sources
-        self.isGeneralKnowledge = isGeneralKnowledge
-        self.usage = usage
-        self.cost = cost
-    }
-}
-
-enum RetrievalScope: String, CaseIterable, Identifiable, Codable, Sendable {
-    case library = "整个知识库"
-    case currentFolder = "当前文件夹"
-    var id: String { rawValue }
-}
-
 enum SaveState: Equatable, Sendable {
     case idle
     case saving
@@ -450,21 +347,11 @@ struct ExternalFileConflict: Identifiable, Sendable {
     var fileWasRemoved: Bool { diskText == nil }
 }
 
-enum EditProposalSource: Equatable, Sendable {
-    case assistant
-    case externalFile
-}
-
 struct EditProposal: Identifiable, Sendable {
     let id: UUID
     let documentPath: String
     let original: String
     let replacement: String
-    let instruction: String
-    let selectionLineRange: Range<Int>?
-    let selectionRange: NSRange?
-    let outsideSelectionReason: String?
-    let source: EditProposalSource
     let expectedDiskText: String?
 
     init(
@@ -472,22 +359,12 @@ struct EditProposal: Identifiable, Sendable {
         documentPath: String,
         original: String,
         replacement: String,
-        instruction: String,
-        selectionLineRange: Range<Int>? = nil,
-        selectionRange: NSRange? = nil,
-        outsideSelectionReason: String? = nil,
-        source: EditProposalSource = .assistant,
         expectedDiskText: String? = nil
     ) {
         self.id = id
         self.documentPath = documentPath
         self.original = original
         self.replacement = replacement
-        self.instruction = instruction
-        self.selectionLineRange = selectionLineRange
-        self.selectionRange = selectionRange
-        self.outsideSelectionReason = outsideSelectionReason
-        self.source = source
         self.expectedDiskText = expectedDiskText
     }
 

@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>残梅记 · 八回</title>
+<style>
+  :root{
+    --paper:#f7efdd;
+    --paper-deep:#efe4c8;
+    --ink:#2e2720;
+    --ink-soft:#554a3c;
+    --cinnabar:#9e3b32;
+    --line:#d3c2a0;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    background:
+      radial-gradient(ellipse at 20% 0%, rgba(158,59,50,.05), transparent 55%),
+      radial-gradient(ellipse at 80% 100%, rgba(120,90,40,.07), transparent 50%),
+      var(--paper-deep);
+    color:var(--ink);
+    font-family:"Kaiti SC","STKaiti","KaiTi","楷体","Songti SC","SimSun",serif;
+    line-height:1.9;
+    -webkit-font-smoothing:antialiased;
+    padding:36px 16px 90px;
+  }
+  .book{
+    max-width:840px;
+    margin:0 auto;
+    background:var(--paper);
+    border:1px solid var(--line);
+    box-shadow:0 8px 40px rgba(80,60,30,.18), inset 0 0 60px rgba(180,150,90,.10);
+    padding:54px 60px 48px;
+    position:relative;
+  }
+  .book::before,.book::after{
+    content:"";position:absolute;left:12px;right:12px;height:1px;
+    background:linear-gradient(90deg,transparent,var(--line),transparent);
+  }
+  .book::before{top:20px;}
+  .book::after{bottom:20px;}
+
+  /* ---------- 封面 ---------- */
+  .cover{text-align:center;padding:36px 0 30px;border-bottom:1px solid var(--line);}
+  .cover .seal{
+    display:inline-block;background:var(--cinnabar);color:#f6ead2;
+    font-size:13px;letter-spacing:4px;padding:6px 10px 6px 14px;
+    border-radius:3px;margin-bottom:22px;font-family:"Songti SC","STSong",serif;
+  }
+  .cover h1{
+    font-size:64px;font-weight:normal;letter-spacing:26px;text-indent:26px;
+    font-family:"Songti SC","STSong","SimSun",serif;color:var(--ink);
+  }
+  .cover .sub{margin-top:14px;font-size:15px;color:var(--ink-soft);letter-spacing:6px;text-indent:6px;}
+  .cover .ci{
+    margin-top:30px;font-size:16px;line-height:2.15;color:var(--ink-soft);
+  }
+  .cover .ci .ci-title{letter-spacing:3px;margin-bottom:6px;color:var(--ink);}
+  .cover .ci .note{margin-top:10px;font-size:13px;color:#8a7a5f;letter-spacing:2px;}
+
+  /* ---------- 目录 ---------- */
+  .toc{padding:26px 0 22px;border-bottom:1px solid var(--line);}
+  .toc h2{
+    text-align:center;font-size:17px;font-weight:normal;letter-spacing:12px;text-indent:12px;
+    margin-bottom:16px;color:var(--cinnabar);
+  }
+  .toc ol{list-style:none;text-align:center;}
+  .toc li{margin:9px 0;}
+  .toc a{
+    color:var(--ink);text-decoration:none;font-size:16px;letter-spacing:1px;
+    border-bottom:1px dotted transparent;transition:color .2s,border-color .2s;
+  }
+  .toc a:hover{color:var(--cinnabar);border-bottom-color:var(--cinnabar);}
+  .toc .num{color:var(--cinnabar);margin-right:10px;font-size:14px;}
+
+  /* ---------- 正文 ---------- */
+  main{padding:10px 0 0;}
+  .hui{padding:40px 0 8px;}
+  .hui+.hui{border-top:1px dashed var(--line);margin-top:8px;}
+  .hui-title{
+    text-align:center;margin-bottom:26px;
+  }
+  .hui-title .hnum{
+    display:block;font-size:14px;color:var(--cinnabar);letter-spacing:6px;margin-bottom:8px;
+  }
+  .hui-title h2{
+    display:inline-block;font-size:22px;font-weight:normal;letter-spacing:2px;
+    border-top:1px solid var(--ink);border-bottom:1px solid var(--ink);
+    padding:10px 22px;font-family:"Songti SC","STSong","SimSun",serif;
+  }
+  .hui p{
+    text-indent:2em;font-size:17.5px;line-height:2.15;text-align:justify;
+    margin:0 0 1.05em;letter-spacing:.4px;
+  }
+  .hui p.shi{ /* 文中诗、词 */
+    text-indent:0;text-align:center;font-size:16.5px;line-height:2.0;
+    margin:1.4em 0;color:var(--ink-soft);
+  }
+  .hui p.shi .t{letter-spacing:2px;color:var(--ink);display:block;margin-bottom:4px;}
+  .zhengshi{
+    text-align:center;font-size:16px;color:var(--cinnabar);
+    margin:1.6em 0 .4em;letter-spacing:1px;
+  }
+  .zhengshi b{font-weight:normal;}
+
+  /* ---------- 页脚 ---------- */
+  footer{
+    margin-top:48px;padding-top:24px;border-top:1px solid var(--line);
+    text-align:center;color:#8a7a5f;font-size:13.5px;line-height:2;
+  }
+
+  /* ---------- 竖排模式 ---------- */
+  .book.vmode{
+    writing-mode:vertical-rl;
+    max-width:none;height:100vh;overflow-y:auto;
+    padding:40px 34px;
+  }
+  .book.vmode .cover{text-align:center;border-bottom:none;border-right:1px solid var(--line);padding:0 26px;}
+  .book.vmode .toc{border-bottom:none;border-right:1px solid var(--line);padding:10px 18px;}
+  .book.vmode .toc ol{columns:1;}
+  .book.vmode .hui{border-top:none;}
+  .book.vmode .hui+.hui{border-top:none;border-left:1px dashed var(--line);margin-top:0;}
+  .book.vmode .hui p{text-indent:0;margin:0 0 0 1.1em;}
+  .book.vmode .hui p.shi{margin:1em 0 1em 1.2em;}
+  .book.vmode .zhengshi{margin:1em 0 1em 1.2em;}
+  .book.vmode footer{border-top:none;border-left:1px solid var(--line);}
+
+  /* ---------- 切换按钮 ---------- */
+  #modeBtn{
+    position:fixed;right:22px;bottom:22px;z-index:10;
+    width:54px;height:54px;border-radius:50%;
+    background:var(--cinnabar);color:#f6ead2;
+    border:none;cursor:pointer;
+    font-family:"Kaiti SC","STKaiti",serif;font-size:15px;letter-spacing:2px;
+    box-shadow:0 4px 16px rgba(120,40,30,.35);
+    transition:transform .15s,background .2s;
+  }
+  #modeBtn:hover{transform:scale(1.06);}
+  #modeBtn:active{transform:scale(.96);}
+
+  @media (max-width:640px){
+    body{padding:16px 8px 90px;}
+    .book{padding:32px 20px 36px;}
+    .cover h1{font-size:44px;letter-spacing:16px;text-indent:16px;}
+    .hui p{font-size:16.5px;}
+  }
+</style>
+</head>
+<body>
+
+<div class="book" id="book">
+
+  <!-- ======== 封面 ======== -->
+  <header class="cover">
+    <span class="seal">姑苏旧事</span>
+    <h1>残梅记</h1>
+    <div class="sub">仿明清白话文笔意&nbsp;·&nbsp;凡八回</div>
+    <div class="ci">
+      <div class="ci-title">临江仙&nbsp;·&nbsp;题《残梅记》</div>
+      一树寒梅初破雪，姑苏城外孤村。绿窗人去闭重门。<br>
+      红笺犹在案，墨迹带啼痕。<br><br>
+      廿载尘缘空记省，此生何处寻君。残香冷月共黄昏。<br>
+      梅花应笑我，犹是梦中人。
+      <div class="note">——道是痴人作痴语，只为情字误平生</div>
+    </div>
+  </header>
+
+  <!-- ======== 目录 ======== -->
+  <nav class="toc">
+    <h2>目&nbsp;&nbsp;录</h2>
+    <ol>
+      <li><a href="#hui1"><span class="num">第一回</span>梅君初入姑苏郡　疏桐夜读咏梅诗</a></li>
+      <li><a href="#hui2"><span class="num">第二回</span>隔粉墙花间传素帕　踏琼雪月下折寒枝</a></li>
+      <li><a href="#hui3"><span class="num">第三回</span>绣香囊春昼初盟誓　吹玉笛良宵暗诉情</a></li>
+      <li><a href="#hui4"><span class="num">第四回</span>宦海风涛摧谢氏　权门金帛迫梅君</a></li>
+      <li><a href="#hui5"><span class="num">第五回</span>辞故里疏桐赴试　对残妆梅君理诗</a></li>
+      <li><a href="#hui6"><span class="num">第六回</span>捷报空传花烛夜　孤灯独守病缠绵</a></li>
+      <li><a href="#hui7"><span class="num">第七回</span>绛帐灯昏焚断稿　梅窗月冷诀残魂</a></li>
+      <li><a href="#hui8"><span class="num">第八回</span>埋诗冢疏桐入道　扫梅花老衲题诗</a></li>
+    </ol>
+  </nav>
+
+  <!-- ======== 正文 ======== -->
+  <main>
+
+    <section class="hui" id="hui1">
+      <div class="hui-title">
+        <span class="hnum">第一回</span>
+        <h2>梅君初入姑苏郡　疏桐夜读咏梅诗</h2>
+      </div>
+
+      <p>话说姑苏阊门之内，有一座沈府，乃本地数一数二的诗礼旧族。主人沈公，讳述文，表字蔚章，曾官至江西学政，致仕在家，惟以课子读书为乐。膝下只一子，名唤青梧，表字疏桐，年方一十七岁，生得面如冠玉，目若朗星，最是聪慧，只是性子有些痴，见了花要叹，见了月要愁，老太太常说：这孩子，倒像女孩子养的。</p>
+      <p>这年残冬，谢家老爷谢襄，表字渔庄，任满进京引见，道经姑苏。因与沈公是同年旧交，又值风雪阻途，便携了女儿，在沈府盘桓住下。这谢襄原也是两榜出身，只是宦途蹭蹬，中年丧妻，膝下只有一女，小字梅君，年方一十六岁。梅君自幼随父宦游，生得眉锁春山，目含秋水，行步姗姗，自有一段天然的风致。只是她娘胎里带出一分弱症，每至冬深春尽，便咳嗽不止，故此谢襄宦游之时，总带着她，不离左右。</p>
+      <p>沈府后园，遍植梅树，约有三四十株，此时正值含苞。一夜北风，纷纷扬扬下起一天大雪，到次日，园中早成了一片琉璃世界。那梅花受了雪气，一夜之间，竟开了三五枝，疏疏落落，红白相间，映着积雪，煞是好看。</p>
+      <p>青梧这夜独坐听雪轩中读书，读的是《花间集》，读到「雪里已知春信至」之句，心下忽有所感，搁了书，推窗看时，只见月影横斜，梅香暗度，不觉技痒，遂口占一绝，高声吟道：</p>
+      <p class="shi"><span class="t">咏梅</span>雪压南枝月满庭，寒香一缕隔窗听。<br>知君素抱冰霜骨，不向春风问姓名。</p>
+      <p>吟罢，正自得意，忽听隔墙一个娇软的声音，也低低的和了一首，道是：</p>
+      <p class="shi"><span class="t">和韵</span>东君未肯放春晴，先遣琼英到小庭。<br>谁把玉箫吹彻夜，一声一泪是平生。</p>
+      <p>青梧听了，又惊又喜，暗道：这声音娇娇怯怯，又和得这样好，定是谢家那位小姐了。忙隔墙问道：「墙外可是谢家姐姐么？夜寒霜重，仔细冻着。」那边却再无声音，只听得一阵细碎的脚步，渐渐远了。青梧站了半日，怅然若失。</p>
+      <p>次日起来，青梧便向丫头们打听，方知谢家小姐闺名梅君，就住在园西挹翠楼上。自此，青梧心里便存了一件事，只不好说出口来。正是：</p>
+      <div class="zhengshi"><b>雪里已知春信至，墙头先递一枝香。</b></div>
+    </section>
+
+    <section class="hui" id="hui2">
+      <div class="hui-title">
+        <span class="hnum">第二回</span>
+        <h2>隔粉墙花间传素帕　踏琼雪月下折寒枝</h2>
+      </div>
+
+      <p>却说次日雪霁天晴，梅君带着丫头绿翘，到园中梅树下拾取落英，说要收在锦囊里，留着薰茶。正弯腰去拾，猛抬头，见青梧站在梅林边，手里拈着一枝梅花，含笑望着她。梅君不觉红了脸，低了头，只作没看见。</p>
+      <p>青梧走上前来，唱了个喏，笑道：「昨夜和诗的，可是姐姐么？姐姐的诗真好，只『一声一泪是平生』一句，小生便猜着姐姐是个有心事的。」梅君听了，半晌不语，方低低说道：「公子取笑了。我不过闲着没事，胡诌两句，当不得真的。」说着，便要转身。</p>
+      <p>青梧赶上一步，道：「姐姐且慢。这枝梅花，是昨夜里月下折的，花上还带着雪，特为姐姐留着。姐姐若不嫌唐突，请收了罢。」梅君迟疑了一回，方接过花来，又从袖中取出一方素帕，包了一朵半开的梅花，递与青梧，道：「也请公子收着。」说完，便携了绿翘，头也不回地去了。</p>
+      <p>青梧回到书房，展开素帕看时，只见帕角绣着一枝小小的绿萼梅，针脚细密，帕上又有两行小楷，墨色尚新，写的是：</p>
+      <p class="shi"><span class="t">偶成</span>手折寒枝带露回，香魂一缕绕妆台。<br>他年若问相思处，月落空庭雪满阶。</p>
+      <p>青梧看了又看，闻了又闻，只觉那帕子上有一股子淡淡的梅花香，直沁心脾。自此，两人便时常以诗相酬，或于月下，或于花间，虽隔着几重门户，却是你一首，我一首，倒比当面说话还热闹。</p>
+      <p>过了几日，梅君受了些风寒，旧疾发作，咳嗽起来，竟吐了两口血。谢襄慌了，连忙请医调治，梅君便整日价卧床，不再到园中来了。青梧急得什么似的，却又不好去探问，只每日在挹翠楼外的墙根下，来来回回地走，走一回，叹一回。他听人说，枇杷叶煮水，最能止咳，便自己跑到城外采了一大包，托绿翘带进去。绿翘笑道：「公子好痴心。我们小姐说，这药引子虽好，只怕还要一味『心药』才治得呢。」青梧听了这话，心里又惊又喜，竟一夜不曾合眼。</p>
+      <p>直过了半月，梅君方渐渐好了。这一夜，月明如昼，青梧正在梅下徘徊，忽听楼上窗子轻轻一响，一件东西落下来，正落在青梧脚边。拾起看时，却是一只旧锦囊，囊中藏着一方新帕，帕上又题了一绝，道是：</p>
+      <p class="shi"><span class="t">病起寄怀</span>病骨支离强自持，药炉烟里数花时。<br>多情只有楼头月，犹照疏桐夜夜痴。</p>
+      <p>青梧读罢，又喜又酸，不觉滴下泪来。正是：</p>
+      <div class="zhengshi"><b>多情只有楼头月，犹照疏桐夜夜痴。</b></div>
+    </section>
+
+    <section class="hui" id="hui3">
+      <div class="hui-title">
+        <span class="hnum">第三回</span>
+        <h2>绣香囊春昼初盟誓　吹玉笛良宵暗诉情</h2>
+      </div>
+
+      <p>光阴荏苒，转眼冬尽春来。园中梅花落尽，绿荫成海，只剩得满架蔷薇，几树新桃。青梧与梅君，经过这一冬的诗词往来，情意已与从前不同。梅君病愈后，闲来无事，便替青梧绣一只香囊，大红缎子面，绣一枝白梅，梅下一双燕子，囊里藏了两粒红豆，又用金线在里子角上，绣了「同心」两个字。</p>
+      <p>青梧得了香囊，如获至宝，日日佩在身上，连睡觉也不肯解下来。又见青梧学吹笛子，吹的是古曲《落梅风》，初时生涩，后来竟吹得呜呜咽咽，声闻园外。梅君听了，悄悄对绿翘道：「你听这笛声，倒像有万语千言，说不出来的似的。」绿翘笑道：「小姐既听得出，何不亲自问他去？」梅君红了脸，啐了一口。</p>
+      <p>这一日，沈老太太在堂上闲坐，谢襄也在。老太太见两个孩子这般光景，心里早有了几分意思，因笑道：「谢家老爷，你瞧这两个孩子，倒像一对玉人。我们青梧虽不肖，倒还算个读书的种子；你家梅君，又这样聪俊。若蒙不弃，老身倒想攀这个亲。」谢襄忙起身笑道：「老太太说哪里话。小女蒲柳之姿，只怕高攀了。」老太太大喜，道：「既如此，等渔庄兄进京引见回来，咱们便正经定个亲事。」两家虽未及下聘，话却已说定，两下里都欢喜不尽。</p>
+      <p>谁知春尽之时，梅君那旧疾，又发作了。这一回比往年更重，咳嗽不止，痰中带血，整整卧床一月，请了多少大夫，都说：「小姐这症候，是娘胎里带来的虚症，须得好生静养，再不可劳神伤心，方保无虞。」青梧听了，心里如刀剜一般，却又无从着力。他悄悄到梅树下，暗暗许愿道：「梅君的病若得好，我青梧情愿减寿十年，报与天地。」这一节痴心，也只有梅树知道。</p>
+      <p>及至梅君病好，已是初夏。这一夜，两人在园中小亭里相遇，月色溶溶，荷香细细。梅君含泪道：「我自小多病，恐不是个长寿的人。公子的心，我都知道。只是……只是你往后，别太念着我了。」青梧道：「你说的是什么话！你的病，原是好得了的。你只管放心，等你病好了，咱们还和从前一样，一处读诗，一处看花。」梅君听了，泪珠儿扑簌簌滚下来，半晌，方点头道：「嗯，我放心了。」</p>
+      <p>两人正说着，忽听亭外有人咳嗽一声，却是绿翘，慌慌张张地跑来，道：「小姐，老爷叫你快回去，说京里来了急信，出大事了！」正是：</p>
+      <div class="zhengshi"><b>只道良缘从此定，谁知平地起风波。</b></div>
+    </section>
+
+    <section class="hui" id="hui4">
+      <div class="hui-title">
+        <span class="hnum">第四回</span>
+        <h2>宦海风涛摧谢氏　权门金帛迫梅君</h2>
+      </div>
+
+      <p>话说谢襄进京引见，原指望补一个美缺，好把女儿的事正经办下来。谁知天有不测风云，他从前任上经手的漕银，被人参了一本，说亏空十余万两。这本原是捕风捉影的事，无奈参他的，是当朝太师顾之章，他老人家在皇上跟前说得上话。旨意下来，谢襄登时革职拿问，下了刑部大狱。家产查抄，随行家人，也都作鸟兽散了。</p>
+      <p>这消息传到姑苏，梅君正倚在窗前看花，听了，先是一怔，随即哭倒在地，直哭得气噎喉堵，几乎不曾背过气去。沈公多方托人打点，无奈顾太师势焰熏天，谁也不敢出头。沈公叹道：「渔庄兄是个实心人，如何得此大祸！只是那漕银亏空四字，明明是个幌子，不知太师爷到底安的什么心。」</p>
+      <p>沈公这话，却猜着了。原来顾太师之子顾文炳，是个纨绔子弟，仗着老子的势，横行京师，专一好色。他不知从何处听说了梅君的美名，便起了一个不良之心。这日，顾府遣了一个官媒婆，直到沈府，见了梅君与沈老太太，话里话外说：若肯把梅君小姐许与顾公子为妾，太师爷一句话，谢老爷便可出狱，官复原职，连亏空的银子，也一笔勾销了。</p>
+      <p>这一番话，说得沈老太太半晌无言。梅君在屏风后听了，直哭得浑身乱颤。她思前想后：父亲在狱中，生死未卜，自己一个女孩儿家，有什么本事？若不应这头亲事，父亲便难保性命；若应了，又辜负了青梧一片心。想到半夜，泪都流干了，终于拿定主意：救父要紧。她怕当面见青梧，说不出口，也怕青梧拦她，误了父亲的性命，便留下一封书，一封锦笺，连那只绣着白梅燕子的香囊，一同压在妆奁里，次日清晨，随那媒婆的车，悄悄去了。</p>
+      <p>青梧这一日偏又出城看花去了。及至回来，挹翠楼已人去楼空。绿翘哭着递上那封书，青梧展开看时，只见满纸泪痕，末后附着一绝，道是：</p>
+      <p class="shi"><span class="t">留别</span>别君此去路漫漫，残雪梅花两鬓寒。<br>但得平安书一纸，不须金榜报春官。</p>
+      <p>青梧读罢，大叫一声，昏绝于地。醒来后，也不哭，也不说话，只把那香囊捏在手里，捏了半日。忽然站起身来，对沈公道：「父亲，儿子要进京，赶今科大比。」沈公叹道：「痴儿，痴儿！你便是中了状元，又救得谁来？」青梧道：「儿子不去试一试，这一辈子，心里也放不下。」沈公知拦他不住，只得替他收拾行装，再三嘱咐：功名事小，身子要紧。</p>
+      <p>青梧拜别父母，带着书童墨香，雇了一乘小轿，便望京师进发。正是：</p>
+      <div class="zhengshi"><b>从此天涯各一方，梅花空对雪茫茫。</b></div>
+    </section>
+
+    <section class="hui" id="hui5">
+      <div class="hui-title">
+        <span class="hnum">第五回</span>
+        <h2>辞故里疏桐赴试　对残妆梅君理诗</h2>
+      </div>
+
+      <p>却说青梧一路进京，正是盛夏，赤日炎炎。他心中有事，也不觉路途辛苦，只恨车马太慢。行到半路，在一座古寺里借宿，月下无聊，提笔在粉壁上题了一绝，道是：</p>
+      <p class="shi"><span class="t">途次题壁</span>匹马孤征客路长，青衫不奈满头霜。<br>夜深忽忆姑苏雪，人在梅窗月在墙。</p>
+      <p>到京后，寓在城南会馆，日间读书，夜里便思念梅君，想到深处，只把那香囊贴在胸口，摩挲一回，叹一回。他托人打听太师府的消息，那人回来，吞吞吐吐道：「顾公子那位新奶奶，自进府来，就没得过一天好日子。顾少爷的原配太太，是个极厉害的角色，天天搓磨她。听说那位新奶奶又是个多病的，如今已咳得卧床不起，顾府里正延医调治呢。」青梧听了，五内俱焚，恨不得立时插翅飞去，却又身无长物，只把一股子气，都使在读书上。</p>
+      <p>到了会试之期，青梧入场，三场文字，皆得意之极。放榜之日，果然高中二甲进士，殿试又选入翰林院，授庶吉士。同年的都来道贺，说：「沈年兄春风得意，该请我们吃酒了。」青梧勉强应酬了半日，不及赴琼林宴，便换了便服，直往太师府来。</p>
+      <p>到了府门前，青梧递上名帖，说要见顾公子。门上人打量了他一回，冷笑道：「我们公子今儿大喜，哪有工夫会客？你是哪里来的穷酸，也配登我们这高门槛？」青梧忍气吞声，只说是故人，要求一见。门上人哪里肯理，连推带搡，把他赶了出来。青梧无可奈何，只得在府门前一条长街上，来回踱步，一连守了三日。</p>
+      <p>到第四日，忽见太师府里外张灯结彩，鼓吹喧阗，原来顾文炳嫌先前纳妾不成体统，如今择了吉日，要补行大礼，明媒正娶。那花轿抬进府门时，青梧正挤在人群外边，远远望见那顶绣着金线的红轿，轿帘一掀，隐约露出一角水红色的衣襟，便觉得天旋地转，一口热血，直涌到喉头，又硬生生咽了回去。</p>
+      <p>当夜，顾府笙歌达旦，灯月交辉。青梧回到会馆，也不点灯，直挺挺坐在黑暗里，坐到五更。正是：</p>
+      <div class="zhengshi"><b>红毡十里笙歌沸，谁念楼头病里人。</b></div>
+    </section>
+
+    <section class="hui" id="hui6">
+      <div class="hui-title">
+        <span class="hnum">第六回</span>
+        <h2>捷报空传花烛夜　孤灯独守病缠绵</h2>
+      </div>
+
+      <p>看官听说，那顶花轿里坐的，哪里是个欢欢喜喜的新娘子。梅君自进太师府，先是受那嫡妻的搓磨，后来又惊闻青梧赴试之事，心里又急又愧，又悲又苦，旧病新愁，一齐发作，早已卧床两月。这日被强扶起来，妆裹上轿，拜了天地，送入洞房，众人散去，她连盖头也不曾揭得下，便一口血喷在锦褥上，厥了过去。</p>
+      <p>顾文炳原是个没长性的，见新妇这等光景，大觉扫兴，草草吩咐请医调治，自己便到别院安歇去了。绿翘守在床边，煎药喂汤，直忙到三更。梅君醒来，见满屋红烛高烧，映着窗上斗大的囍字，心里一阵酸，一阵苦，泪珠儿只是滚。她喘了半日，忽然问绿翘道：「外边这样热闹，是做什么？」绿翘含泪道：「小姐忘了，今日是……是小姐的好日子。」梅君听了，半晌不语，忽然微微笑道：「好日子，好日子。」</p>
+      <p>正说着，忽听窗外两个婆子闲磕牙，一个道：「你听说了么，今科新点的翰林里，有一位沈老爷，表字疏桐，才二十出头，真真少年得意。听说原是姑苏人氏，倒与咱们家奶奶是同乡呢。」梅君隔窗听得「疏桐」二字，浑身一震，挣扎着爬起来，问绿翘道：「她们说的，可是真的？」绿翘哭道：「是真的，小姐。沈公子中了进士，点了翰林了。」</p>
+      <p>梅君听了，怔了半日，忽而笑道：「他中了？好，好。我原知道他是个有出息的人。」说着，眼泪却像断了线的珠子，滚滚而下。又喘了一回，叹道：「只可惜，迟了，迟了。」当夜，又咳了半夜，吐了半盂血，直闹到天明，方昏昏睡去。</p>
+      <p>自此，梅君的病，一日重似一日。顾文炳见她总不见好，也懒得理会，只吩咐下人好生看顾，便再不过问。梅君倒乐得清净，便命绿翘把历年积下的诗稿，都翻出来，一一整理。那些诗，有隔墙和韵的，有雪夜酬答的，有帕上传书的，有月下口占的，一页页，都是当年光景。她看了又看，哭了又哭，末了，把诗稿都归在一只旧锦匣里，研了墨，提笔在匣盖上，端端正正写了「残梅吟」三个字，便又咳倒了。正是：</p>
+      <div class="zhengshi"><b>红烛高烧人不见，空教明月照罗帷。</b></div>
+    </section>
+
+    <section class="hui" id="hui7">
+      <div class="hui-title">
+        <span class="hnum">第七回</span>
+        <h2>绛帐灯昏焚断稿　梅窗月冷诀残魂</h2>
+      </div>
+
+      <p>却说梅君自知不起，这一夜，强撑着起来，教绿翘把灯剔亮，又将那只「残梅吟」锦匣取来，放在枕边。她坐了一回，忽然道：「绿翘，把火盆端过来。」绿翘依言端过火盆，梅君便取出一页诗稿，看了一回，叹了一回，投在火里。那一页纸，霎时烧着，化作一片灰蝶，飘飘荡荡，飞上屋梁。</p>
+      <p>绿翘慌了，哭道：「小姐，这是你几年的心血，烧了岂不可惜！好歹留几页，将来也好……」梅君摇头道：「留着做什么？他看了，徒增伤心；旁人看了，更添是非。不如烧了干净。」说着，又取一页，看也不看，投进火中。一页，两页，三页……火光明明灭灭，映着她消瘦的脸，倒添了几分血色。</p>
+      <p>烧到「他年若问相思处，月落空庭雪满阶」那一页，梅君忽然住手，凑着灯光，看了又看，轻轻吟了一遍，又吟一遍，眼泪滴在纸上，洇开一朵墨花。半晌，方低低说道：「这一页，原是我头一回写给他的。那夜，也是这样的雪，这样的月。」说着，把那页纸，慢慢地，慢慢地投进火里，眼看着它烧尽，才收回目光。</p>
+      <p>绿翘哭得伏在床沿上。梅君歇了一回，又口占一绝，教绿翘记下，道是：</p>
+      <p class="shi"><span class="t">绝命词</span>诗稿成灰泪亦枯，梅花一树影全无。<br>从今莫问前生事，只道春风过故庐。</p>
+      <p>吟罢，喘成一团。绿翘哭着问她：「小姐，可有什么话，要带给沈公子么？」梅君想了一回，道：「你只替我说：他教我『放心』，我如今，倒真的放心了。只愿来生，做一株梅，长在他读书的窗下，替他开一夜花，也抵得这一世了。」言讫，微微含笑，阖目而逝。时年一十八岁。正是：</p>
+      <div class="zhengshi"><b>玉骨已成泉下土，墨痕犹锁箧中诗。</b></div>
+    </section>
+
+    <section class="hui" id="hui8">
+      <div class="hui-title">
+        <span class="hnum">第八回</span>
+        <h2>埋诗冢疏桐入道　扫梅花老衲题诗</h2>
+      </div>
+
+      <p>却说青梧闻得梅君讣信，正在翰林院值房，登时面色如土，也不及告假，抢了一匹马，直奔太师府。到了门前，只见素车白马，缓缓出来，原来顾府已草草发丧，灵柩正送往城外古寺。青梧下马，跟在灵车后面，一步一步，直跟到寺里。</p>
+      <p>寺中停灵，青梧于柩前哭奠，一恸几绝。绿翘见了，哭拜在地，把焚稿之事，细细说了一遍。青梧听了，半晌无言，忽然笑道：「烧得好，烧得好。她这一生的诗，原只为我一个人写的，如今人去了，诗自然也该去了。」说着，伏在柩上，放声大哭，直哭得寺中钟磬无声，连那守灵的老僧，也垂下泪来。</p>
+      <p>青梧在寺中守了三日，便扶柩还姑苏，葬于沈园梅林深处。垒土为坟，亲手植了一株绿萼梅，又立了一块小石，题着「梅君之冢」四字。他把那只旧锦匣，连同匣中余下的几页残诗、一方素帕、两粒红豆，都埋在墓侧，谓之「诗冢」。自此，青梧日日到坟前徘徊，或坐或立，或哭或笑，连翰林院的差使也辞了。沈公见他这般，也只得由他。</p>
+      <p>年余，青梧忽然拜别父母，说要去云游天下。沈公知他心已死了，拦不住，只得含泪送他出门。此后二十年，再无人知他下落。</p>
+      <p>又过了几年，沈公夫妇相继谢世，沈园也渐渐荒废了，只剩那几株老梅，岁岁开花，岁岁落。忽一日，有行旅之人经过园外，见一个老衲，在废园梅树下扫落花，拾起一瓣，放在掌心里，嗅了半晌，又向那株绿萼梅下，合掌立了一回，方提笔在粉墙上题了一绝，道是：</p>
+      <p class="shi"><span class="t">题壁</span>廿年重到旧园林，残雪梅花不可寻。<br>只有石桥流水在，夜深犹作断肠音。</p>
+      <p>题罢，飘然而去。有人问那看园的，老衲是谁？看园的道：「这便是当年沈府的二公子，如今法号叫做『扫梅』。」及至追出园去，那老衲早已不见，只余满园梅影，满地雪光。</p>
+      <p>看官听说，这一段公案，原是笔者听来的旧话。梅君之痴，青梧之痴，都是一个「情」字作祟。古今多少痴儿女，都在这一个字上，生生死死，死死生生。笔者记此一段，不敢说有什么深意，只当雪夜围炉，与看官们消遣罢了。正是：</p>
+      <div class="zhengshi"><b>残梅记罢雪初晴，纸帐灯昏泪欲倾。<br>寄语世间儿女辈，莫将痴字误平生。</b></div>
+    </section>
+
+  </main>
+
+  <!-- ======== 页脚 ======== -->
+  <footer>
+    《残梅记》八回毕<br>
+    仿《红楼梦》《水浒传》明清白话笔意，聊寄雪窗一梦。<br>
+    文笔浅陋，效颦而已，读者诸君，莞尔置之可也。
+  </footer>
+
+</div>
+
+<button id="modeBtn" onclick="toggleMode()" title="切换横排/竖排">竖排</button>
+
+<script>
+  function toggleMode(){
+    var book=document.getElementById('book');
+    var btn=document.getElementById('modeBtn');
+    book.classList.toggle('vmode');
+    btn.textContent=book.classList.contains('vmode')?'横排':'竖排';
+  }
+</script>
+</body>
+</html>

@@ -2,26 +2,6 @@ import Foundation
 import Testing
 @testable import Zhijing
 
-@Test func corruptChatStoreIsReportedAndPreserved() throws {
-    let directory = try makeTemporaryDirectory()
-    defer { try? FileManager.default.removeItem(at: directory) }
-
-    let url = directory.appending(path: "Chats.json")
-    let original = Data("{not valid json".utf8)
-    try original.write(to: url)
-    let service = ChatPersistenceService(directoryOverride: directory)
-
-    #expect(throws: (any Error).self) {
-        _ = try service.loadStrict()
-    }
-    #expect(throws: (any Error).self) {
-        try service.saveSynchronously([
-            "/note.md": [ChatMessage(role: .user, text: "不要覆盖")]
-        ])
-    }
-    #expect(try Data(contentsOf: url) == original)
-}
-
 @Test func corruptPortableAnnotationStoreIsPreserved() throws {
     let directory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -41,24 +21,6 @@ import Testing
     #expect(try Data(contentsOf: url) == original)
 }
 
-@Test func corruptSecretStoreIsNotOverwritten() throws {
-    let directory = try makeTemporaryDirectory()
-    defer { try? FileManager.default.removeItem(at: directory) }
-
-    let url = try LocalSecretStore.storageURL(directoryOverride: directory)
-    let original = Data("{broken".utf8)
-    try original.write(to: url)
-
-    #expect(throws: (any Error).self) {
-        try LocalSecretStore.save(
-            "replacement-secret",
-            account: "openai-api-key",
-            directoryOverride: directory
-        )
-    }
-    #expect(try Data(contentsOf: url) == original)
-}
-
 private func makeTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appending(path: "ZhijingPersistenceTests-\(UUID().uuidString)")
@@ -69,36 +31,9 @@ private func makeTemporaryDirectory() throws -> URL {
     return url
 }
 
-@Test func aiJSONRequestPolicyAppliesAuthenticationAndTimeouts() throws {
-    let url = try #require(URL(string: "https://example.com/v1/chat/completions"))
-    let request = try AIRequestPolicy.jsonPOST(
-        url: url,
-        apiKey: "test-key",
-        body: ["model": "test-model"],
-        timeout: AIRequestPolicy.generationTimeout
-    )
-
-    #expect(request.httpMethod == "POST")
-    #expect(request.timeoutInterval == 60)
-    #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-key")
-    #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
-    #expect(request.httpBody != nil)
-    #expect(AIRequestPolicy.connectionTimeout > 0)
-}
-
 @Test func unchangedPersistenceSnapshotsDoNotRewriteFiles() throws {
     let directory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
-
-    let chatService = ChatPersistenceService(directoryOverride: directory)
-    let chats = [
-        "/note.md": [ChatMessage(role: .user, text: "保持不变")]
-    ]
-    try chatService.saveSynchronously(chats)
-    let chatURL = directory.appending(path: "Chats.json")
-    try setOldModificationDate(for: chatURL)
-    try chatService.saveSynchronously(chats)
-    #expect(try modificationDate(for: chatURL) == oldModificationDate)
 
     let library = directory.appending(path: "Library")
     try FileManager.default.createDirectory(

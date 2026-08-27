@@ -10,6 +10,9 @@ final class EditorSessionState {
     private(set) var navigationRequest: EditorNavigationRequest?
     private(set) var selection: EditorTextSelection?
     private(set) var wordCount = 0
+    private(set) var speakingDurationLabel = DocumentMetrics(markdown: "")
+        .speakingDurationLabel
+    private(set) var selectionMetrics: DocumentMetrics?
     var saveState: SaveState = .idle
 
     @ObservationIgnored
@@ -28,6 +31,15 @@ final class EditorSessionState {
 
     func updateSelection(_ selection: EditorTextSelection?) {
         self.selection = selection
+        updateMetricSelection(selection?.text)
+    }
+
+    func updateMetricSelection(_ text: String?) {
+        guard let text, !text.isEmpty else {
+            selectionMetrics = nil
+            return
+        }
+        selectionMetrics = DocumentMetrics(markdown: text)
     }
 
     func navigate(to request: EditorNavigationRequest?) {
@@ -39,6 +51,8 @@ final class EditorSessionState {
         selectedDocument = nil
         selection = nil
         wordCount = 0
+        speakingDurationLabel = DocumentMetrics(markdown: "").speakingDurationLabel
+        selectionMetrics = nil
         replaceText("")
     }
 
@@ -54,11 +68,12 @@ final class EditorSessionState {
                 return
             }
             guard !Task.isCancelled else { return }
-            let count = await Task.detached(priority: .utility) {
-                DocumentMetrics(markdown: text).count
+            let metrics = await Task.detached(priority: .utility) {
+                DocumentMetrics(markdown: text)
             }.value
             guard let self, !Task.isCancelled, self.text == text else { return }
-            wordCount = count
+            wordCount = metrics.count
+            speakingDurationLabel = metrics.speakingDurationLabel
         }
     }
 

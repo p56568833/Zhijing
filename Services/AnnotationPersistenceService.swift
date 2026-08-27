@@ -270,7 +270,7 @@ final class AnnotationPersistenceService: @unchecked Sendable {
         var sections = [
             "# 知境批注索引",
             "",
-            "> 给外部 AI：阅读、修改或评审下列文稿时，必须同时读取对应批注。批注代表用户的判断、问题和修改意图，不是正文事实或引用来源。",
+            "> 给外部工具：阅读、修改或评审下列文稿时，请同时读取对应批注。批注代表用户的判断、问题和修改意图，不是正文事实或引用来源。",
             ""
         ]
         for path in documents.keys.sorted() {

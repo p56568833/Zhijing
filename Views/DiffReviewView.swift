@@ -22,7 +22,7 @@ struct DiffReviewView: View {
             onDecision: decide
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(ZhijingTheme.paper)
     }
 
     private func decide(

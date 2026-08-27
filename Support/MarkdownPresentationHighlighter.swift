@@ -21,6 +21,9 @@ enum MarkdownFenceStateResolver {
 enum MarkdownPresentationStyle {
     case heading
     case quote
+    case annotationHeader
+    case annotationContext
+    case annotationBody
     case horizontalRule
     case fence
     case codeBlock
@@ -28,16 +31,36 @@ enum MarkdownPresentationStyle {
     case strong
     case listMarker
     case link
+    case textHighlight
+    case textImportant
+    case textConcept
+    case textUnderline
+    case textMarkSyntax
 
     var attributes: [NSAttributedString.Key: Any] {
         switch self {
         case .heading:
             [
-                .foregroundColor: NSColor.systemBlue,
-                .backgroundColor: NSColor.systemBlue.withAlphaComponent(0.06)
+                .foregroundColor: ZhijingTheme.accentNSColor,
+                .backgroundColor: ZhijingTheme.accentNSColor.withAlphaComponent(0.055)
             ]
         case .quote:
-            [.foregroundColor: NSColor.systemGreen]
+            [.foregroundColor: ZhijingTheme.quoteNSColor]
+        case .annotationHeader:
+            [
+                .foregroundColor: ZhijingTheme.annotationNSColor,
+                .backgroundColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.08)
+            ]
+        case .annotationContext:
+            [
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .backgroundColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.035)
+            ]
+        case .annotationBody:
+            [
+                .foregroundColor: NSColor.labelColor,
+                .backgroundColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.035)
+            ]
         case .horizontalRule:
             [
                 .foregroundColor: NSColor.secondaryLabelColor,
@@ -45,28 +68,44 @@ enum MarkdownPresentationStyle {
             ]
         case .fence:
             [
-                .foregroundColor: NSColor.systemPurple,
-                .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.08)
+                .foregroundColor: ZhijingTheme.codeNSColor,
+                .backgroundColor: ZhijingTheme.codeNSColor.withAlphaComponent(0.075)
             ]
         case .codeBlock:
             [
-                .foregroundColor: NSColor.systemTeal,
-                .backgroundColor: NSColor.controlBackgroundColor.withAlphaComponent(0.7)
+                .foregroundColor: ZhijingTheme.codeNSColor,
+                .backgroundColor: ZhijingTheme.chromeNSColor.withAlphaComponent(0.72)
             ]
         case .inlineCode:
             [
-                .foregroundColor: NSColor.systemPurple,
-                .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.08)
+                .foregroundColor: ZhijingTheme.codeNSColor,
+                .backgroundColor: ZhijingTheme.codeNSColor.withAlphaComponent(0.075)
             ]
         case .strong:
-            [.foregroundColor: NSColor.systemIndigo]
+            [.foregroundColor: ZhijingTheme.accentNSColor]
         case .listMarker:
-            [.foregroundColor: NSColor.systemOrange]
+            [.foregroundColor: ZhijingTheme.annotationNSColor]
         case .link:
             [
                 .foregroundColor: NSColor.linkColor,
                 .underlineStyle: NSUnderlineStyle.single.rawValue
             ]
+        case .textHighlight:
+            [
+                .backgroundColor: ZhijingTheme.highlightNSColor
+                    .withAlphaComponent(0.32)
+            ]
+        case .textImportant:
+            [.foregroundColor: ZhijingTheme.importantNSColor]
+        case .textConcept:
+            [.foregroundColor: ZhijingTheme.conceptNSColor]
+        case .textUnderline:
+            [
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: ZhijingTheme.underlineNSColor
+            ]
+        case .textMarkSyntax:
+            [.foregroundColor: NSColor.tertiaryLabelColor]
         }
     }
 }
@@ -81,7 +120,8 @@ enum MarkdownPresentationHighlighter {
     private static let temporaryKeys: [NSAttributedString.Key] = [
         .foregroundColor,
         .backgroundColor,
-        .underlineStyle
+        .underlineStyle,
+        .underlineColor
     ]
 
     private static let headingExpression = expression(#"^\s*#{1,6}\s+"#)
@@ -161,6 +201,9 @@ enum MarkdownPresentationHighlighter {
         var result: [MarkdownPresentationSpan] = []
         var location = 0
         var inFence = startsInsideFence
+        var inAnnotation = false
+        var annotationBodyStarted = false
+        var inlineExcludedRanges: [NSRange] = []
 
         while location < string.length {
             let lineRange = string.lineRange(
@@ -176,19 +219,47 @@ enum MarkdownPresentationHighlighter {
 
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 result.append(.init(range: contentRange, style: .fence))
+                inlineExcludedRanges.append(contentRange)
                 inFence.toggle()
+                inAnnotation = false
+                annotationBodyStarted = false
             } else if inFence {
                 result.append(.init(range: contentRange, style: .codeBlock))
+                inlineExcludedRanges.append(contentRange)
+            } else if InlineAnnotationMarkdown.isHeading(trimmed) {
+                result.append(.init(range: contentRange, style: .annotationHeader))
+                inAnnotation = true
+                annotationBodyStarted = false
+            } else if inAnnotation, trimmed.hasPrefix(">") {
+                let quotedContent = String(trimmed.dropFirst())
+                    .trimmingCharacters(in: .whitespaces)
+                if quotedContent.isEmpty {
+                    annotationBodyStarted = true
+                }
+                result.append(.init(
+                    range: contentRange,
+                    style: annotationBodyStarted
+                        ? .annotationBody
+                        : .annotationContext
+                ))
+            } else if trimmed.isEmpty {
+                inAnnotation = false
+                annotationBodyStarted = false
             } else if firstMatch(headingExpression, in: line) != nil {
+                inAnnotation = false
+                annotationBodyStarted = false
                 result.append(.init(range: contentRange, style: .heading))
             } else if firstMatch(quoteExpression, in: line) != nil {
+                inAnnotation = false
                 result.append(.init(range: contentRange, style: .quote))
             } else if firstMatch(horizontalRuleExpression, in: line) != nil {
+                inAnnotation = false
                 result.append(.init(range: contentRange, style: .horizontalRule))
             } else if let marker = firstMatch(
                 listMarkerExpression,
                 in: line
             ) {
+                inAnnotation = false
                 result.append(.init(
                     range: NSRange(
                         location: contentRange.location + marker.range.location,
@@ -196,6 +267,8 @@ enum MarkdownPresentationHighlighter {
                     ),
                     style: .listMarker
                 ))
+            } else if !trimmed.isEmpty {
+                inAnnotation = false
             }
             location = NSMaxRange(lineRange)
         }
@@ -214,10 +287,34 @@ enum MarkdownPresentationHighlighter {
             baseLocation: baseLocation,
             to: &result
         )
+        for mark in InlineTextMarkMarkdown.spans(
+            in: source,
+            baseLocation: baseLocation
+        ) where inlineExcludedRanges.allSatisfy({
+            NSIntersectionRange($0, mark.fullRange).length == 0
+        }) {
+            result.append(.init(
+                range: mark.contentRange,
+                style: presentationStyle(for: mark.kind)
+            ))
+            result.append(.init(range: mark.prefixRange, style: .textMarkSyntax))
+            result.append(.init(range: mark.suffixRange, style: .textMarkSyntax))
+        }
         for link in links ?? MarkdownLinkDetector.links(in: source) {
             result.append(.init(range: link.range, style: .link))
         }
         return result
+    }
+
+    private static func presentationStyle(
+        for kind: InlineTextMarkKind
+    ) -> MarkdownPresentationStyle {
+        switch kind {
+        case .highlight: .textHighlight
+        case .important: .textImportant
+        case .concept: .textConcept
+        case .underline: .textUnderline
+        }
     }
 
     private static func addMatches(

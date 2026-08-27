@@ -202,6 +202,16 @@ private enum MarkdownExportRenderer {
                     spacingBefore: 4,
                     spacingAfter: 10
                 )
+            case .annotation:
+                append(
+                    "批注\n\(block.content)",
+                    to: result,
+                    font: .systemFont(ofSize: 12.5),
+                    color: .systemOrange,
+                    leftIndent: 12,
+                    spacingBefore: 6,
+                    spacingAfter: 10
+                )
             case .unorderedList(let indentation):
                 append(
                     "•  \(block.content)",
@@ -289,18 +299,16 @@ private enum MarkdownExportRenderer {
            rendered.attribute(.font, at: 0, effectiveRange: nil) == nil {
             rendered.addAttribute(.font, value: font, range: fullRange)
         }
+        InlineTextMarkAttributedRenderer.applyStyles(
+            to: rendered,
+            context: .export
+        )
         rendered.append(NSAttributedString(string: "\n"))
         result.append(rendered)
     }
 
     private static func inlineMarkdown(_ source: String) -> NSMutableAttributedString {
-        guard let attributed = try? AttributedString(
-            markdown: source,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) else {
-            return NSMutableAttributedString(string: source)
-        }
-        return NSMutableAttributedString(attributedString: NSAttributedString(attributed))
+        InlineTextMarkAttributedRenderer.renderInlineMarkdown(source)
     }
 
     private static func startsWithPrimaryHeading(

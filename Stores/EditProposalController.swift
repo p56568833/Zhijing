@@ -92,14 +92,7 @@ final class EditProposalController {
                 documentPath: proposal.documentPath,
                 original: resolution.settledText,
                 replacement: remainingReplacement,
-                instruction: proposal.instruction,
-                selectionLineRange: proposal.selectionLineRange,
-                selectionRange: proposal.selectionRange,
-                outsideSelectionReason: proposal.outsideSelectionReason,
-                source: proposal.source,
-                expectedDiskText: proposal.source == .externalFile
-                    ? resolution.settledText
-                    : nil
+                expectedDiskText: resolution.settledText
             )
         } else {
             self.proposal = nil
@@ -111,7 +104,7 @@ final class EditProposalController {
             refreshedDocument: refreshed,
             settledLine: resolution.settledLine,
             isComplete: isComplete,
-            isExternal: proposal.source == .externalFile
+            isExternal: true
         )
     }
 
@@ -128,17 +121,13 @@ final class EditProposalController {
         _ = try revisions.createSnapshot(
             text: proposal.original,
             document: document,
-            name: proposal.source == .externalFile
-                ? "应用外部修改前"
-                : nil
+            name: "应用外部修改前"
         )
-        if proposal.source == .externalFile {
-            _ = try revisions.createSnapshot(
-                text: proposal.replacement,
-                document: document,
-                name: "外部修改完整版本"
-            )
-        }
+        _ = try revisions.createSnapshot(
+            text: proposal.replacement,
+            document: document,
+            name: "外部修改完整版本"
+        )
         snapshottedProposalIDs.insert(proposal.id)
     }
 
@@ -147,7 +136,6 @@ final class EditProposalController {
         document: NoteDocument,
         currentText: String
     ) throws -> String? {
-        guard proposal.source == .externalFile else { return nil }
         let latestDiskText: String
         do {
             latestDiskText = try knowledgeBase.read(document)
@@ -161,9 +149,7 @@ final class EditProposalController {
         self.proposal = EditProposal(
             documentPath: document.relativePath,
             original: currentText,
-            replacement: latestDiskText,
-            instruction: "外部文件在审阅期间又被改写，已更新为最新版本",
-            source: .externalFile
+            replacement: latestDiskText
         )
         return "外部文件又有新修改，Diff 已更新，请重新确认。"
     }

@@ -82,7 +82,7 @@ struct AnnotationRailView: View {
             syncFooter
         }
         .frame(minWidth: 270, idealWidth: 300, maxWidth: 380)
-        .background(.bar)
+        .background(ZhijingTheme.sidebar)
         .alert(
             "删除这条批注？",
             isPresented: Binding(
@@ -100,7 +100,7 @@ struct AnnotationRailView: View {
                 pendingDeletion = nil
             }
         } message: { _ in
-            Text("正文不会变化，外部 AI 使用的批注文件会同步更新。")
+            Text("正文不会变化，随文稿保存的批注文件会同步更新。")
         }
     }
 
@@ -108,7 +108,7 @@ struct AnnotationRailView: View {
         HStack(spacing: 9) {
             Image(systemName: "text.bubble")
                 .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.orange)
+                .foregroundStyle(ZhijingTheme.annotation)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("批注")
@@ -164,7 +164,7 @@ struct AnnotationRailView: View {
     private var syncFooter: some View {
         HStack(spacing: 6) {
             Image(systemName: "checkmark.circle")
-            Text("已同步到 AI 可读取的批注文件")
+            Text("已同步到文稿批注文件")
             Spacer()
         }
         .font(.caption2)

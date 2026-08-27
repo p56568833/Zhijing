@@ -54,7 +54,7 @@ import PDFKit
     let anchor = try #require(
         TextAnnotationAnchorResolver.makeAnchor(selection: selection, in: original)
     )
-    let annotation = TextAnnotation(anchor: anchor, text: "请让 AI 核实")
+    let annotation = TextAnnotation(anchor: anchor, text: "请核实")
     let edited = "新增的前言\n\(original)"
 
     let resolved = try #require(
@@ -76,43 +76,13 @@ import PDFKit
             prefix: "前文",
             suffix: "后文"
         ),
-        text: "这是给 AI 的批注"
+        text: "这是一条批注"
     )
     let value = ["/tmp/note.md": [annotation]]
 
     try persistence.saveSynchronously(value)
 
     #expect(persistence.load() == value)
-}
-
-@Test func apiKeyUsesALocalOwnerOnlyFileWithoutKeychainAccess() throws {
-    let root = FileManager.default.temporaryDirectory
-        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
-    defer { try? FileManager.default.removeItem(at: root) }
-
-    try LocalSecretStore.save(
-        "sk-local-test",
-        account: "openai-api-key",
-        directoryOverride: root
-    )
-
-    #expect(LocalSecretStore.read(
-        account: "openai-api-key",
-        directoryOverride: root
-    ) == "sk-local-test")
-    let url = try LocalSecretStore.storageURL(directoryOverride: root)
-    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-    #expect(attributes[.posixPermissions] as? Int == 0o600)
-
-    try LocalSecretStore.save(
-        "",
-        account: "openai-api-key",
-        directoryOverride: root
-    )
-    #expect(LocalSecretStore.read(
-        account: "openai-api-key",
-        directoryOverride: root
-    ).isEmpty)
 }
 
 @Test func textAnnotationReanchorsWhenItsQuotedTextIsEdited() throws {
@@ -196,7 +166,7 @@ import PDFKit
             prefix: "",
             suffix: ""
         ),
-        text: "外部 AI 必须看到"
+        text: "外部工具必须看到"
     )
     let persistence = AnnotationPersistenceService(directoryOverride: parent)
     try persistence.saveSynchronously(
@@ -208,9 +178,9 @@ import PDFKit
         path: AnnotationPersistenceService.portableFilename
     )
     let indexText = try String(contentsOf: indexURL, encoding: .utf8)
-    #expect(indexText.contains("给外部 AI"))
+    #expect(indexText.contains("给外部工具"))
     #expect(indexText.contains("稿子/文稿.md"))
-    #expect(indexText.contains("外部 AI 必须看到"))
+    #expect(indexText.contains("外部工具必须看到"))
     #expect(indexText.contains("**状态**：待处理"))
 
     try FileManager.default.moveItem(at: originalRoot, to: movedRoot)
@@ -272,35 +242,57 @@ import PDFKit
 
     store.requestAnnotationComposer()
 
-    #expect(store.annotationComposerRequest?.selection.text == "选中这段文字")
-    #expect(store.isAnnotationRailVisible)
+    #expect(store.inlineAnnotationRequestID == 1)
     #expect(store.errorMessage == nil)
-
-    let request = try #require(store.annotationComposerRequest)
-    store.addAnnotation(text: "这里需要补充证据", selection: request.selection)
-    let annotation = try #require(store.currentAnnotations.first)
-    #expect(store.annotationComposerRequest == nil)
-    #expect(!annotation.isResolved)
-
-    store.toggleAnnotationResolution(id: annotation.id)
-    #expect(store.currentAnnotations.first?.isResolved == true)
 }
 
 @MainActor
-@Test func selectionBubbleSendsTheAnnotationToTheRailInsteadOfOpeningAPopover() {
+@Test func inlineAnnotationIsInsertedIntoTheMarkdownDocument() {
     let textView = MarkdownEditorTextView()
     textView.annotationDocumentID = "文章.md"
     textView.string = "前文，需要批注的结论，后文。"
     let range = (textView.string as NSString).range(of: "需要批注的结论")
     textView.setSelectedRange(range)
-    var requestedSelection: EditorTextSelection?
-    textView.onRequestAnnotation = { requestedSelection = $0 }
 
-    textView.requestAnnotationForCurrentSelection()
+    let inserted = textView.insertInlineAnnotation("这里需要补充证据", for: range)
 
-    #expect(requestedSelection?.documentID == "文章.md")
-    #expect(requestedSelection?.range == range)
-    #expect(requestedSelection?.text == "需要批注的结论")
+    #expect(inserted)
+    #expect(textView.string.contains("> 批注"))
+    #expect(textView.string.contains("原文 · 「需要批注的结论」"))
+    #expect(textView.string.contains("> 这里需要补充证据"))
+}
+
+@MainActor
+@Test func annotationComposerPlaceholderDisappearsAsSoonAsTextExists() {
+    let textView = AnnotationComposerTextView()
+    textView.placeholder = "写下批注…"
+
+    #expect(textView.shouldDrawPlaceholder)
+    textView.string = "正在输入"
+    #expect(!textView.shouldDrawPlaceholder)
+}
+
+@Test func legacyInlineAnnotationHeadingRemainsReadable() {
+    #expect(InlineAnnotationMarkdown.isHeading("> 批注"))
+    #expect(InlineAnnotationMarkdown.isHeading("> **批注**"))
+}
+
+@Test func inlineAnnotationStaysBesideTheSelectedParagraph() throws {
+    let source = "第一段\n第二段\n第三段"
+    let selection = (source as NSString).range(of: "第二段")
+    let insertion = try #require(InlineAnnotationMarkdown.insertion(
+        in: source,
+        selection: selection,
+        annotation: "请核对这个判断"
+    ))
+    let result = (source as NSString).replacingCharacters(
+        in: insertion.range,
+        with: insertion.replacementText
+    )
+
+    #expect(result.contains("第二段\n\n> 批注"))
+    #expect(result.contains("> 原文 · 「第二段」"))
+    #expect(result.contains("> 请核对这个判断\n\n第三段"))
 }
 
 @MainActor
@@ -463,140 +455,6 @@ import PDFKit
     #expect(control.intrinsicContentSize.height > 0)
 }
 
-@Test func aiEditPatchChangesOnlyReturnedPassages() throws {
-    let original = """
-    # 标题
-
-    第一段保持不变。
-
-    第二段需要润色。
-
-    结尾保持不变。
-    """
-    let response = """
-    {
-      "edits": [
-        {
-          "old_text": "第二段需要润色。",
-          "new_text": "第二段已经写得更清楚。"
-        }
-      ]
-    }
-    """
-
-    let result = try AIEditPatchProcessor.apply(
-        response: response,
-        to: original
-    )
-    #expect(result.contains("第一段保持不变。"))
-    #expect(result.contains("第二段已经写得更清楚。"))
-    #expect(result.contains("结尾保持不变。"))
-    #expect(!result.contains("第二段需要润色。"))
-}
-
-@Test func aiEditPatchSupportsDeletionAndAnchoredInsertion() throws {
-    let original = "开头\n删除这一行\n结尾"
-    let response = """
-    {"edits":[
-      {"old_text":"删除这一行\\n","new_text":""},
-      {"old_text":"结尾","new_text":"新增一行\\n结尾"}
-    ]}
-    """
-
-    #expect(
-        try AIEditPatchProcessor.apply(response: response, to: original)
-            == "开头\n新增一行\n结尾"
-    )
-}
-
-@Test func aiEditPatchRejectsAmbiguousOrOverlappingPassages() {
-    let ambiguous = """
-    {"edits":[{"old_text":"重复","new_text":"替换"}]}
-    """
-    #expect(throws: Error.self) {
-        try AIEditPatchProcessor.apply(
-            response: ambiguous,
-            to: "重复内容，重复出现。"
-        )
-    }
-
-    let overlapping = AIEditPatch(edits: [
-        AITextEdit(oldText: "甲乙", newText: "一"),
-        AITextEdit(oldText: "乙丙", newText: "二"),
-    ])
-    #expect(throws: Error.self) {
-        try AIEditPatchProcessor.apply(
-            patch: overlapping,
-            to: "甲乙丙"
-        )
-    }
-}
-
-@Test func chatEditPatchIsRemovedFromVisibleReplyAndAppliedLocally() throws {
-    let response = """
-    我只调整了第二段。
-
-    ```edit-patch
-    {"edits":[{"old_text":"旧段落","new_text":"新段落"}]}
-    ```
-    """
-    let extracted = try AIEditPatchProcessor.extractFromChat(
-        response,
-        original: "开头\n旧段落\n结尾"
-    )
-
-    #expect(extracted.display == "我只调整了第二段。")
-    #expect(extracted.replacement == "开头\n新段落\n结尾")
-}
-
-@Test func aiEditPatchPreservesScopeAndReasonForConfirmation() throws {
-    let response = """
-    {"edits":[
-      {"old_text":"选区","new_text":"选区修改","scope":"selection","reason":null},
-      {"old_text":"相邻句","new_text":"调整后的相邻句","scope":"context","reason":"需要与新表述保持主语一致"}
-    ]}
-    """
-    let application = try AIEditPatchProcessor.applyDetailed(
-        response: response,
-        to: "选区\n相邻句"
-    )
-
-    #expect(application.edits.count == 2)
-    #expect(application.edits[0].scope == "selection")
-    #expect(application.edits[1].scope == "context")
-    #expect(application.edits[1].reason == "需要与新表述保持主语一致")
-}
-
-@Test func retrievalScopeTitlesRemainStable() {
-    #expect(RetrievalScope.library.rawValue == "整个知识库")
-    #expect(RetrievalScope.currentFolder.rawValue == "当前文件夹")
-}
-
-@Test func providerPresetsMatchModelsAndEndpoints() {
-    #expect(AIProviderPreset.openAI.endpoint == "https://api.openai.com/v1")
-    #expect(AIProviderPreset.openAI.models.contains { $0.id == "gpt-5.4-mini" })
-    #expect(AIProviderPreset.deepSeek.endpoint == "https://api.deepseek.com")
-    #expect(AIProviderPreset.deepSeek.models.contains { $0.id == "deepseek-v4-flash" })
-    #expect(AIProviderPreset.custom.endpoint == nil)
-}
-
-@Test func baseURLsResolveToChatCompletionRequests() {
-    #expect(
-        AIEndpointResolver.chatCompletionsURL(from: "https://api.deepseek.com")?.absoluteString
-            == "https://api.deepseek.com/chat/completions"
-    )
-    #expect(
-        AIEndpointResolver.chatCompletionsURL(from: "https://api.openai.com/v1")?.absoluteString
-            == "https://api.openai.com/v1/chat/completions"
-    )
-    #expect(
-        AIEndpointResolver.chatCompletionsURL(
-            from: "https://example.com/v1/chat/completions"
-        )?.absoluteString == "https://example.com/v1/chat/completions"
-    )
-    #expect(AIEndpointResolver.chatCompletionsURL(from: "not a URL") == nil)
-}
-
 @Test func documentOpenRequestKeepsEverySelectedFileInTheCurrentLibrary() throws {
     let root = URL(filePath: "/tmp/ZhijingOpenLibrary", directoryHint: .isDirectory)
     let resolved = DocumentOpenRequestResolver.resolve(
@@ -696,40 +554,6 @@ import PDFKit
     ])
 }
 
-@Test func connectionTestRejectsMissingKeyBeforeNetworking() async {
-    let configuration = AIConfiguration(
-        apiKey: "",
-        endpoint: URL(string: "https://api.openai.com/v1/chat/completions")!,
-        model: "gpt-5.4-mini",
-        provider: .openAI
-    )
-
-    do {
-        try await AIService().testConnection(configuration: configuration)
-        Issue.record("缺少 API Key 时不应通过连接测试")
-    } catch {
-        #expect(error.localizedDescription == "请先填写 API Key。")
-    }
-}
-
-@Test func legacyChatMessagesDecodeWithoutUsageFields() throws {
-    let json = """
-    {
-      "id": "8C2A97BB-5E39-4E4A-A928-D6843C31C842",
-      "role": "assistant",
-      "text": "旧回复",
-      "createdAt": 0,
-      "sources": [],
-      "isGeneralKnowledge": false
-    }
-    """
-    let decoder = JSONDecoder()
-    decoder.dateDecodingStrategy = .secondsSince1970
-    let message = try decoder.decode(ChatMessage.self, from: Data(json.utf8))
-    #expect(message.usage == nil)
-    #expect(message.cost == nil)
-}
-
 @Test func chineseSearchAvoidsSingleCharacterNoise() throws {
     let root = URL(filePath: NSTemporaryDirectory())
         .appending(path: "ZhijingSearch-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -816,22 +640,6 @@ import PDFKit
     #expect(!service.search(query: "乙库", documents: secondDocuments).isEmpty)
 }
 
-@Test func currentQuestionAppearsOnlyOnceInAIRequestMessages() {
-    let question = "这次问题"
-    let history = [
-        ChatMessage(role: .user, text: "上一次问题"),
-        ChatMessage(role: .assistant, text: "上一次回答"),
-        ChatMessage(role: .user, text: question),
-    ]
-    let messages = AIService().answerMessages(
-        question: question,
-        currentContext: "正文",
-        history: history,
-        sources: []
-    )
-    #expect(messages.filter { $0["role"] == "user" && $0["content"] == question }.count == 1)
-}
-
 @Test func libraryWatcherFiltersExcludedFolderEvents() {
     let root = "/tmp/ZhijingWatch"
     #expect(LibraryWatcher.shouldInclude(
@@ -864,19 +672,6 @@ import PDFKit
     }
 }
 
-@Test func chatsPersistOutsideUserDefaultsAndKeepLatestSnapshot() throws {
-    let root = URL(filePath: NSTemporaryDirectory())
-        .appending(path: "ZhijingChats-\(UUID().uuidString)", directoryHint: .isDirectory)
-    defer { try? FileManager.default.removeItem(at: root) }
-    let persistence = ChatPersistenceService(directoryOverride: root)
-    persistence.save(["文章.md": [ChatMessage(role: .user, text: "旧消息")]])
-    let latest = ["文章.md": [ChatMessage(role: .user, text: "新消息")]]
-    try persistence.saveSynchronously(latest)
-
-    let loaded = persistence.load()
-    #expect(loaded["文章.md"]?.map(\.text) == ["新消息"])
-}
-
 @Test func documentStateKeysDoNotLeakAcrossLibraries() {
     let first = NoteDocument(
         url: URL(filePath: "/tmp/FirstLibrary/共享.md"),
@@ -890,27 +685,20 @@ import PDFKit
         modifiedAt: .distantPast,
         size: 0
     )
-    let message = ChatMessage(role: .user, text: "只属于第一个知识库")
-
     let migrated = DocumentStateStore.migrateLegacyKeys(
         favorites: ["共享.md"],
-        chats: ["共享.md": [message]],
         documents: [first]
     )
 
     #expect(first.persistenceKey != second.persistenceKey)
     #expect(migrated.favorites == [first.persistenceKey])
-    #expect(migrated.chats[first.persistenceKey] == [message])
-    #expect(migrated.chats[second.persistenceKey] == nil)
 
     let afterSwitch = DocumentStateStore.migrateLegacyKeys(
         favorites: migrated.favorites,
-        chats: migrated.chats,
         documents: [second]
     )
     #expect(!afterSwitch.didChange)
     #expect(afterSwitch.favorites == [first.persistenceKey])
-    #expect(afterSwitch.chats[second.persistenceKey] == nil)
 }
 
 @Test func scanIncludesLongMarkdownExtension() throws {
@@ -1033,33 +821,16 @@ import PDFKit
 @Test func staleEditProposalCannotOverwriteNewTyping() {
     let proposal = EditProposal(
         documentPath: "文章.md",
-        original: "生成建议时的正文",
-        replacement: "AI 修改后的正文",
-        instruction: "润色"
+        original: "开始审阅时的正文",
+        replacement: "外部修改后的正文"
     )
 
-    #expect(proposal.canApply(to: "文章.md", currentText: "生成建议时的正文"))
+    #expect(proposal.canApply(to: "文章.md", currentText: "开始审阅时的正文"))
     #expect(!proposal.canApply(to: "文章.md", currentText: "用户后来输入的新正文"))
-    #expect(!proposal.canApply(to: "另一篇.md", currentText: "生成建议时的正文"))
+    #expect(!proposal.canApply(to: "另一篇.md", currentText: "开始审阅时的正文"))
 }
 
-@Test func editProposalsDistinguishAssistantAndExternalFileChanges() {
-    let assistant = EditProposal(
-        documentPath: "文章.md",
-        original: "原稿",
-        replacement: "AI 修改",
-        instruction: "润色"
-    )
-    let external = EditProposal(
-        documentPath: "文章.md",
-        original: "原稿",
-        replacement: "外部 AI 修改",
-        instruction: "外部修改",
-        source: .externalFile
-    )
-
-    #expect(assistant.source == .assistant)
-    #expect(external.source == .externalFile)
+@Test func externalEditProposalUsesTheReviewingSaveState() {
     #expect(SaveState.reviewingExternalChange.label == "等待确认外部修改")
 }
 
@@ -1417,22 +1188,6 @@ import PDFKit
     #expect(markers[0].rectInTextView.minY == textView.textContainerOrigin.y)
 }
 
-@Test func publicHTTPAIEndpointIsRejectedBeforeNetworking() async {
-    let configuration = AIConfiguration(
-        apiKey: "test-key",
-        endpoint: URL(string: "http://example.com/v1/chat/completions")!,
-        model: "test-model",
-        provider: .custom
-    )
-
-    do {
-        try await AIService().testConnection(configuration: configuration)
-        Issue.record("公网 HTTP 地址不应接收 API Key")
-    } catch {
-        #expect(error.localizedDescription.contains("必须使用 HTTPS"))
-    }
-}
-
 @Test func readingModeRemovesMarkdownSourceMarkers() {
     let source = """
     # **标题**
@@ -1453,6 +1208,228 @@ import PDFKit
     #expect(!visibleText.contains("**"))
     #expect(!visibleText.contains(">"))
     #expect(!visibleText.contains("https://"))
+}
+
+@Test func inlineTextMarksUseReadableMarkdownAndCanBeReplacedOrCleared() throws {
+    let source = "这是重点内容"
+    let selection = (source as NSString).range(of: "重点")
+    let highlighted = try #require(InlineTextMarkMarkdown.mutation(
+        in: source,
+        selection: selection,
+        applying: .highlight
+    ))
+
+    #expect(highlighted.replacementText == "[重点]{.mark}")
+    #expect(highlighted.selectionRange == NSRange(location: 3, length: 2))
+
+    let highlightedSource = (source as NSString).replacingCharacters(
+        in: highlighted.range,
+        with: highlighted.replacementText
+    )
+    let important = try #require(InlineTextMarkMarkdown.mutation(
+        in: highlightedSource,
+        selection: highlighted.selectionRange,
+        applying: .important
+    ))
+    #expect(important.replacementText == "[重点]{.important}")
+
+    let importantSource = (highlightedSource as NSString).replacingCharacters(
+        in: important.range,
+        with: important.replacementText
+    )
+    let cleared = try #require(InlineTextMarkMarkdown.mutation(
+        in: importantSource,
+        selection: important.selectionRange,
+        applying: .important
+    ))
+    #expect(cleared.replacementText == "重点")
+    #expect(cleared.selectionRange == selection)
+}
+
+@Test func inlineTextMarksRecognizeAllFourSemanticStylesAndOffsets() {
+    let source = "前缀 [荧光]{.mark} [警示]{.important} [概念]{.concept} [句子]{.underline}"
+    let spans = InlineTextMarkMarkdown.spans(in: source, baseLocation: 12)
+
+    #expect(spans.map(\.kind) == [
+        .highlight,
+        .important,
+        .concept,
+        .underline,
+    ])
+    #expect(spans.first?.fullRange.location == 15)
+    #expect(spans.first?.contentRange.location == 16)
+}
+
+@Test func inlineTextMarksDoNotWrapMultipleLinesOrMarkdownLinks() {
+    let multiline = "第一行\n第二行"
+    #expect(InlineTextMarkMarkdown.mutation(
+        in: multiline,
+        selection: NSRange(location: 0, length: multiline.utf16.count),
+        applying: .underline
+    ) == nil)
+
+    let link = "[链接](https://example.com)"
+    let linkText = (link as NSString).range(of: "链接")
+    #expect(InlineTextMarkMarkdown.mutation(
+        in: link,
+        selection: linkText,
+        applying: .concept
+    ) == nil)
+}
+
+@MainActor
+@Test func editorPresentsTextMarksWithoutChangingTextMetrics() throws {
+    let source = "[荧光]{.mark} [警示]{.important} [概念]{.concept} [句子]{.underline}"
+    let textView = MarkdownEditorTextView()
+    textView.isRichText = false
+    textView.string = source
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    MarkdownPresentationHighlighter.apply(to: textView)
+    let spans = InlineTextMarkMarkdown.spans(in: source)
+    let layoutManager = try #require(textView.layoutManager)
+
+    let highlightAttributes = layoutManager.temporaryAttributes(
+        atCharacterIndex: spans[0].contentRange.location,
+        effectiveRange: nil
+    )
+    #expect(highlightAttributes[.backgroundColor] != nil)
+    #expect(highlightAttributes[.font] == nil)
+
+    let importantAttributes = layoutManager.temporaryAttributes(
+        atCharacterIndex: spans[1].contentRange.location,
+        effectiveRange: nil
+    )
+    #expect(importantAttributes[.foregroundColor] != nil)
+    #expect(importantAttributes[.font] == nil)
+
+    let underlineAttributes = layoutManager.temporaryAttributes(
+        atCharacterIndex: spans[3].contentRange.location,
+        effectiveRange: nil
+    )
+    #expect(underlineAttributes[.underlineStyle] != nil)
+    #expect(underlineAttributes[.underlineColor] != nil)
+}
+
+@MainActor
+@Test func editorCollapsesInactiveTextMarkSyntaxAndRevealsTheActiveMark() throws {
+    let source = "前文 [重点结论]{.important} 后文"
+    let span = try #require(InlineTextMarkMarkdown.spans(in: source).first)
+    let scrollView = NSScrollView(
+        frame: NSRect(x: 0, y: 0, width: 500, height: 180)
+    )
+    let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+    textView.isRichText = false
+    textView.isHorizontallyResizable = false
+    textView.textContainer?.containerSize = NSSize(
+        width: scrollView.contentSize.width,
+        height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.textContainer?.widthTracksTextView = true
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    textView.enableTextMarkSyntaxFolding()
+    textView.string = source
+    scrollView.documentView = textView
+
+    textView.setSelectedRange(NSRange(location: source.utf16.count, length: 0))
+    textView.updateSelectionAnnotationButton()
+    let layoutManager = try #require(textView.layoutManager)
+    let textContainer = try #require(textView.textContainer)
+    layoutManager.ensureLayout(for: textContainer)
+    let hiddenGlyphIndex = layoutManager.glyphIndexForCharacter(
+        at: span.prefixRange.location
+    )
+    #expect(layoutManager.propertyForGlyph(at: hiddenGlyphIndex).contains(.null))
+
+    textView.setSelectedRange(span.contentRange)
+    textView.updateSelectionAnnotationButton()
+    layoutManager.ensureLayout(for: textContainer)
+    let revealedGlyphIndex = layoutManager.glyphIndexForCharacter(
+        at: span.prefixRange.location
+    )
+    #expect(!layoutManager.propertyForGlyph(at: revealedGlyphIndex).contains(.null))
+    #expect(textView.selectedRange() == span.contentRange)
+}
+
+@MainActor
+@Test func selectionActionsAreDirectOrderedPillsWithClearAtTheRight() throws {
+    let source = "前文重点后文"
+    let scrollView = NSScrollView(
+        frame: NSRect(x: 0, y: 0, width: 340, height: 180)
+    )
+    let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+    textView.annotationDocumentID = "测试.md"
+    textView.isRichText = false
+    textView.isHorizontallyResizable = false
+    textView.textContainer?.containerSize = NSSize(
+        width: scrollView.contentSize.width,
+        height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.textContainer?.widthTracksTextView = true
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    textView.string = source
+    scrollView.documentView = textView
+    textView.setSelectedRange((source as NSString).range(of: "重点"))
+    textView.updateSelectionAnnotationButton()
+    textView.layoutSubtreeIfNeeded()
+
+    let orderedButtons = textView.subviews.compactMap { $0 as? NSButton }
+        .filter { !$0.isHidden }
+        .sorted { $0.frame.minX < $1.frame.minX }
+    #expect(orderedButtons.map(\.title) == [
+        "荧光", "重要", "概念", "下划线", "批注", "清除"
+    ])
+
+    let conceptButton = try #require(
+        orderedButtons.compactMap { $0 as? SelectionMarkButton }
+            .first { $0.kind == .concept }
+    )
+    let clearButton = try #require(
+        orderedButtons.compactMap { $0 as? SelectionMarkButton }
+            .first { $0.isClearAction }
+    )
+    #expect(!clearButton.isEnabled)
+    #expect(clearButton.alphaValue == 1)
+    #expect(clearButton.frame.maxX <= textView.visibleRect.maxX - 8)
+
+    conceptButton.performClick(nil)
+    #expect(textView.string.contains("[重点]{.concept}"))
+    #expect(clearButton.isEnabled)
+
+    clearButton.performClick(nil)
+    #expect(textView.string == source)
+}
+
+@Test func readingModeHidesTextMarkSyntaxAndKeepsVisualStyles() throws {
+    let source = "[荧光]{.mark} [警示]{.important} [概念]{.concept} [句子]{.underline}"
+    let rendered = MarkdownReadingAttributedRenderer.render(source)
+
+    #expect(rendered.string.contains("荧光 警示 概念 句子"))
+    #expect(!rendered.string.contains("{.mark}"))
+    let nsText = rendered.string as NSString
+    let highlightRange = nsText.range(of: "荧光")
+    let importantRange = nsText.range(of: "警示")
+    let conceptRange = nsText.range(of: "概念")
+    let underlineRange = nsText.range(of: "句子")
+    #expect(rendered.attribute(
+        .backgroundColor,
+        at: highlightRange.location,
+        effectiveRange: nil
+    ) != nil)
+    #expect(rendered.attribute(
+        .foregroundColor,
+        at: importantRange.location,
+        effectiveRange: nil
+    ) != nil)
+    #expect(rendered.attribute(
+        .foregroundColor,
+        at: conceptRange.location,
+        effectiveRange: nil
+    ) != nil)
+    #expect(rendered.attribute(
+        .underlineStyle,
+        at: underlineRange.location,
+        effectiveRange: nil
+    ) != nil)
 }
 
 @Test func namedSnapshotsPersistMetadataAndRemainUnique() throws {
@@ -1600,8 +1577,17 @@ import PDFKit
     let short = DocumentMetrics(markdown: "# 标题\n\n你好 **world**")
     #expect(short.count == 5)
 
+    let marked = DocumentMetrics(
+        markdown: "[荧光]{.mark} [警示]{.important} [概念]{.concept} [句子]{.underline}"
+    )
+    #expect(marked.count == 8)
+
     let long = DocumentMetrics(markdown: String(repeating: "知", count: 501))
     #expect(long.count == 501)
+    #expect(long.speakingDurationLabel == "约 2 分钟")
+
+    let brief = DocumentMetrics(markdown: "这是一段很短的口播")
+    #expect(brief.speakingDurationLabel == "不足 1 分钟")
 }
 
 @Test func persistedPaneWidthsAreAlwaysUsable() {
@@ -1665,6 +1651,8 @@ import PDFKit
 
     这是用于验证中文排版的正文，包含 **重点内容** 与 [链接](https://example.com)。
 
+    [荧光]{.mark} [警示]{.important} [概念]{.concept} [句子]{.underline}
+
     > 引用内容应该保持清晰的层级。
 
     - 第一项
@@ -1694,7 +1682,14 @@ import PDFKit
     )
 
     #expect((try Data(contentsOf: pdfURL)).starts(with: Data("%PDF".utf8)))
-    #expect(PDFDocument(url: pdfURL)?.pageCount ?? 0 >= 2)
+    let pdfDocument = try #require(PDFDocument(url: pdfURL))
+    #expect(pdfDocument.pageCount >= 2)
+    let extractedPDFText = pdfDocument.string?
+        .precomposedStringWithCompatibilityMapping ?? ""
+    for markedText in ["荧光", "警示", "概念", "句子"] {
+        #expect(extractedPDFText.contains(markedText))
+    }
+    #expect(!extractedPDFText.contains("{.mark}"))
     #expect((try Data(contentsOf: wordURL)).starts(with: Data([0x50, 0x4B])))
     #expect((try wordURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) > 1_000)
 }

@@ -3,16 +3,10 @@ import SwiftUI
 struct ContentView: View {
     @Bindable var store: AppStore
     @AppStorage("sidebarPaneWidth") private var savedSidebarPaneWidth = 260.0
-    @AppStorage("assistantPaneWidth") private var savedAssistantPaneWidth = 350.0
     @State private var sidebarPaneWidth = PaneWidthPreference.load(
         key: "sidebarPaneWidth",
         default: 260,
         range: 210...360
-    )
-    @State private var assistantPaneWidth = PaneWidthPreference.load(
-        key: "assistantPaneWidth",
-        default: 350,
-        range: 300...480
     )
 
     var body: some View {
@@ -24,6 +18,7 @@ struct ContentView: View {
                     if store.isSidebarVisible {
                         SidebarView(store: store)
                             .frame(width: sidebarPaneWidth)
+                            .frame(maxHeight: .infinity, alignment: .top)
                         ResizablePaneDivider(
                             paneWidth: $sidebarPaneWidth,
                             range: 210...360,
@@ -36,54 +31,26 @@ struct ContentView: View {
 
                     EditorView(store: store)
                         .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
-
-                    if store.isAssistantVisible {
-                        ResizablePaneDivider(
-                            paneWidth: $assistantPaneWidth,
-                            range: 300...480,
-                            dragDirection: -1,
-                            onDragEnded: { width in
-                                savedAssistantPaneWidth = width
-                            }
-                        )
-                        AssistantView(store: store)
-                            .frame(width: assistantPaneWidth)
-                    }
                 }
                 .toolbar {
-                    ToolbarItem(placement: .navigation) {
+                    ToolbarItemGroup(placement: .navigation) {
                         Button {
                             store.toggleSidebar()
                         } label: {
                             Label("切换侧栏", systemImage: "sidebar.left")
                         }
-                    }
-                    ToolbarItem {
                         Button {
                             store.createNote()
                         } label: {
-                            Label("新建文稿", systemImage: "square.and.pencil")
+                            Label("新建文稿", systemImage: "plus")
                         }
-                    }
-                    ToolbarItem {
-                        Button {
-                            store.toggleAssistant()
-                        } label: {
-                            Label("AI 助手", systemImage: "sparkles")
-                        }
-                    }
-                    ToolbarItem {
-                        SettingsLink {
-                            Label("API 设置", systemImage: "gearshape")
-                        }
-                        .help("API 与模型设置（⌘,）")
+                        .help("新建 Markdown 文稿（⌘N）")
                     }
                 }
             }
         }
-        .sheet(item: $store.selectionEditRequest) { request in
-            SelectionEditPromptView(store: store, request: request)
-        }
+        .tint(ZhijingTheme.accent)
+        .background(ZhijingTheme.canvas)
         .sheet(item: $store.externalConflict) { conflict in
             ExternalConflictView(store: store, conflict: conflict)
         }
@@ -166,56 +133,6 @@ private struct ExternalConflictView: View {
     }
 }
 
-private struct SelectionEditPromptView: View {
-    let store: AppStore
-    let request: SelectionEditRequest
-    @State private var instruction = ""
-    @Environment(\.dismiss) private var dismiss
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label("修改所选内容", systemImage: "wand.and.stars")
-                .font(.headline)
-            Text(request.selection.text)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
-            TextField("例如：更简洁，但保留这个例子", text: $instruction, axis: .vertical)
-                .lineLimit(2...5)
-                .focused($isFocused)
-                .onSubmit(submit)
-            HStack {
-                Text("AI 会读取必要上下文，但只返回修改片段")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("取消") { dismiss() }
-                Button("生成修改", action: submit)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }
-        .padding(18)
-        .frame(width: 460)
-        .onAppear { isFocused = true }
-    }
-
-    private func submit() {
-        let value = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return }
-        store.selectionEditRequest = nil
-        store.proposeSelectionEdit(
-            instruction: value,
-            selection: request.selection
-        )
-        dismiss()
-    }
-}
-
 private struct WelcomeView: View {
     let store: AppStore
 
@@ -223,11 +140,11 @@ private struct WelcomeView: View {
         VStack(spacing: 22) {
             Image(systemName: "books.vertical")
                 .font(.system(size: 52, weight: .light))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(ZhijingTheme.accent)
             VStack(spacing: 7) {
                 Text("知境")
                     .font(.system(size: 30, weight: .semibold, design: .rounded))
-                Text("在自己的 Markdown 知识库里，边写、边搜索、边与 AI 共创。")
+                Text("在自己的 Markdown 知识库里，专注写作、搜索与整理。")
                     .foregroundStyle(.secondary)
             }
             Button("打开知识库文件夹…") {
@@ -236,12 +153,13 @@ private struct WelcomeView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             SettingsLink {
-                Label("API 与模型设置", systemImage: "key.horizontal")
+                Label("偏好设置", systemImage: "slider.horizontal.3")
             }
             Text("文稿始终保留在你的 Mac 上")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(ZhijingTheme.canvas)
     }
 }

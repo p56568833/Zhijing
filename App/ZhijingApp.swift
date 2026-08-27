@@ -29,23 +29,11 @@ struct ZhijingApp: App {
         }
         .defaultSize(width: 1440, height: 900)
         .commands {
-            CommandGroup(replacing: .appSettings) {
-                SettingsLink {
-                    Label("API 与模型设置…", systemImage: "gearshape")
-                }
-                .keyboardShortcut(",")
-            }
             CommandGroup(replacing: .newItem) {
                 Button("新建文稿") { store.createNote() }
                     .keyboardShortcut("n")
                 Button("新建文件夹") { store.createFolder() }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
-            }
-            CommandGroup(after: .sidebar) {
-                Button(store.isAssistantVisible ? "隐藏 AI 助手" : "显示 AI 助手") {
-                    store.toggleAssistant()
-                }
-                .keyboardShortcut("a", modifiers: [.command, .option])
             }
             CommandGroup(after: .textEditing) {
                 Button("查找…") {
@@ -66,11 +54,6 @@ struct ZhijingApp: App {
                     store.requestAnnotationComposer()
                 }
                 .keyboardShortcut("m", modifiers: [.command, .shift])
-                Button("AI 修改所选内容…") {
-                    store.requestCustomSelectionEdit()
-                }
-                .keyboardShortcut("k", modifiers: [.command, .shift])
-                Divider()
                 Button("立即保存") { store.saveNow() }
                     .keyboardShortcut("s")
                 Button("创建版本快照") { store.createManualSnapshot() }
@@ -97,7 +80,7 @@ struct ZhijingApp: App {
 
         Settings {
             SettingsView(store: store)
-                .frame(width: 540)
+                .frame(width: 500)
         }
     }
 }
