@@ -1,5 +1,40 @@
 import SwiftUI
 
+/// 文库列表行帧测量用的偏好键，拖拽排序时用它定位落点。
+private struct RowFrameKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(
+        value: inout [String: CGRect],
+        nextValue: () -> [String: CGRect]
+    ) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
+/// 文库列表的行容器：负责选中与悬停的圆角高亮（替代 List 的样式）。
+private struct LibraryRowContainer<Content: View>: View {
+    let isSelected: Bool
+    @ViewBuilder let content: () -> Content
+    @State private var isHovering = false
+
+    var body: some View {
+        content()
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(
+                        isSelected
+                            ? ZhijingTheme.accent.opacity(0.16)
+                            : isHovering ? Color.primary.opacity(0.05) : Color.clear
+                    )
+            )
+            .onHover { isHovering = $0 }
+            .animation(.easeOut(duration: 0.1), value: isHovering)
+    }
+}
+
 struct SidebarView: View {
     @Bindable var store: AppStore
     @State private var contentMode = SidebarContentMode.library
@@ -8,22 +43,21 @@ struct SidebarView: View {
     @State private var renameText = ""
     @State private var deleteTarget: NoteDocument?
     @State private var renameTargetRowKey: String?
-    @State private var folderRenameTarget: String?
     @State private var deleteFolderTarget: String?
-    @State private var libraryFilter = LibraryFilter.all
+    @State private var libraryScope: LibraryScope = .all
+    @State private var draggingDocumentPath: String?
+    @State private var dragAnchorMidY: CGFloat?
+    @State private var rowFrames: [String: CGRect] = [:]
     @FocusState private var renameFocus: RenameFocus?
 
-    private enum LibraryFilter: String, CaseIterable, Identifiable {
-        case all = "全部"
-        case favorites = "收藏"
-        case recent = "最近"
-
-        var id: Self { self }
+    private enum LibraryScope: Hashable {
+        case all
+        case favorites
+        case folder(String)
     }
 
     private enum RenameFocus: Hashable {
         case document(String)
-        case folder(String)
     }
 
     var body: some View {
@@ -33,7 +67,7 @@ struct SidebarView: View {
             case .library:
                 searchBar
                 if store.searchQuery.isEmpty {
-                    libraryFilterPicker
+                    scopeAndSortBar
                 }
             case .outline:
                 outlineHeader
@@ -41,11 +75,7 @@ struct SidebarView: View {
             Divider().opacity(0.58)
             switch contentMode {
             case .library:
-                if store.searchQuery.isEmpty {
-                    libraryList
-                } else {
-                    searchResults
-                }
+                libraryList
             case .outline:
                 documentOutline
             }
@@ -58,11 +88,8 @@ struct SidebarView: View {
         .task(id: outlineRefreshID) {
             await refreshOutline()
         }
-        .onChange(of: store.selectedDocument?.id) { _, documentID in
+        .onChange(of: store.selectedDocument?.id) { _, _ in
             selectedOutlineItemID = nil
-            if documentID == nil {
-                contentMode = .library
-            }
         }
         .confirmationDialog(
             "要将“\(deleteTarget?.title ?? "")”移到废纸篓吗？",
@@ -78,7 +105,7 @@ struct SidebarView: View {
             Button("取消", role: .cancel) { deleteTarget = nil }
         }
         .confirmationDialog(
-            "要将文件夹“\(folderDisplayName(deleteFolderTarget ?? ""))”移到废纸篓吗？",
+            "要将文件夹“\(deleteFolderTargetTitle)”移到废纸篓吗？",
             isPresented: Binding(
                 get: { deleteFolderTarget != nil },
                 set: { if !$0 { deleteFolderTarget = nil } }
@@ -96,6 +123,10 @@ struct SidebarView: View {
         }
     }
 
+    private var deleteFolderTargetTitle: String {
+        folderDisplayName(deleteFolderTarget ?? "")
+    }
+
     private var contentModePicker: some View {
         Picker("侧栏内容", selection: $contentMode) {
             Label("文库", systemImage: "books.vertical")
@@ -107,7 +138,6 @@ struct SidebarView: View {
         .labelsHidden()
         .padding(.horizontal, 10)
         .padding(.top, 10)
-        .disabled(store.selectedDocument == nil)
     }
 
     private var searchBar: some View {
@@ -121,7 +151,6 @@ struct SidebarView: View {
             if !store.searchQuery.isEmpty {
                 Button {
                     store.searchQuery = ""
-                    store.searchResults = []
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
@@ -133,98 +162,182 @@ struct SidebarView: View {
         .padding(.vertical, 10)
     }
 
-    private var libraryFilterPicker: some View {
-        Picker("文稿范围", selection: $libraryFilter) {
-            ForEach(LibraryFilter.allCases) { filter in
-                Text(filter.rawValue).tag(filter)
+    private var scopeAndSortBar: some View {
+        HStack(spacing: 6) {
+            scopePicker
+            sortPicker
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 10)
+        .padding(.bottom, 8)
+    }
+
+    private var scopePicker: some View {
+        Picker("文稿范围", selection: $libraryScope) {
+            Text("全部文稿").tag(LibraryScope.all)
+            Text("收藏").tag(LibraryScope.favorites)
+            ForEach(sortedFolders, id: \.self) { folder in
+                Text(folderDisplayName(folder)).tag(LibraryScope.folder(folder))
             }
         }
-        .pickerStyle(.segmented)
+        .pickerStyle(.menu)
         .labelsHidden()
-        .padding(.horizontal, 10)
-        .padding(.bottom, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var sortPicker: some View {
+        Picker("排序", selection: $store.documentSort) {
+            ForEach(AppDocumentSort.allCases, id: \.self) { sort in
+                Text(sort.label).tag(sort)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .help("拖动文稿行可手动调换顺序")
     }
 
     private var libraryList: some View {
-        List(selection: Binding(
-            get: { store.selectedDocument?.id },
-            set: { id in
-                if let document = store.documents.first(where: { $0.id == id }) {
-                    store.select(document)
-                }
-            }
-        )) {
-            switch libraryFilter {
-            case .all:
-                Section {
-                    OutlineGroup(store.libraryTree, children: \.children) { item in
-                        libraryTreeRow(item)
-                    }
-                } header: {
-                    Text("知识库")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .dropDestination(for: String.self) { paths, _ in
-                            moveDocuments(at: paths, toFolder: "")
-                        }
-                }
-            case .favorites:
-                Section("收藏") {
-                    ForEach(store.favoriteDocuments) { document in
-                        noteRow(document, rowKey: document.id)
-                            .tag(document.id)
-                    }
-                }
-            case .recent:
-                Section("最近修改") {
-                    ForEach(store.recentDocuments) { document in
-                        noteRow(document, rowKey: document.id)
-                            .tag(document.id)
-                    }
-                }
+        Group {
+            if store.searchQuery.isEmpty {
+                documentsList
+            } else {
+                searchResultsList
             }
         }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
-        .overlay {
-            if libraryFilter == .favorites && store.favoriteDocuments.isEmpty {
-                ContentUnavailableView(
-                    "还没有收藏",
-                    systemImage: "star",
-                    description: Text("右键文稿即可添加收藏。")
-                )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var documentsList: some View {
+        let documents = scopedDocuments
+        return ScrollView {
+            if documents.isEmpty {
+                emptyScopeView
+                    .padding(.top, 44)
+                    .frame(maxWidth: .infinity)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(documents) { document in
+                        LibraryRowContainer(
+                            isSelected: store.selectedDocument?.id == document.id
+                        ) {
+                            noteRow(document)
+                        }
+                        .background(frameReader(for: document))
+                        .opacity(
+                            draggingDocumentPath == document.relativePath ? 0.7 : 1
+                        )
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.top, 4)
+                .padding(.bottom, 8)
+            }
+        }
+        .coordinateSpace(name: "libraryListSpace")
+        .onPreferenceChange(RowFrameKey.self) { rowFrames = $0 }
+    }
+
+    @ViewBuilder
+    private var emptyScopeView: some View {
+        switch libraryScope {
+        case .favorites:
+            Text("还没有收藏，右键文稿即可添加。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .folder:
+            Text("这个文件夹还没有文稿。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .all:
+            ContentUnavailableView(
+                "知识库是空的",
+                systemImage: "books.vertical",
+                description: Text("点击左下角的“+”新建文稿。")
+            )
+        }
+    }
+
+    private var searchResultsList: some View {
+        ScrollView {
+            if store.searchResults.isEmpty {
+                ContentUnavailableView.search(text: store.searchQuery)
+                    .padding(.top, 44)
+                    .frame(maxWidth: .infinity)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(store.searchResults) { hit in
+                        LibraryRowContainer(isSelected: false) {
+                            searchResultRow(hit)
+                        }
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.top, 4)
             }
         }
     }
 
-    private var searchResults: some View {
-        List(store.searchResults) { hit in
-            Button {
-                store.select(hit.document)
-            } label: {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(hit.document.title)
-                        .fontWeight(.medium)
-                        .lineLimit(1)
-                    Text(hit.excerpt)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                    Text("\(hit.document.folder.isEmpty ? "知识库根目录" : hit.document.folder) · 第 \(hit.line) 行")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+    private func searchResultRow(_ hit: SearchHit) -> some View {
+        Button {
+            store.select(hit.document, atLine: hit.line)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(hit.document.title)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Text(hit.excerpt)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                Text("\(hit.document.folder.isEmpty ? "知识库根目录" : hit.document.folder) · 第 \(hit.line) 行")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .scrollContentBackground(.hidden)
-        .overlay {
-            if store.searchResults.isEmpty {
-                ContentUnavailableView.search(text: store.searchQuery)
+        .buttonStyle(.plain)
+    }
+
+    private var scopedDocuments: [NoteDocument] {
+        let filtered: [NoteDocument]
+        switch libraryScope {
+        case .all:
+            filtered = store.documents
+        case .favorites:
+            filtered = store.favoriteDocuments
+        case .folder(let folder):
+            filtered = store.documents.filter {
+                $0.folder == folder || $0.folder.hasPrefix(folder + "/")
             }
         }
+        return sorted(filtered)
+    }
+
+    private func sorted(_ documents: [NoteDocument]) -> [NoteDocument] {
+        let byPath = Dictionary(
+            uniqueKeysWithValues: documents.map { ($0.relativePath, $0) }
+        )
+        switch store.documentSort {
+        case .recent:
+            return documents.sorted { $0.modifiedAt > $1.modifiedAt }
+        case .title:
+            return documents.sorted {
+                $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            }
+        case .manual:
+            let orderedPaths = DocumentOrdering.applyingManualOrder(
+                store.manualDocumentOrder,
+                to: documents.map(\.relativePath)
+            )
+            return orderedPaths.compactMap { byPath[$0] }
+        }
+    }
+
+    private var sortedFolders: [String] {
+        store.folders.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
     private var outlineHeader: some View {
@@ -342,106 +455,155 @@ struct SidebarView: View {
         store.selectedDocument?.url.pathExtension.lowercased() == "srt"
     }
 
-    private func noteRow(
-        _ document: NoteDocument,
-        rowKey: String,
-        showsFolder: Bool = true
-    ) -> some View {
-        Label {
-            if renameTargetRowKey == rowKey {
+    private func noteRow(_ document: NoteDocument) -> some View {
+        HStack(spacing: 6) {
+            if renameTargetRowKey == document.id {
                 TextField("文稿名称", text: $renameText)
                     .textFieldStyle(.plain)
-                    .focused($renameFocus, equals: .document(rowKey))
+                    .focused($renameFocus, equals: .document(document.id))
                     .onSubmit { commitDocumentRename(document) }
                     .onExitCommand { cancelRename() }
             } else {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(document.title).lineLimit(1)
-                    if showsFolder, !document.folder.isEmpty {
-                        Text(document.folder)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                Label {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(document.title).lineLimit(1)
+                        if !document.folder.isEmpty {
+                            Text(document.folder)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
+                } icon: {
+                    Image(systemName: document.kindIcon)
+                        .foregroundStyle(.secondary)
                 }
             }
-        } icon: {
-            Image(systemName: document.kindIcon)
-                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            if renameTargetRowKey != document.id {
+                favoriteButton(document)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard renameTargetRowKey != document.id else { return }
+            store.select(document)
         }
         .contextMenu {
             Button(store.favorites.contains(document.persistenceKey) ? "取消收藏" : "收藏") {
                 store.toggleFavorite(document)
             }
             Button("重命名…") {
-                beginRenaming(document, rowKey: rowKey)
+                beginRenaming(document)
             }
+            moveToFolderMenu(document)
             Button("在 Finder 中显示") { store.revealInFinder(document) }
             Divider()
             Button("移到废纸篓", role: .destructive) { deleteTarget = document }
         }
-        .draggable(document.relativePath)
+        .gesture(reorderGesture(for: document))
     }
 
-    @ViewBuilder
-    private func libraryTreeRow(_ item: LibraryTreeItem) -> some View {
-        switch item.content {
-        case .folder(let path):
-            folderRow(path)
-        case .document(let document):
-            noteRow(
-                document,
-                rowKey: document.id,
-                showsFolder: false
+    /// 手势驱动的拖拽排序：按下时对基准位置拍一次快照，
+    /// 之后拖动行越过相邻行的中线才移动一格——
+    /// 基准不随换位刷新，杜绝"换位后偏移量叠加"导致的连环乱飞。
+    private func reorderGesture(for document: NoteDocument) -> some Gesture {
+        DragGesture(minimumDistance: 8)
+            .onChanged { value in
+                guard renameTargetRowKey == nil else { return }
+                guard draggingDocumentPath == nil
+                    || draggingDocumentPath == document.relativePath else { return }
+                if draggingDocumentPath == nil {
+                    guard let frame = rowFrames[document.relativePath] else { return }
+                    draggingDocumentPath = document.relativePath
+                    dragAnchorMidY = frame.midY
+                }
+                guard let anchorMidY = dragAnchorMidY else { return }
+                stepReorder(
+                    dragged: document,
+                    pointerMidY: anchorMidY + value.translation.height
+                )
+            }
+            .onEnded { _ in
+                draggingDocumentPath = nil
+                dragAnchorMidY = nil
+            }
+    }
+
+    /// 每次最多移动一格：只有指针真的越过相邻行的中线才触发，
+    /// 换位后相邻行的中线随之远去，必须再拖一段才会继续换。
+    private func stepReorder(dragged: NoteDocument, pointerMidY: CGFloat) {
+        let visible = scopedDocuments
+        guard let index = visible.firstIndex(where: {
+            $0.relativePath == dragged.relativePath
+        }) else { return }
+
+        var destination: Int?
+        if index + 1 < visible.count,
+           let nextFrame = rowFrames[visible[index + 1].relativePath],
+           pointerMidY > nextFrame.midY {
+            destination = index + 1
+        } else if index > 0,
+                  let previousFrame = rowFrames[visible[index - 1].relativePath],
+                  pointerMidY < previousFrame.midY {
+            destination = index - 1
+        }
+        guard let destination else { return }
+        withAnimation(.easeInOut(duration: 0.14)) {
+            store.setManualDocumentOrder(
+                DocumentOrdering.moved(visible, fromIndex: index, toIndex: destination)
             )
-            .tag(document.id)
+            store.documentSort = .manual
         }
     }
 
-    @ViewBuilder
-    private func folderRow(_ folder: String) -> some View {
-        HStack(spacing: 7) {
-            Image(systemName: "folder")
-                .foregroundStyle(.secondary)
-            if folderRenameTarget == folder {
-                TextField("文件夹名称", text: $renameText)
-                    .textFieldStyle(.plain)
-                    .focused($renameFocus, equals: .folder(folder))
-                    .onSubmit { commitFolderRename(folder) }
-                    .onExitCommand { cancelRename() }
-            } else {
-                Text(folderDisplayName(folder))
-                    .lineLimit(1)
-            }
-        }
-        .contentShape(Rectangle())
-        .contextMenu {
-            Button("重命名…") { beginRenamingFolder(folder) }
-            Divider()
-            Button("移到废纸篓", role: .destructive) {
-                deleteFolderTarget = folder
-            }
-        }
-        .dropDestination(for: String.self) { paths, _ in
-            moveDocuments(at: paths, toFolder: folder)
+    private func frameReader(for document: NoteDocument) -> some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: RowFrameKey.self,
+                value: [
+                    document.relativePath: geo.frame(in: .named("libraryListSpace"))
+                ]
+            )
         }
     }
 
-    private func beginRenaming(_ document: NoteDocument, rowKey: String) {
-        folderRenameTarget = nil
-        renameTargetRowKey = rowKey
+    private func favoriteButton(_ document: NoteDocument) -> some View {
+        let isFavorite = store.favorites.contains(document.persistenceKey)
+        return Button {
+            store.toggleFavorite(document)
+        } label: {
+            Image(systemName: isFavorite ? "star.fill" : "star")
+                .font(.caption)
+                .foregroundStyle(isFavorite ? Color.yellow : Color.secondary.opacity(0.55))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isFavorite ? "取消收藏" : "收藏")
+    }
+
+    private func moveToFolderMenu(_ document: NoteDocument) -> some View {
+        Menu("移动到…") {
+            Button("知识库根目录") {
+                store.move(document, toFolder: "")
+            }
+            .disabled(document.folder.isEmpty)
+            ForEach(
+                sortedFolders.filter { $0 != document.folder },
+                id: \.self
+            ) { folder in
+                Button(folderDisplayName(folder)) {
+                    store.move(document, toFolder: folder)
+                }
+            }
+        }
+    }
+
+    private func beginRenaming(_ document: NoteDocument) {
+        renameTargetRowKey = document.id
         renameText = document.title
         DispatchQueue.main.async {
-            renameFocus = .document(rowKey)
-        }
-    }
-
-    private func beginRenamingFolder(_ folder: String) {
-        renameTargetRowKey = nil
-        folderRenameTarget = folder
-        renameText = folderDisplayName(folder)
-        DispatchQueue.main.async {
-            renameFocus = .folder(folder)
+            renameFocus = .document(document.id)
         }
     }
 
@@ -452,29 +614,10 @@ struct SidebarView: View {
         store.rename(document, to: name)
     }
 
-    private func commitFolderRename(_ folder: String) {
-        let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        cancelRename()
-        store.renameFolder(folder, to: name)
-    }
-
     private func cancelRename() {
         renameFocus = nil
         renameTargetRowKey = nil
-        folderRenameTarget = nil
         renameText = ""
-    }
-
-    private func moveDocuments(at paths: [String], toFolder folder: String) -> Bool {
-        let documents = paths.compactMap { path in
-            store.documents.first(where: { $0.relativePath == path })
-        }
-        guard !documents.isEmpty else { return false }
-        for document in documents where document.folder != folder {
-            store.move(document, toFolder: folder)
-        }
-        return true
     }
 
     private func folderDisplayName(_ folder: String) -> String {

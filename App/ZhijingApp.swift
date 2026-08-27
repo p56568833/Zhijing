@@ -76,6 +76,39 @@ struct ZhijingApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             }
+            CommandMenu("格式") {
+                Button("加粗") {
+                    store.applyInlineFormat(.bold)
+                }
+                .keyboardShortcut("b")
+                Button("斜体") {
+                    store.applyInlineFormat(.italic)
+                }
+                .keyboardShortcut("i")
+                Button("删除线") {
+                    store.applyInlineFormat(.strikethrough)
+                }
+                .keyboardShortcut("x", modifiers: [.command, .shift])
+                Divider()
+                Button("荧光标记") {
+                    store.applyInlineFormat(.textMark(.highlight))
+                }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+                Button("下划线标记") {
+                    store.applyInlineFormat(.textMark(.underline))
+                }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
+                Divider()
+                Menu("彩色文字") {
+                    Button("红色文字") { store.applyInlineFormat(.textMark(.red)) }
+                    Button("橙色文字") { store.applyInlineFormat(.textMark(.orange)) }
+                    Button("绿色文字") { store.applyInlineFormat(.textMark(.green)) }
+                    Button("蓝色文字") { store.applyInlineFormat(.textMark(.blue)) }
+                }
+                Button("清除标记") {
+                    store.applyInlineFormat(.clearTextMark)
+                }
+            }
         }
 
         Settings {

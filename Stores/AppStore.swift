@@ -59,6 +59,17 @@ final class AppStore {
         annotationController.composerRequest
     }
     private(set) var inlineAnnotationRequestID = 0
+    private(set) var formatRequest: EditorFormatRequest?
+
+    func applyInlineFormat(_ command: EditorFormatCommand) {
+        guard !isPreviewMode,
+              selectedDocument != nil,
+              editProposal == nil else {
+            NSSound.beep()
+            return
+        }
+        formatRequest = EditorFormatRequest(id: UUID(), command: command)
+    }
     var searchQuery: String {
         get { librarySearchController.query }
         set { librarySearchController.query = newValue }
@@ -90,6 +101,14 @@ final class AppStore {
     var colorScheme: AppColorScheme {
         get { preferences.colorScheme }
         set { preferences.colorScheme = newValue }
+    }
+    var documentSort: AppDocumentSort {
+        get { preferences.documentSort }
+        set { preferences.documentSort = newValue }
+    }
+    var manualDocumentOrder: [String] {
+        get { preferences.manualDocumentOrder }
+        set { preferences.manualDocumentOrder = newValue }
     }
     var isPreviewMode = false
     var errorMessage: String?
@@ -303,17 +322,22 @@ final class AppStore {
 
     func refreshLibrary(
         selecting relativePath: String? = nil,
-        opening relativePaths: [String] = []
+        opening relativePaths: [String] = [],
+        followMoves: Bool = true
     ) async {
         guard !Task.isCancelled else { return }
         guard let libraryURL else { return }
         loadPortableAnnotationsIfNeeded(at: libraryURL)
+        let previousDocuments = workspaceCatalog.documents
         do {
             guard let scanned = try await workspaceCatalog.refresh(
                 excludedFolders: excludedFolders,
                 favorites: favorites
             ) else { return }
             guard !Task.isCancelled else { return }
+            if followMoves {
+                followExternallyMovedDocuments(previousDocuments: previousDocuments)
+            }
             migrateExternalDocumentsIntoLibrary()
             refreshDerivedLibraryState()
             reconcileMovedAnnotationDocuments(in: libraryURL)
@@ -338,13 +362,14 @@ final class AppStore {
             } else if let selectedDocument {
                 if externalDocuments.contains(where: { $0.id == selectedDocument.id }) {
                     // Keep an external tab selected while the library refreshes.
+                } else if externalConflict?.document.id == selectedDocument.id {
+                    return
                 } else {
-                    if externalConflict?.document.id != selectedDocument.id {
-                        documentSession.cancelAutosave()
-                        clearDocumentSelection()
+                    let hadUnsavedChanges = editorText != documentSession.loadedText
+                    documentSession.cancelAutosave()
+                    clearDocumentSelection()
+                    if hadUnsavedChanges {
                         errorMessage = "当前文稿已不在知识库中，可能被其他应用移动或删除。"
-                    } else {
-                        return
                     }
                 }
             } else {
@@ -363,6 +388,68 @@ final class AppStore {
         } catch {
             errorMessage = "无法读取知识库：\(error.localizedDescription)"
         }
+    }
+
+    /// 知识库重新扫描后，尝试为"路径消失"的已打开文稿找到新位置。
+    /// 命中时沿用应用内移动的状态迁移（收藏、批注、标签页、历史版本），
+    /// 未命中时保持原状，交由常规的外部冲突流程兜底。
+    @discardableResult
+    private func followExternallyMovedDocuments(previousDocuments: [NoteDocument]) -> Bool {
+        let previousByPath = Dictionary(
+            uniqueKeysWithValues: previousDocuments.map { ($0.relativePath, $0) }
+        )
+        var trackedPaths = openDocumentPaths
+        if let selected = selectedDocument,
+           isLibraryDocument(selected),
+           externalConflict?.document.id != selected.id,
+           !trackedPaths.contains(selected.relativePath) {
+            trackedPaths.append(selected.relativePath)
+        }
+        let currentPaths = Set(documents.map(\.relativePath))
+        let trackedDocuments: [NoteDocument] = trackedPaths.compactMap { previousByPath[$0] }
+            .filter { !currentPaths.contains($0.relativePath) }
+        guard !trackedDocuments.isEmpty else { return false }
+
+        let previousPaths = Set(previousDocuments.map(\.relativePath))
+        let appearedDocuments = documents.filter { !previousPaths.contains($0.relativePath) }
+        guard !appearedDocuments.isEmpty else { return false }
+
+        let matches = ExternalMoveMatcher.match(
+            vanished: trackedDocuments,
+            appeared: appearedDocuments
+        )
+        var followedSelection = false
+        for match in matches {
+            let isSelected = match.vanished.id == selectedDocument?.id
+            let hasUnsavedChanges =
+                isSelected && editorText != documentSession.loadedText
+            if hasUnsavedChanges {
+                guard let diskText = try? knowledgeBase.read(match.destination),
+                      diskText == documentSession.loadedText else { continue }
+            }
+            migrateDocumentState(
+                from: match.vanished,
+                to: match.destination.url,
+                newRelativePath: match.destination.relativePath,
+                updateSelection: isSelected
+            )
+            try? knowledgeBase.migrateRevisions(
+                from: match.vanished,
+                to: match.destination.url
+            )
+            if isSelected {
+                followedSelection = true
+                if hasUnsavedChanges {
+                    documentSession.cancelAutosave()
+                    selectedDocument = match.destination
+                    revisionController.load(for: match.destination)
+                    scheduleAutosave()
+                } else {
+                    select(match.destination)
+                }
+            }
+        }
+        return followedSelection
     }
 
     func select(_ document: NoteDocument) {
@@ -617,7 +704,12 @@ final class AppStore {
             if wasSelected {
                 clearDocumentSelection()
             }
-            Task { await refreshLibrary(selecting: wasSelected ? newRelativePath : nil) }
+            Task {
+                await refreshLibrary(
+                    selecting: wasSelected ? newRelativePath : nil,
+                    followMoves: false
+                )
+            }
         } catch {
             errorMessage = "重命名失败：\(error.localizedDescription)"
         }
@@ -651,7 +743,12 @@ final class AppStore {
             if wasSelected {
                 clearDocumentSelection()
             }
-            Task { await refreshLibrary(selecting: wasSelected ? newRelativePath : nil) }
+            Task {
+                await refreshLibrary(
+                    selecting: wasSelected ? newRelativePath : nil,
+                    followMoves: false
+                )
+            }
         } catch {
             errorMessage = "移动文稿失败：\(error.localizedDescription)"
         }
@@ -708,7 +805,12 @@ final class AppStore {
             if failedRevisionMigrations > 0 {
                 errorMessage = "文件夹已重命名，但有 \(failedRevisionMigrations) 篇文稿的历史版本迁移失败。"
             }
-            Task { await refreshLibrary(selecting: migratedSelection) }
+            Task {
+                await refreshLibrary(
+                    selecting: migratedSelection,
+                    followMoves: false
+                )
+            }
         } catch {
             errorMessage = "重命名文件夹失败：\(error.localizedDescription)"
         }
@@ -740,7 +842,9 @@ final class AppStore {
             if selectedIsAffected {
                 clearDocumentSelection()
             }
-            Task { await refreshLibrary() }
+            Task {
+                await refreshLibrary(followMoves: false)
+            }
         } catch {
             errorMessage = "删除文件夹失败：\(error.localizedDescription)"
         }
@@ -764,7 +868,9 @@ final class AppStore {
                 documentSession.cancelAutosave()
                 clearDocumentSelection()
             }
-            Task { await refreshLibrary() }
+            Task {
+                await refreshLibrary(followMoves: false)
+            }
         } catch {
             errorMessage = "移到废纸篓失败：\(error.localizedDescription)"
         }
@@ -873,8 +979,72 @@ final class AppStore {
         )
     }
 
+    func select(_ document: NoteDocument, atLine line: Int) {
+        select(document)
+        isPreviewMode = false
+        editorState.navigate(
+            to: EditorNavigationRequest(
+                documentID: document.id,
+                line: line
+            )
+        )
+    }
+
+    /// 阅读模式下点击任务复选框：直接改写对应行的 [ ] / [x] 标记，
+    /// 走常规编辑管线以获得自动保存与撤销支持。
+    func toggleTaskCheckbox(atLine line: Int) {
+        guard selectedDocument != nil else { return }
+        let nsText = editorText as NSString
+        guard line >= 1 else { return }
+        var location = 0
+        var currentLine = 1
+        while currentLine < line, location < nsText.length {
+            location = NSMaxRange(
+                nsText.lineRange(for: NSRange(location: location, length: 0))
+            )
+            currentLine += 1
+        }
+        guard location <= nsText.length else { return }
+        let lineRange = nsText.lineRange(
+            for: NSRange(location: min(location, nsText.length), length: 0)
+        )
+        let lineText = nsText.substring(with: lineRange)
+        guard let updated = DocumentTaskList.toggled(lineText) else { return }
+        editorDidChange(nsText.replacingCharacters(in: lineRange, with: updated))
+    }
+
     func revealInFinder(_ document: NoteDocument) {
         NSWorkspace.shared.activateFileViewerSelecting([document.url])
+    }
+
+    /// 拖拽标签页换位：按显示顺序重排打开列表并持久化。
+    func moveDocumentTab(_ document: NoteDocument, toIndex targetIndex: Int) {
+        let order = openDocuments
+        guard let fromIndex = order.firstIndex(where: { $0.id == document.id })
+        else { return }
+        let newOrder = DocumentOrdering.moved(
+            order,
+            fromIndex: fromIndex,
+            toIndex: targetIndex
+        )
+        guard newOrder != order else { return }
+        let libraryPaths = newOrder
+            .filter { isLibraryDocument($0) }
+            .map(\.relativePath)
+        let externals = newOrder.filter { !isLibraryDocument($0) }
+        openDocumentPaths = libraryPaths
+        externalDocuments = externals
+        persistOpenDocuments()
+        persistExternalDocuments()
+    }
+
+    /// 拖拽文库列表排序：把可见列表的新顺序合并进全局手动顺序并持久化。
+    func setManualDocumentOrder(_ visibleOrder: [NoteDocument]) {
+        manualDocumentOrder = DocumentOrdering.mergedManualOrder(
+            visible: visibleOrder.map(\.relativePath),
+            previous: manualDocumentOrder,
+            universe: documents.map(\.relativePath)
+        )
     }
 
     func closeDocumentTab(_ document: NoteDocument) {

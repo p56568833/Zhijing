@@ -198,6 +198,19 @@ struct EditorTextSelection: Equatable, Sendable {
     var isEmpty: Bool { range.length == 0 || text.isEmpty }
 }
 
+enum EditorFormatCommand: Equatable, Sendable {
+    case bold
+    case italic
+    case strikethrough
+    case textMark(InlineTextMarkKind)
+    case clearTextMark
+}
+
+struct EditorFormatRequest: Equatable, Sendable, Identifiable {
+    let id: UUID
+    let command: EditorFormatCommand
+}
+
 struct AnnotationComposerRequest: Identifiable, Equatable, Sendable {
     let id: UUID
     let selection: EditorTextSelection

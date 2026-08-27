@@ -134,6 +134,10 @@ final class SelectionMarkButton: NSButton {
         case .important: ZhijingTheme.importantNSColor
         case .concept: ZhijingTheme.conceptNSColor
         case .underline: ZhijingTheme.underlineNSColor
+        case .red: .systemRed
+        case .orange: .systemOrange
+        case .green: .systemGreen
+        case .blue: .systemBlue
         }
     }
 
@@ -144,6 +148,10 @@ final class SelectionMarkButton: NSButton {
         case .important: "重要"
         case .concept: "概念"
         case .underline: "下划线"
+        case .red: "红"
+        case .orange: "橙"
+        case .green: "绿"
+        case .blue: "蓝"
         }
     }
 

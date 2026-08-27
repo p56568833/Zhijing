@@ -232,6 +232,36 @@ private enum MarkdownExportRenderer {
                     spacingBefore: 0,
                     spacingAfter: 4
                 )
+            case .taskList(let indentation, let isChecked):
+                append(
+                    "\(isChecked ? "☑" : "☐")  \(block.content)",
+                    to: result,
+                    font: .systemFont(ofSize: 12.5),
+                    leftIndent: CGFloat(indentation) * 18 + 14,
+                    firstLineIndent: CGFloat(indentation) * 18,
+                    spacingBefore: 0,
+                    spacingAfter: 4
+                )
+            case .image:
+                append(
+                    block.content,
+                    to: result,
+                    font: .systemFont(ofSize: 12.5),
+                    color: .secondaryLabelColor,
+                    spacingBefore: 4,
+                    spacingAfter: 9
+                )
+            case .table(let header, let rows):
+                append(
+                    ( [header] + rows)
+                        .map { "| " + $0.joined(separator: " | ") + " |" }
+                        .joined(separator: "\n"),
+                    to: result,
+                    font: .monospacedSystemFont(ofSize: 10.5, weight: .regular),
+                    color: .darkGray,
+                    spacingBefore: 4,
+                    spacingAfter: 10
+                )
             case .code:
                 append(
                     block.content,

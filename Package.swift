@@ -17,11 +17,8 @@ let package = Package(
                 "知境.app",
                 "Assets",
                 "dist",
-                "残梅记",
-                "fm26-expert-skill",
                 "tmp",
                 "知识库笔记软件-MVP产品需求文档.md",
-                "Reasonix看.md",
                 "README.md"
             ],
             sources: ["App", "Models", "Services", "Stores", "Support", "Views"]

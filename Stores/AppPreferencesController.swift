@@ -23,6 +23,20 @@ enum AppColorScheme: String, CaseIterable {
     }
 }
 
+enum AppDocumentSort: String, CaseIterable {
+    case recent
+    case title
+    case manual
+
+    var label: String {
+        switch self {
+        case .recent: "最近修改"
+        case .title: "标题"
+        case .manual: "自定义"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class AppPreferencesController {
@@ -43,6 +57,12 @@ final class AppPreferencesController {
     var excludedFoldersText: String {
         didSet { defaults.set(excludedFoldersText, forKey: Keys.excludedFolders) }
     }
+    var documentSort: AppDocumentSort {
+        didSet { defaults.set(documentSort.rawValue, forKey: Keys.documentSort) }
+    }
+    var manualDocumentOrder: [String] {
+        didSet { defaults.set(manualDocumentOrder, forKey: Keys.manualDocumentOrder) }
+    }
 
     private let defaults: UserDefaults
 
@@ -61,6 +81,12 @@ final class AppPreferencesController {
         excludedFoldersText = defaults.string(
             forKey: Keys.excludedFolders
         ) ?? ".git, node_modules"
+        documentSort = AppDocumentSort(
+            rawValue: defaults.string(forKey: Keys.documentSort) ?? ""
+        ) ?? .recent
+        manualDocumentOrder = defaults.stringArray(
+            forKey: Keys.manualDocumentOrder
+        ) ?? []
     }
 
     private enum Keys {
@@ -69,5 +95,7 @@ final class AppPreferencesController {
         static let sidebarVisible = "sidebarVisible"
         static let annotationRailVisible = "annotationRailVisible"
         static let colorScheme = "colorScheme"
+        static let documentSort = "documentSort"
+        static let manualDocumentOrder = "manualDocumentOrder"
     }
 }

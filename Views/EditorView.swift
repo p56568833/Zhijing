@@ -20,6 +20,10 @@ struct EditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             editorChrome
+            if isFormatBarVisible {
+                Divider()
+                FormatBar(store: store)
+            }
             if store.isDocumentFindVisible,
                store.selectedDocument != nil,
                store.editProposal == nil {
@@ -68,6 +72,12 @@ struct EditorView: View {
         .onChange(of: store.isPreviewMode) {
             store.editorSelectionDidChange(nil)
         }
+    }
+
+    private var isFormatBarVisible: Bool {
+        store.selectedDocument != nil
+            && !store.isPreviewMode
+            && store.editProposal == nil
     }
 
     private var editorChrome: some View {
@@ -158,7 +168,11 @@ struct EditorView: View {
             if store.isPreviewMode {
                 MarkdownReadingView(
                     text: store.editorText,
-                    onSelectionChange: store.readingSelectionDidChange
+                    baseURL: document.url.deletingLastPathComponent(),
+                    onSelectionChange: store.readingSelectionDidChange,
+                    onToggleTaskLine: { line in
+                        store.toggleTaskCheckbox(atLine: line)
+                    }
                 )
             } else {
                 MarkdownSourceEditor(
@@ -170,6 +184,7 @@ struct EditorView: View {
                     findNavigationRequest: store.documentFindNavigationRequest,
                     annotations: store.currentResolvedAnnotations,
                     inlineAnnotationRequestID: store.inlineAnnotationRequestID,
+                    formatRequest: store.formatRequest,
                     onChange: store.editorDidChange,
                     onSelectionChange: store.editorSelectionDidChange,
                     onFindResultChange: store.updateDocumentFindResult,
@@ -184,5 +199,76 @@ struct EditorView: View {
                 description: Text("从左侧知识库中选择，或新建一篇 Markdown 文稿。")
             )
         }
+    }
+}
+
+private struct FormatBar: View {
+    let store: AppStore
+
+    var body: some View {
+        HStack(spacing: 2) {
+            formatButton("bold", "加粗（⌘B）") {
+                store.applyInlineFormat(.bold)
+            }
+            formatButton("italic", "斜体（⌘I）") {
+                store.applyInlineFormat(.italic)
+            }
+            formatButton("strikethrough", "删除线（⇧⌘X）") {
+                store.applyInlineFormat(.strikethrough)
+            }
+            barDivider
+            formatButton("underline", "下划线标记") {
+                store.applyInlineFormat(.textMark(.underline))
+            }
+            formatButton("highlighter", "荧光标记（⇧⌘H）") {
+                store.applyInlineFormat(.textMark(.highlight))
+            }
+            colorMenu
+            barDivider
+            formatButton("eraser", "清除标记") {
+                store.applyInlineFormat(.clearTextMark)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(ZhijingTheme.chrome)
+    }
+
+    private var barDivider: some View {
+        Divider()
+            .frame(height: 14)
+            .padding(.horizontal, 5)
+    }
+
+    private var colorMenu: some View {
+        Menu {
+            Button("红色文字") { store.applyInlineFormat(.textMark(.red)) }
+            Button("橙色文字") { store.applyInlineFormat(.textMark(.orange)) }
+            Button("绿色文字") { store.applyInlineFormat(.textMark(.green)) }
+            Button("蓝色文字") { store.applyInlineFormat(.textMark(.blue)) }
+        } label: {
+            Image(systemName: "paintpalette")
+                .frame(width: 24, height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("彩色文字")
+    }
+
+    private func formatButton(
+        _ systemImage: String,
+        _ helpText: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .frame(width: 24, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(helpText)
     }
 }

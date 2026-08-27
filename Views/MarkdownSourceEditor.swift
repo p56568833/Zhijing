@@ -186,6 +186,36 @@ final class MarkdownEditorTextView: NSTextView {
         super.mouseDown(with: event)
     }
 
+    override func paste(_ sender: Any?) {
+        if tryInsertPastedImage() { return }
+        super.paste(sender)
+    }
+
+    /// 剪贴板里有图片时，把图片存到文稿的 assets 文件夹并插入引用，
+    /// 避免把二进制数据当文本粘贴进 Markdown。
+    private func tryInsertPastedImage() -> Bool {
+        guard let documentID = annotationDocumentID else { return false }
+        guard let payload = DocumentImageAttachment.payload(
+            from: NSPasteboard.general
+        ) else { return false }
+        let documentURL = URL(filePath: documentID)
+        do {
+            let savedURL = try DocumentImageAttachment.save(
+                payload,
+                forDocumentAt: documentURL
+            )
+            let link = DocumentImageAttachment.markdownLink(
+                for: savedURL,
+                documentURL: documentURL
+            )
+            insertText(link, replacementRange: selectedRange())
+            return true
+        } catch {
+            NSSound.beep()
+            return true
+        }
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard modifiers.contains(.command),
@@ -204,6 +234,18 @@ final class MarkdownEditorTextView: NSTextView {
         }
         if characters == "h", modifiers.contains(.shift) {
             _ = applyTextMark(.highlight)
+            return true
+        }
+        if characters == "b" {
+            _ = performFormat(.bold)
+            return true
+        }
+        if characters == "i" {
+            _ = performFormat(.italic)
+            return true
+        }
+        if characters == "x", modifiers.contains(.shift) {
+            _ = performFormat(.strikethrough)
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -246,6 +288,10 @@ final class MarkdownEditorTextView: NSTextView {
             in: string,
             at: range
         )
+        let containsTextMark = InlineTextMarkMarkdown.containsMark(
+            in: string,
+            intersecting: range
+        )
         let canApplyTextMark = activeKind != nil || InlineTextMarkMarkdown.mutation(
             in: string,
             selection: range,
@@ -257,7 +303,7 @@ final class MarkdownEditorTextView: NSTextView {
             button.isActive = activeKind == kind
         }
         clearButton.isHidden = false
-        clearButton.isEnabled = activeKind != nil
+        clearButton.isEnabled = containsTextMark
         clearButton.isActive = false
         annotationButton.isHidden = false
         layoutSelectionAnnotationButton()
@@ -339,11 +385,58 @@ final class MarkdownEditorTextView: NSTextView {
         return true
     }
 
+    /// 供格式栏、菜单和快捷键统一调用的格式入口。
+    @discardableResult
+    func performFormat(_ command: EditorFormatCommand) -> Bool {
+        switch command {
+        case .textMark(let kind):
+            return applyTextMark(kind)
+        case .clearTextMark:
+            return applyTextMark(nil)
+        case .bold:
+            return applyWrap(.bold)
+        case .italic:
+            return applyWrap(.italic)
+        case .strikethrough:
+            return applyWrap(.strikethrough)
+        }
+    }
+
+    @discardableResult
+    private func applyWrap(_ style: InlineMarkdownFormatting.WrapStyle) -> Bool {
+        let selection = selectedRange()
+        guard let mutation = InlineMarkdownFormatting.mutation(
+            in: string,
+            selection: selection,
+            style: style
+        ), shouldChangeText(
+            in: mutation.range,
+            replacementString: mutation.replacementText
+        ) else {
+            NSSound.beep()
+            return false
+        }
+        textStorage?.replaceCharacters(
+            in: mutation.range,
+            with: mutation.replacementText
+        )
+        didChangeText()
+        setSelectedRange(mutation.selectionRange)
+        scrollRangeToVisible(mutation.selectionRange)
+        window?.makeFirstResponder(self)
+        updateSelectionAnnotationButton()
+        return true
+    }
+
     private func appendTextMarkItems(to menu: NSMenu) {
         menu.autoenablesItems = false
         let activeKind = InlineTextMarkMarkdown.kind(
             in: string,
             at: selectedRange()
+        )
+        let containsTextMark = InlineTextMarkMarkdown.containsMark(
+            in: string,
+            intersecting: selectedRange()
         )
         let canApplyTextMark = activeKind != nil || InlineTextMarkMarkdown.mutation(
             in: string,
@@ -375,7 +468,7 @@ final class MarkdownEditorTextView: NSTextView {
             keyEquivalent: ""
         )
         clearItem.target = self
-        clearItem.isEnabled = activeKind != nil
+        clearItem.isEnabled = containsTextMark
         menu.addItem(clearItem)
     }
 
@@ -397,6 +490,14 @@ final class MarkdownEditorTextView: NSTextView {
         case .underline:
             attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
             attributes[.underlineColor] = ZhijingTheme.underlineNSColor
+        case .red:
+            attributes[.foregroundColor] = NSColor.systemRed
+        case .orange:
+            attributes[.foregroundColor] = NSColor.systemOrange
+        case .green:
+            attributes[.foregroundColor] = NSColor.systemGreen
+        case .blue:
+            attributes[.foregroundColor] = NSColor.systemBlue
         }
         item.attributedTitle = NSAttributedString(
             string: item.title,
@@ -538,7 +639,8 @@ final class MarkdownEditorTextView: NSTextView {
     private func makeSelectionMarkButtons(
     ) -> [InlineTextMarkKind: SelectionMarkButton] {
         var buttons: [InlineTextMarkKind: SelectionMarkButton] = [:]
-        for kind in InlineTextMarkKind.allCases {
+        for kind in InlineTextMarkKind.allCases
+        where kind.showsInSelectionPills {
             let button = SelectionMarkButton(kind: kind)
             button.target = self
             button.action = #selector(applyTextMarkFromButton(_:))
@@ -611,6 +713,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     let findNavigationRequest: DocumentFindNavigationRequest?
     let annotations: [ResolvedTextAnnotation]
     let inlineAnnotationRequestID: Int
+    let formatRequest: EditorFormatRequest?
     let onChange: (String, EditorTextMutation?) -> Void
     let onSelectionChange: (EditorTextSelection?) -> Void
     let onFindResultChange: (DocumentFindResult) -> Void
@@ -654,6 +757,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             in: textView
         )
         textView.updateAnnotations(annotations)
+        context.coordinator.applyFormat(
+            request: formatRequest,
+            in: textView
+        )
         return scrollView
     }
 
@@ -682,6 +789,10 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             in: textView
         )
         textView.updateAnnotations(annotations)
+        context.coordinator.applyFormat(
+            request: formatRequest,
+            in: textView
+        )
         context.coordinator.presentInlineAnnotationIfNeeded(
             requestID: inlineAnnotationRequestID,
             in: textView
@@ -762,6 +873,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         private var navigationRequestID: UUID?
         private var findNavigationRequestID: UUID?
         private var inlineAnnotationRequestID = 0
+        private var formatRequestID: UUID?
         private var isApplyingExternalContent = false
         private var presentationTask: Task<Void, Never>?
         private var presentationGeneration = 0
@@ -992,6 +1104,16 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                   requestID != inlineAnnotationRequestID else { return }
             inlineAnnotationRequestID = requestID
             textView.presentInlineAnnotationComposer()
+        }
+
+        func applyFormat(
+            request: EditorFormatRequest?,
+            in textView: MarkdownEditorTextView
+        ) {
+            guard let request,
+                  request.id != formatRequestID else { return }
+            formatRequestID = request.id
+            textView.performFormat(request.command)
         }
 
         private func position(

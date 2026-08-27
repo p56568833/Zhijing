@@ -3,19 +3,25 @@ import SwiftUI
 
 struct MarkdownReadingView: View {
     let text: String
+    var baseURL: URL?
     var onSelectionChange: (String?) -> Void = { _ in }
+    var onToggleTaskLine: (Int) -> Void = { _ in }
 
     var body: some View {
         MarkdownSelectableReadingView(
             text: text,
-            onSelectionChange: onSelectionChange
+            baseURL: baseURL,
+            onSelectionChange: onSelectionChange,
+            onToggleTaskLine: onToggleTaskLine
         )
     }
 }
 
 private struct MarkdownSelectableReadingView: NSViewRepresentable {
     let text: String
+    let baseURL: URL?
     let onSelectionChange: (String?) -> Void
+    let onToggleTaskLine: (Int) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onSelectionChange: onSelectionChange)
@@ -53,19 +59,22 @@ private struct MarkdownSelectableReadingView: NSViewRepresentable {
         textView.textContainer?.lineFragmentPadding = 0
         textView.delegate = context.coordinator
         scrollView.documentView = textView
-        context.coordinator.render(text, into: textView)
+        textView.onToggleTaskLine = onToggleTaskLine
+        context.coordinator.render(text, baseURL: baseURL, into: textView)
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? MarkdownReadingTextView
         else { return }
-        context.coordinator.render(text, into: textView)
+        textView.onToggleTaskLine = onToggleTaskLine
+        context.coordinator.render(text, baseURL: baseURL, into: textView)
     }
 
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var source: String?
+        private var renderedBaseURL: URL?
         private var renderTask: Task<Void, Never>?
         private let onSelectionChange: (String?) -> Void
 
@@ -86,9 +95,14 @@ private struct MarkdownSelectableReadingView: NSViewRepresentable {
             )
         }
 
-        func render(_ text: String, into textView: MarkdownReadingTextView) {
-            guard source != text else { return }
+        func render(
+            _ text: String,
+            baseURL: URL?,
+            into textView: MarkdownReadingTextView
+        ) {
+            guard source != text || renderedBaseURL != baseURL else { return }
             source = text
+            renderedBaseURL = baseURL
             renderTask?.cancel()
 
             let selection = textView.selectedRange()
@@ -96,7 +110,10 @@ private struct MarkdownSelectableReadingView: NSViewRepresentable {
             renderTask = Task { [weak textView] in
                 let rendered = await Task.detached(priority: .userInitiated) {
                     SendableAttributedString(
-                        MarkdownReadingRenderCache.shared.render(text)
+                        MarkdownReadingRenderCache.shared.render(
+                            text,
+                            baseURL: baseURL
+                        )
                     )
                 }.value
                 guard !Task.isCancelled, source == text, let textView else { return }
@@ -126,6 +143,8 @@ private struct SendableAttributedString: @unchecked Sendable {
 }
 
 final class MarkdownReadingTextView: NSTextView {
+    var onToggleTaskLine: ((Int) -> Void)?
+
     private let maximumContentWidth: CGFloat = 820
     private let minimumHorizontalInset: CGFloat = 46
 
@@ -137,6 +156,46 @@ final class MarkdownReadingTextView: NSTextView {
             height: 38
         )
     }
+
+    override func mouseDown(with event: NSEvent) {
+        if let line = taskLine(at: event.locationInWindow) {
+            onToggleTaskLine?(line)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        if taskLine(at: event.locationInWindow) != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            super.cursorUpdate(with: event)
+        }
+    }
+
+    private func taskLine(at pointInWindow: NSPoint) -> Int? {
+        let point = convert(pointInWindow, from: nil)
+        guard let layoutManager, let textContainer else { return nil }
+        var fraction: CGFloat = 0
+        let index = layoutManager.characterIndex(
+            for: point,
+            in: textContainer,
+            fractionOfDistanceBetweenInsertionPoints: &fraction
+        )
+        let length = (string as NSString).length
+        guard index < length else { return nil }
+        return textStorage?.attribute(
+            .zhijingTaskCheckbox,
+            at: index,
+            effectiveRange: nil
+        ) as? Int
+    }
+}
+
+private extension NSAttributedString.Key {
+    static let zhijingTaskCheckbox = NSAttributedString.Key(
+        "com.zhijing.reading-task-checkbox"
+    )
 }
 
 private final class MarkdownReadingRenderCache: @unchecked Sendable {
@@ -147,8 +206,12 @@ private final class MarkdownReadingRenderCache: @unchecked Sendable {
     private let limit = 10
     private let lock = NSLock()
 
-    func render(_ markdown: String) -> NSAttributedString {
-        let key = "\(markdown.utf16.count)-\(markdown.hashValue)"
+    func render(
+        _ markdown: String,
+        baseURL: URL? = nil
+    ) -> NSAttributedString {
+        let key = "\(baseURL?.standardizedFileURL.path ?? "")|"
+            + "\(markdown.utf16.count)-\(markdown.hashValue)"
         lock.lock()
         if let cached = values[key], cached.source == markdown {
             lock.unlock()
@@ -156,7 +219,10 @@ private final class MarkdownReadingRenderCache: @unchecked Sendable {
         }
         lock.unlock()
 
-        let rendered = MarkdownReadingAttributedRenderer.render(markdown)
+        let rendered = MarkdownReadingAttributedRenderer.render(
+            markdown,
+            baseURL: baseURL
+        )
         lock.lock()
         values[key] = (markdown, rendered)
         order.removeAll { $0 == key }
@@ -171,7 +237,10 @@ private final class MarkdownReadingRenderCache: @unchecked Sendable {
 }
 
 enum MarkdownReadingAttributedRenderer {
-    static func render(_ markdown: String) -> NSAttributedString {
+    static func render(
+        _ markdown: String,
+        baseURL: URL? = nil
+    ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         for block in MarkdownReadingParser.parse(markdown) {
             switch block.kind {
@@ -234,6 +303,29 @@ enum MarkdownReadingAttributedRenderer {
                     lineSpacing: 5,
                     spacingAfter: 7
                 )
+            case .taskList(let indentation, let isChecked):
+                appendTaskList(
+                    block,
+                    indentation: indentation,
+                    isChecked: isChecked,
+                    to: result
+                )
+            case .image:
+                if !appendImage(
+                    block.content,
+                    baseURL: baseURL,
+                    to: result
+                ) {
+                    append(
+                        block.content,
+                        to: result,
+                        font: .systemFont(ofSize: 16),
+                        lineSpacing: 6,
+                        spacingAfter: 14
+                    )
+                }
+            case .table(let header, let rows):
+                appendTable(header: header, rows: rows, to: result)
             case .code:
                 append(
                     block.content,
@@ -305,6 +397,245 @@ enum MarkdownReadingAttributedRenderer {
             lineSpacing: 5,
             spacingAfter: 16
         )
+    }
+
+    private static func appendTaskList(
+        _ block: MarkdownReadingBlock,
+        indentation: Int,
+        isChecked: Bool,
+        to result: NSMutableAttributedString
+    ) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 5
+        paragraph.paragraphSpacing = 7
+        paragraph.headIndent = CGFloat(indentation) * 18 + 20
+        paragraph.firstLineHeadIndent = CGFloat(indentation) * 18
+
+        let attributed = NSMutableAttributedString()
+        attributed.append(NSAttributedString(
+            string: isChecked ? "☑  " : "☐  ",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 16),
+                .foregroundColor: isChecked
+                    ? ZhijingTheme.accentNSColor
+                    : NSColor.secondaryLabelColor,
+                .zhijingTaskCheckbox: block.sourceLine
+            ]
+        ))
+        attributed.append(inlineMarkdown(block.content))
+        let range = NSRange(location: 0, length: attributed.length)
+        attributed.addAttribute(.paragraphStyle, value: paragraph, range: range)
+        attributed.enumerateAttribute(.font, in: range) { value, subrange, _ in
+            if let existing = value as? NSFont {
+                attributed.addAttribute(
+                    .font,
+                    value: NSFontManager.shared.convert(
+                        existing,
+                        toSize: 16
+                    ),
+                    range: subrange
+                )
+            } else {
+                attributed.addAttribute(
+                    .font,
+                    value: NSFont.systemFont(ofSize: 16),
+                    range: subrange
+                )
+            }
+        }
+        InlineTextMarkAttributedRenderer.applyStyles(
+            to: attributed,
+            context: .screen
+        )
+        attributed.append(NSAttributedString(string: "\n"))
+        result.append(attributed)
+    }
+
+    /// 返回是否成功渲染为图片；失败时调用方回退为普通段落。
+    private static func appendImage(
+        _ markdown: String,
+        baseURL: URL?,
+        to result: NSMutableAttributedString
+    ) -> Bool {
+        guard let (alt, path) = imageURL(in: markdown),
+              let image = loadImage(at: path, baseURL: baseURL) else {
+            return false
+        }
+
+        let attachment = NSTextAttachment()
+        attachment.attachmentCell = NSTextAttachmentCell(imageCell: image)
+        let maximumImageWidth: CGFloat = 760
+        let maximumImageHeight: CGFloat = 560
+        var size = image.size
+        let scale = min(
+            maximumImageWidth / max(size.width, 1),
+            maximumImageHeight / max(size.height, 1),
+            1
+        )
+        size = NSSize(
+            width: size.width * scale,
+            height: size.height * scale
+        )
+        attachment.bounds = NSRect(
+            origin: .zero,
+            size: size
+        )
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.paragraphSpacingBefore = 8
+        paragraph.paragraphSpacing = 14
+
+        let attributed = NSMutableAttributedString(attachment: attachment)
+        if !alt.isEmpty {
+            attributed.append(NSAttributedString(
+                string: "  \(alt)",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 13),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            ))
+        }
+        let range = NSRange(location: 0, length: attributed.length)
+        attributed.addAttribute(.paragraphStyle, value: paragraph, range: range)
+        attributed.append(NSAttributedString(string: "\n"))
+        result.append(attributed)
+        return true
+    }
+
+    private static func imageURL(
+        in markdown: String
+    ) -> (alt: String, path: String)? {
+        guard markdown.hasPrefix("![") else { return nil }
+        guard let altEnd = markdown.range(of: "]") else { return nil }
+        let alt = String(markdown[markdown.index(after: markdown.startIndex)..<altEnd.lowerBound])
+        let remainder = markdown[altEnd.upperBound...]
+        guard remainder.hasPrefix("("), remainder.hasSuffix(")") else { return nil }
+        let path = String(remainder.dropFirst().dropLast())
+            .trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return nil }
+        return (alt.trimmingCharacters(in: .whitespaces), path)
+    }
+
+    private static func loadImage(
+        at path: String,
+        baseURL: URL?
+    ) -> NSImage? {
+        let url: URL
+        if path.lowercased().hasPrefix("http://") || path.lowercased().hasPrefix("https://") {
+            // 阅读渲染在后台线程同步执行，不做网络请求，远程图片回退为文字。
+            return nil
+        } else if path.hasPrefix("/") {
+            url = URL(filePath: path)
+        } else if let baseURL {
+            url = baseURL.appending(path: path)
+        } else {
+            url = URL(filePath: path)
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return NSImage(contentsOf: url)
+    }
+
+    private static func appendTable(
+        header: [String],
+        rows: [[String]],
+        to result: NSMutableAttributedString
+    ) {
+        let font = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular)
+        let columnCount = max(header.count, rows.map(\.count).max() ?? 0)
+        guard columnCount > 0 else { return }
+
+        let padding: CGFloat = 16
+        var columnWidths = Array(repeating: CGFloat(0), count: columnCount)
+        for row in [header] + rows {
+            for (index, cell) in row.enumerated() where index < columnCount {
+                columnWidths[index] = max(
+                    columnWidths[index],
+                    textWidth(cell, font: font)
+                )
+            }
+        }
+        let paddedWidths = columnWidths.map { $0 + padding }
+
+        func appendRow(_ row: [String], isHeader: Bool) {
+            let lineFont = isHeader
+                ? NSFont.monospacedSystemFont(ofSize: 13.5, weight: .semibold)
+                : font
+            let line = NSMutableAttributedString()
+            for index in 0..<columnCount {
+                let cell = index < row.count ? row[index] : ""
+                let lineText = NSMutableAttributedString(
+                    string: cell,
+                    attributes: [
+                        .font: lineFont,
+                        .foregroundColor: NSColor.labelColor
+                    ]
+                )
+                lineText.append(NSAttributedString(
+                    string: String(
+                        repeating: " ",
+                        count: padCount(
+                            textWidth(cell, font: lineFont),
+                            target: paddedWidths[index],
+                            spaceFont: font
+                        )
+                    )
+                ))
+                line.append(lineText)
+            }
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineSpacing = 3
+            line.addAttribute(
+                .paragraphStyle,
+                value: paragraph,
+                range: NSRange(location: 0, length: line.length)
+            )
+            line.append(NSAttributedString(string: "\n"))
+            result.append(line)
+        }
+
+        let totalWidth = paddedWidths.reduce(0, +)
+        let separator = NSMutableAttributedString()
+        let dashWidth = textWidth("─", font: font)
+        separator.append(NSAttributedString(
+            string: String(repeating: "─", count: max(4, Int(totalWidth / max(dashWidth, 1)))),
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.tertiaryLabelColor
+            ]
+        ))
+        let separatorParagraph = NSMutableParagraphStyle()
+        separatorParagraph.lineSpacing = 2
+        separator.addAttribute(
+            .paragraphStyle,
+            value: separatorParagraph,
+            range: NSRange(location: 0, length: separator.length)
+        )
+        separator.append(NSAttributedString(string: "\n"))
+
+        appendRow(header, isHeader: true)
+        result.append(separator)
+        for row in rows {
+            appendRow(row, isHeader: false)
+        }
+        result.append(NSAttributedString(string: "\n"))
+    }
+
+    private static func textWidth(
+        _ text: String,
+        font: NSFont
+    ) -> CGFloat {
+        NSAttributedString(string: text, attributes: [.font: font])
+            .size().width
+    }
+
+    private static func padCount(
+        _ current: CGFloat,
+        target: CGFloat,
+        spaceFont: NSFont
+    ) -> Int {
+        let spaceWidth = max(textWidth(" ", font: spaceFont), 1)
+        guard target > current else { return 0 }
+        return Int(ceil((target - current) / spaceWidth))
     }
 
     private static func append(
@@ -386,6 +717,9 @@ struct MarkdownReadingBlock: Identifiable {
         case annotation
         case unorderedList(indentation: Int)
         case orderedList(marker: String, indentation: Int)
+        case taskList(indentation: Int, isChecked: Bool)
+        case image
+        case table(header: [String], rows: [[String]])
         case code
         case divider
         case space
@@ -394,6 +728,8 @@ struct MarkdownReadingBlock: Identifiable {
     let id: Int
     let kind: Kind
     let content: String
+    /// 在源文件中的行号（从 1 开始），用于任务列表点击写回。
+    let sourceLine: Int
 }
 
 enum MarkdownReadingParser {
@@ -401,19 +737,35 @@ enum MarkdownReadingParser {
         let lines = source.components(separatedBy: .newlines)
         var blocks: [MarkdownReadingBlock] = []
         var paragraphLines: [String] = []
+        var paragraphLineNumbers: [Int] = []
         var codeLines: [String] = []
         var annotationLines: [String] = []
         var isInsideCodeFence = false
         var isInsideAnnotation = false
+        var index = 0
 
-        func append(_ kind: MarkdownReadingBlock.Kind, _ content: String = "") {
-            blocks.append(.init(id: blocks.count, kind: kind, content: content))
+        func append(
+            _ kind: MarkdownReadingBlock.Kind,
+            _ content: String = "",
+            _ sourceLine: Int
+        ) {
+            blocks.append(.init(
+                id: blocks.count,
+                kind: kind,
+                content: content,
+                sourceLine: sourceLine
+            ))
         }
 
         func flushParagraph() {
             guard !paragraphLines.isEmpty else { return }
-            append(.paragraph, paragraphLines.joined(separator: "\n"))
+            append(
+                .paragraph,
+                paragraphLines.joined(separator: "\n"),
+                paragraphLineNumbers.first ?? 1
+            )
             paragraphLines.removeAll(keepingCapacity: true)
+            paragraphLineNumbers.removeAll(keepingCapacity: true)
         }
 
         func flushAnnotation() {
@@ -421,13 +773,16 @@ enum MarkdownReadingParser {
             while annotationLines.last?.isEmpty == true {
                 annotationLines.removeLast()
             }
-            append(.annotation, annotationLines.joined(separator: "\n"))
+            append(.annotation, annotationLines.joined(separator: "\n"), 1)
             annotationLines.removeAll(keepingCapacity: true)
             isInsideAnnotation = false
         }
 
-        for line in lines {
+        while index < lines.count {
+            let line = lines[index]
+            let lineNumber = index + 1
             let trimmed = line.trimmingCharacters(in: .whitespaces)
+            defer { index += 1 }
 
             if isInsideAnnotation {
                 if trimmed.hasPrefix(">") {
@@ -443,7 +798,7 @@ enum MarkdownReadingParser {
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 flushParagraph()
                 if isInsideCodeFence {
-                    append(.code, codeLines.joined(separator: "\n"))
+                    append(.code, codeLines.joined(separator: "\n"), lineNumber)
                     codeLines.removeAll(keepingCapacity: true)
                 }
                 isInsideCodeFence.toggle()
@@ -458,17 +813,17 @@ enum MarkdownReadingParser {
             if trimmed.isEmpty {
                 flushParagraph()
                 if blocks.last.map({ !isSpace($0.kind) }) ?? false {
-                    append(.space)
+                    append(.space, "", lineNumber)
                 }
                 continue
             }
 
             if let heading = heading(in: trimmed) {
                 flushParagraph()
-                append(.heading(level: heading.level), heading.content)
+                append(.heading(level: heading.level), heading.content, lineNumber)
             } else if isDivider(trimmed) {
                 flushParagraph()
-                append(.divider)
+                append(.divider, "", lineNumber)
             } else if InlineAnnotationMarkdown.isHeading(trimmed) {
                 flushParagraph()
                 isInsideAnnotation = true
@@ -476,10 +831,22 @@ enum MarkdownReadingParser {
                 flushParagraph()
                 let content = String(trimmed.dropFirst())
                     .trimmingCharacters(in: .whitespaces)
-                append(.quote, content)
+                append(.quote, content, lineNumber)
+            } else if let table = table(at: index, in: lines) {
+                flushParagraph()
+                append(.table(header: table.header, rows: table.rows), "", lineNumber)
+                index = table.endIndex - 1
             } else if let item = unorderedItem(in: line) {
                 flushParagraph()
-                append(.unorderedList(indentation: item.indentation), item.content)
+                if let task = taskItem(in: item.content) {
+                    append(
+                        .taskList(indentation: item.indentation, isChecked: task.isChecked),
+                        task.content,
+                        lineNumber
+                    )
+                } else {
+                    append(.unorderedList(indentation: item.indentation), item.content, lineNumber)
+                }
             } else if let item = orderedItem(in: line) {
                 flushParagraph()
                 append(
@@ -487,22 +854,97 @@ enum MarkdownReadingParser {
                         marker: item.marker,
                         indentation: item.indentation
                     ),
-                    item.content
+                    item.content,
+                    lineNumber
                 )
+            } else if isImageLine(trimmed) {
+                flushParagraph()
+                append(.image, trimmed, lineNumber)
             } else {
                 paragraphLines.append(line)
+                paragraphLineNumbers.append(lineNumber)
             }
         }
 
         flushParagraph()
         flushAnnotation()
         if isInsideCodeFence && !codeLines.isEmpty {
-            append(.code, codeLines.joined(separator: "\n"))
+            append(.code, codeLines.joined(separator: "\n"), lines.count)
         }
         while blocks.last.map({ isSpace($0.kind) }) ?? false {
             blocks.removeLast()
         }
         return blocks
+    }
+
+    private static func table(
+        at startIndex: Int,
+        in lines: [String]
+    ) -> (header: [String], rows: [[String]], endIndex: Int)? {
+        guard startIndex + 1 < lines.count else { return nil }
+        let headerLine = lines[startIndex].trimmingCharacters(in: .whitespaces)
+        let separatorLine = lines[startIndex + 1]
+            .trimmingCharacters(in: .whitespaces)
+        guard isTableRow(headerLine), isTableSeparator(separatorLine) else {
+            return nil
+        }
+
+        var rowLines = [headerLine]
+        var cursor = startIndex + 2
+        while cursor < lines.count,
+              isTableRow(lines[cursor].trimmingCharacters(in: .whitespaces)) {
+            rowLines.append(lines[cursor].trimmingCharacters(in: .whitespaces))
+            cursor += 1
+        }
+        let header = tableCells(headerLine)
+        let rows = rowLines.dropFirst().map(tableCells)
+        return (header, rows, cursor)
+    }
+
+    private static func isTableRow(_ line: String) -> Bool {
+        line.hasPrefix("|") && line.count > 1
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = tableCells(line)
+        guard !cells.isEmpty else { return false }
+        return cells.allSatisfy { cell in
+            let compact = cell.replacingOccurrences(of: " ", with: "")
+            guard compact.hasPrefix(":") || compact.hasSuffix(":") else {
+                return !compact.isEmpty && compact.allSatisfy { $0 == "-" }
+            }
+            let dashes = compact
+                .trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return !dashes.isEmpty && dashes.allSatisfy { $0 == "-" }
+        }
+    }
+
+    private static func tableCells(_ row: String) -> [String] {
+        var trimmed = row
+        if trimmed.hasPrefix("|") { trimmed.removeFirst() }
+        if trimmed.hasSuffix("|") { trimmed.removeLast() }
+        return trimmed.components(separatedBy: "|")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func taskItem(
+        in content: String
+    ) -> (isChecked: Bool, content: String)? {
+        guard content.hasPrefix("[ ]") || content.hasPrefix("[x]")
+            || content.hasPrefix("[X]") else { return nil }
+        let isChecked = !content.hasPrefix("[ ]")
+        let remainder = content.dropFirst(3)
+        guard remainder.first?.isWhitespace == true else { return nil }
+        return (isChecked, remainder.trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func isImageLine(_ line: String) -> Bool {
+        guard line.hasPrefix("![") else { return false }
+        guard let altEnd = line.range(of: "]") else { return false }
+        let remainder = line[altEnd.upperBound...]
+        guard remainder.hasPrefix("("), remainder.hasSuffix(")") else { return false }
+        let path = remainder.dropFirst().dropLast()
+        return !path.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     private static func heading(in line: String) -> (level: Int, content: String)? {

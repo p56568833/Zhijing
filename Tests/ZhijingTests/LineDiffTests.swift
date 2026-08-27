@@ -1260,13 +1260,59 @@ import PDFKit
     #expect(spans.first?.contentRange.location == 16)
 }
 
-@Test func inlineTextMarksDoNotWrapMultipleLinesOrMarkdownLinks() {
-    let multiline = "第一行\n第二行"
-    #expect(InlineTextMarkMarkdown.mutation(
+@Test func inlineTextMarksSupportSpacesAndPreserveMultilineMarkdownStructure() throws {
+    let sentence = "Big Hit 当时几乎到了破产边缘"
+    let sentenceMutation = try #require(InlineTextMarkMarkdown.mutation(
+        in: sentence,
+        selection: NSRange(location: 0, length: sentence.utf16.count),
+        applying: .concept
+    ))
+    #expect(sentenceMutation.replacementText == "[Big Hit 当时几乎到了破产边缘]{.concept}")
+
+    let multiline = """
+    ## 二、Big Hit 前史 (20)
+
+    ### 前期特别垃圾
+    - 业务冷清到旗下艺人来公司主要就是为了玩 Nintendo Wii 的网球游戏
+    ---
+    - 方时赫后来接受彭博采访时回忆，Big Hit 当时几乎到了破产边缘
+    """
+    let mutation = try #require(InlineTextMarkMarkdown.mutation(
         in: multiline,
         selection: NSRange(location: 0, length: multiline.utf16.count),
-        applying: .underline
-    ) == nil)
+        applying: .important
+    ))
+    let marked = mutation.replacementText
+    #expect(marked.contains("## [二、Big Hit 前史 (20)]{.important}"))
+    #expect(marked.contains("\n\n### [前期特别垃圾]{.important}"))
+    #expect(marked.contains("- [业务冷清到旗下艺人来公司主要就是为了玩 Nintendo Wii 的网球游戏]{.important}"))
+    #expect(marked.contains("\n---\n"))
+    #expect(marked.contains("- [方时赫后来接受彭博采访时回忆，Big Hit 当时几乎到了破产边缘]{.important}"))
+
+    let changed = try #require(InlineTextMarkMarkdown.mutation(
+        in: marked,
+        selection: mutation.selectionRange,
+        applying: .concept
+    ))
+    let conceptMarked = (marked as NSString).replacingCharacters(
+        in: changed.range,
+        with: changed.replacementText
+    )
+    #expect(conceptMarked.contains("## [二、Big Hit 前史 (20)]{.concept}"))
+    #expect(!conceptMarked.contains("{.important}"))
+
+    let cleared = try #require(InlineTextMarkMarkdown.mutation(
+        in: conceptMarked,
+        selection: changed.selectionRange,
+        applying: nil
+    ))
+    #expect((conceptMarked as NSString).replacingCharacters(
+        in: cleared.range,
+        with: cleared.replacementText
+    ) == multiline)
+}
+
+@Test func inlineTextMarksStillProtectMarkdownLinks() {
 
     let link = "[链接](https://example.com)"
     let linkText = (link as NSString).range(of: "链接")
@@ -1274,6 +1320,14 @@ import PDFKit
         in: link,
         selection: linkText,
         applying: .concept
+    ) == nil)
+
+    let fencedCode = "```swift\nlet name = \"Big Hit\"\n```"
+    let codeSelection = (fencedCode as NSString).range(of: "Big Hit")
+    #expect(InlineTextMarkMarkdown.mutation(
+        in: fencedCode,
+        selection: codeSelection,
+        applying: .highlight
     ) == nil)
 }
 
@@ -1393,6 +1447,52 @@ import PDFKit
 
     conceptButton.performClick(nil)
     #expect(textView.string.contains("[重点]{.concept}"))
+    #expect(clearButton.isEnabled)
+
+    clearButton.performClick(nil)
+    #expect(textView.string == source)
+}
+
+@MainActor
+@Test func multilineSelectionEnablesTextMarksAndClear() throws {
+    let source = "## Big Hit 前史\n\n- 第一段内容\n- 第二段内容"
+    let scrollView = NSScrollView(
+        frame: NSRect(x: 0, y: 0, width: 520, height: 220)
+    )
+    let textView = MarkdownEditorTextView(frame: scrollView.contentView.bounds)
+    textView.isRichText = false
+    textView.isHorizontallyResizable = false
+    textView.textContainer?.containerSize = NSSize(
+        width: scrollView.contentSize.width,
+        height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.textContainer?.widthTracksTextView = true
+    MarkdownSourceEditor.Coordinator.applyPlainTextAppearance(to: textView)
+    textView.string = source
+    scrollView.documentView = textView
+    textView.setSelectedRange(NSRange(
+        location: 0,
+        length: source.utf16.count
+    ))
+    textView.updateSelectionAnnotationButton()
+
+    let markButtons = textView.subviews.compactMap {
+        $0 as? SelectionMarkButton
+    }
+    let importantButton = try #require(markButtons.first {
+        $0.kind == .important
+    })
+    let clearButton = try #require(markButtons.first {
+        $0.isClearAction
+    })
+    #expect(InlineTextMarkKind.allCases.filter(\.showsInSelectionPills).allSatisfy { kind in
+        markButtons.first { $0.kind == kind }?.isEnabled == true
+    })
+    #expect(!clearButton.isEnabled)
+
+    importantButton.performClick(nil)
+    #expect(textView.string.contains("## [Big Hit 前史]{.important}"))
+    #expect(textView.string.contains("- [第一段内容]{.important}"))
     #expect(clearButton.isEnabled)
 
     clearButton.performClick(nil)

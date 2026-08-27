@@ -1,7 +1,21 @@
 import SwiftUI
 
+/// 标签页帧测量用的偏好键，拖拽换位时用它定位落点。
+private struct TabFrameKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(
+        value: inout [String: CGRect],
+        nextValue: () -> [String: CGRect]
+    ) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
 struct DocumentTabBar: View {
     let store: AppStore
+    @State private var draggingTabID: String?
+    @State private var dragAnchorMidX: CGFloat?
+    @State private var tabFrames: [String: CGRect] = [:]
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -13,11 +27,65 @@ struct DocumentTabBar: View {
                         select: { store.select(document) },
                         close: { store.closeDocumentTab(document) }
                     )
+                    .opacity(draggingTabID == document.id ? 0.65 : 1)
+                    .background(frameReader(for: document))
+                    .gesture(reorderGesture(for: document))
                 }
             }
+            .coordinateSpace(name: "tabBarSpace")
             .padding(.horizontal, 8)
         }
         .frame(height: 40)
+        .onPreferenceChange(TabFrameKey.self) { tabFrames = $0 }
+    }
+
+    private func frameReader(for document: NoteDocument) -> some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: TabFrameKey.self,
+                value: [document.id: geo.frame(in: .named("tabBarSpace"))]
+            )
+        }
+    }
+
+    /// 手势驱动的拖拽换位：按下时对基准位置拍一次快照，
+    /// 拖过相邻标签的中线才移动一格——基准不随换位刷新，
+    /// 杜绝"换位后偏移量叠加"导致的连环乱飞。
+    private func reorderGesture(for document: NoteDocument) -> some Gesture {
+        DragGesture(minimumDistance: 8)
+            .onChanged { value in
+                guard draggingTabID == nil || draggingTabID == document.id else { return }
+                if draggingTabID == nil {
+                    guard let frame = tabFrames[document.id] else { return }
+                    draggingTabID = document.id
+                    dragAnchorMidX = frame.midX
+                }
+                guard let anchorMidX = dragAnchorMidX else { return }
+                let pointerMidX = anchorMidX + value.translation.width
+
+                let order = store.openDocuments
+                guard let index = order.firstIndex(where: { $0.id == document.id })
+                else { return }
+
+                var destination: Int?
+                if index + 1 < order.count,
+                   let nextFrame = tabFrames[order[index + 1].id],
+                   pointerMidX > nextFrame.midX {
+                    destination = index + 1
+                } else if index > 0,
+                          let previousFrame = tabFrames[order[index - 1].id],
+                          pointerMidX < previousFrame.midX {
+                    destination = index - 1
+                }
+                guard let destination else { return }
+                withAnimation(.easeInOut(duration: 0.14)) {
+                    store.moveDocumentTab(order[index], toIndex: destination)
+                }
+            }
+            .onEnded { _ in
+                draggingTabID = nil
+                dragAnchorMidX = nil
+            }
     }
 }
 

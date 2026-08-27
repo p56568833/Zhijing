@@ -35,6 +35,10 @@ enum MarkdownPresentationStyle {
     case textImportant
     case textConcept
     case textUnderline
+    case textRed
+    case textOrange
+    case textGreen
+    case textBlue
     case textMarkSyntax
 
     var attributes: [NSAttributedString.Key: Any] {
@@ -104,6 +108,14 @@ enum MarkdownPresentationStyle {
                 .underlineStyle: NSUnderlineStyle.single.rawValue,
                 .underlineColor: ZhijingTheme.underlineNSColor
             ]
+        case .textRed:
+            [.foregroundColor: NSColor.systemRed]
+        case .textOrange:
+            [.foregroundColor: NSColor.systemOrange]
+        case .textGreen:
+            [.foregroundColor: NSColor.systemGreen]
+        case .textBlue:
+            [.foregroundColor: NSColor.systemBlue]
         case .textMarkSyntax:
             [.foregroundColor: NSColor.tertiaryLabelColor]
         }
@@ -314,6 +326,10 @@ enum MarkdownPresentationHighlighter {
         case .important: .textImportant
         case .concept: .textConcept
         case .underline: .textUnderline
+        case .red: .textRed
+        case .orange: .textOrange
+        case .green: .textGreen
+        case .blue: .textBlue
         }
     }
 
