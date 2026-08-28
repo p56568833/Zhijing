@@ -47,7 +47,8 @@ struct SidebarView: View {
     @State private var deleteFolderTarget: String?
     @State private var libraryScope: LibraryScope = .all
     @State private var draggingDocumentPath: String?
-    @State private var dragOffset: CGFloat = 0
+    @State private var dragGhostOffset: CGFloat = 0
+    @State private var dragGhostBaseOffset: CGFloat = 0
     @State private var dragStartMidY: CGFloat?
     @State private var dragSlotMidYs: [CGFloat] = []
     @State private var dragActiveOrder: [NoteDocument]?
@@ -233,29 +234,41 @@ struct SidebarView: View {
                             noteRow(document)
                         }
                         .background(frameReader(for: document))
-                        .scaleEffect(isDragged ? 1.04 : 1)
-                        .offset(y: isDragged ? dragOffset : 0)
-                        .zIndex(isDragged ? 1 : 0)
-                        .shadow(
-                            color: .black.opacity(isDragged ? 0.3 : 0),
-                            radius: isDragged ? 14 : 0,
-                            y: isDragged ? 6 : 0
-                        )
-                        .animation(.snappy(duration: 0.2), value: isDragged)
-                        .animation(
-                            isDragged ? nil : .snappy(duration: 0.26),
-                            value: orderSignature
-                        )
-                        .gesture(reorderGesture(for: document))
+                        // 被拖行的原位隐身，充当占位空隙；真实外观由浮层负责
+                        .opacity(isDragged ? 0 : 1)
+                        .animation(.snappy(duration: 0.26), value: orderSignature)
                     }
+                }
+                .overlay(alignment: .top) {
+                    dragGhost
                 }
                 .padding(.horizontal, 6)
                 .padding(.top, 4)
                 .padding(.bottom, 8)
+                .gesture(reorderGesture())
             }
         }
         .coordinateSpace(name: "libraryListSpace")
         .onPreferenceChange(RowFrameKey.self) { rowFrames = $0 }
+    }
+
+    /// 跟随指针的浮层行：位置 = 原槽位 + 纯指针位移。
+    /// 它不参与布局，换位时其余行怎么动都影响不到它。
+    @ViewBuilder
+    private var dragGhost: some View {
+        if let path = draggingDocumentPath,
+           let document = displayDocuments.first(where: { $0.relativePath == path }) {
+            LibraryRowContainer(
+                isSelected: store.selectedDocument?.id == document.id
+            ) {
+                noteRow(document)
+            }
+            .scaleEffect(1.04)
+            .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
+            .offset(y: dragGhostBaseOffset + dragGhostOffset)
+            .allowsHitTesting(false)
+            .animation(.snappy(duration: 0.18), value: draggingDocumentPath == nil)
+        }
     }
 
     @ViewBuilder
@@ -523,7 +536,7 @@ struct SidebarView: View {
         }
     }
 
-    // MARK: - 拖拽排序（Safari 式：按住浮起跟手，其余行让位，松手弹回槽位）
+    // MARK: - 拖拽排序（Safari 式：浮层跟手 + 原位空隙让位）
 
     /// 拖拽期间渲染冻结的本地顺序，松手才一次性提交回 store；
     /// 拖动途中排序基准（改动时间、外部文件变动）不会让列表在指下重排。
@@ -531,32 +544,46 @@ struct SidebarView: View {
         dragActiveOrder ?? scopedDocuments
     }
 
-    /// 手势驱动的拖拽排序：按下即浮起、1:1 跟手；
-    /// 行的中线越过相邻槽位中线时其余行弹簧让位，可一次跨多格。
-    private func reorderGesture(for document: NoteDocument) -> some Gesture {
-        DragGesture(minimumDistance: 5)
+    private func document(at point: CGPoint) -> NoteDocument? {
+        scopedDocuments.first { document in
+            guard let frame = rowFrames[document.relativePath] else { return false }
+            return point.y >= frame.minY && point.y <= frame.maxY
+        }
+    }
+
+    /// 列表级拖拽手势：起点落在哪一行就拖哪行。
+    /// 手势挂在列表容器上——容器本身在拖拽期间永远不动，
+    /// translation 始终是纯指针位移，从根上杜绝"行跟着指针走、
+    /// 指针位移又被行移动污染"造成的乱飞。
+    private func reorderGesture() -> some Gesture {
+        DragGesture(minimumDistance: 5, coordinateSpace: .named("libraryListSpace"))
             .onChanged { value in
                 guard renameTargetRowKey == nil else { return }
-                guard dragActiveOrder == nil
-                    || draggingDocumentPath == document.relativePath else { return }
                 if dragActiveOrder == nil {
                     // 槽位判定只认按下瞬间的静止布局快照：
-                    // 此后邻居在滑动、被拖行在飘，实时帧会污染基准。
+                    // 此后邻居在滑动、浮层在飘，实时帧会污染基准。
                     let documents = scopedDocuments
                     guard !documents.isEmpty,
-                          documents.allSatisfy({ rowFrames[$0.relativePath] != nil })
+                          documents.allSatisfy({ rowFrames[$0.relativePath] != nil }),
+                          let document = document(at: value.startLocation),
+                          let frame = rowFrames[document.relativePath],
+                          let firstFrame = rowFrames[documents[0].relativePath]
                     else { return }
                     draggingDocumentPath = document.relativePath
-                    dragStartMidY = rowFrames[document.relativePath]?.midY
+                    dragStartMidY = frame.midY
                     dragSlotMidYs = documents.map { rowFrames[$0.relativePath]!.midY }
+                    // 浮层自然停靠在列表顶端，先补上"到原槽位"的位移
+                    dragGhostBaseOffset = frame.minY - firstFrame.minY
+                    dragGhostOffset = 0
                     dragActiveOrder = documents
                     dragMovedAny = false
                     NSCursor.closedHand.push()
                 }
                 guard let startMidY = dragStartMidY,
                       let visible = dragActiveOrder,
+                      let draggedPath = draggingDocumentPath,
                       let index = visible.firstIndex(where: {
-                          $0.relativePath == document.relativePath
+                          $0.relativePath == draggedPath
                       }),
                       !dragSlotMidYs.isEmpty,
                       index < dragSlotMidYs.count
@@ -567,8 +594,10 @@ struct SidebarView: View {
                     max(startMidY + value.translation.height, dragSlotMidYs.first!),
                     dragSlotMidYs.last!
                 )
-                dragOffset = visualMidY - dragSlotMidYs[index]
+                dragGhostOffset = visualMidY - startMidY
 
+                // 中线越过哪个槽位就换到哪，可一次跨多格；
+                // 换位只动数据，其余行靠签名动画弹簧滑动，浮层不受影响。
                 var target = index
                 while target + 1 < dragSlotMidYs.count,
                       visualMidY > (dragSlotMidYs[target] + dragSlotMidYs[target + 1]) / 2 {
@@ -579,12 +608,9 @@ struct SidebarView: View {
                     target -= 1
                 }
                 guard target != index else { return }
-                // 换位写入本地顺序：其余行靠签名动画弹簧滑动，
-                // 被拖行的槽位变化必须瞬时，才能和上面的跟手偏移严格抵消。
                 dragActiveOrder = DocumentOrdering.moved(
                     visible, fromIndex: index, toIndex: target
                 )
-                dragOffset = visualMidY - dragSlotMidYs[target]
                 dragMovedAny = true
             }
             .onEnded { _ in
@@ -592,28 +618,33 @@ struct SidebarView: View {
             }
     }
 
-    /// 松手：顺序一次性提交回 store，行从指针处弹回槽位；
-    /// 浮起状态多留一拍再收，避免落位动画没走完就沉到邻行下面。
+    /// 松手：顺序一次性提交回 store，浮层从指针处弹回空隙槽位；
+    /// 真实行保持隐身，等浮层落稳后再显形，位置逐像素相同。
     private func finishDrag() {
-        guard let activeOrder = dragActiveOrder else { return }
+        guard let activeOrder = dragActiveOrder,
+              let draggedPath = draggingDocumentPath,
+              let startMidY = dragStartMidY,
+              let index = activeOrder.firstIndex(where: { $0.relativePath == draggedPath }),
+              !dragSlotMidYs.isEmpty,
+              index < dragSlotMidYs.count
+        else { return }
         NSCursor.pop()
-        let draggedPath = draggingDocumentPath
-        dragActiveOrder = nil
-        dragStartMidY = nil
-        dragSlotMidYs = []
         let moved = dragMovedAny
         dragMovedAny = false
+        dragActiveOrder = nil
+        dragStartMidY = nil
         if moved {
             if store.documentSort != .manual { store.documentSort = .manual }
             store.setManualDocumentOrder(activeOrder)
         }
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
-            dragOffset = 0
+        let landingOffset = dragSlotMidYs[index] - startMidY
+        dragSlotMidYs = []
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            dragGhostOffset = landingOffset
         }
         Task { @MainActor in
-            try? await Task.sleep(for: .seconds(0.45))
-            if draggingDocumentPath == draggedPath,
-               dragActiveOrder == nil, dragOffset == 0 {
+            try? await Task.sleep(for: .seconds(0.42))
+            if draggingDocumentPath == draggedPath, dragActiveOrder == nil {
                 draggingDocumentPath = nil
             }
         }
