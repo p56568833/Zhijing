@@ -4,8 +4,8 @@ set -euo pipefail
 APP_NAME="Zhijing"
 DISPLAY_NAME="知境"
 BUNDLE_ID="com.zhijing.app"
-APP_VERSION="0.3.0"
-BUILD_NUMBER="4"
+APP_VERSION="0.3.1"
+BUILD_NUMBER="5"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
