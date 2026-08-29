@@ -58,6 +58,11 @@ enum ZhijingTheme {
         light: NSColor(red: 0.31, green: 0.43, blue: 0.58, alpha: 0.90),
         dark: NSColor(red: 0.63, green: 0.75, blue: 0.88, alpha: 0.90)
     )
+    /// 批注锚点波浪线与编号的朱红，深色模式提亮保证可见。
+    static let annotationWaveNSColor = dynamicColor(
+        light: NSColor(red: 0.788, green: 0.294, blue: 0.259, alpha: 1),
+        dark: NSColor(red: 0.95, green: 0.48, blue: 0.43, alpha: 1)
+    )
 
     static let accent = Color(nsColor: accentNSColor)
     static let canvas = Color(nsColor: canvasNSColor)

@@ -1331,6 +1331,85 @@ import PDFKit
     ) == nil)
 }
 
+@Test func clearingAcrossPartialMarksKeepsTheUnselectedEdgesMarked() throws {
+    let source = "[甲乙]{.important} 和 [丙丁]{.concept}"
+    let spans = InlineTextMarkMarkdown.spans(in: source)
+    // 选区从第一个标记正文的「乙」拖到第二个标记正文的「丙」，两端都只切中一部分。
+    let selection = NSRange(
+        location: spans[0].contentRange.location + 1,
+        length: spans[1].contentRange.location + 1
+            - (spans[0].contentRange.location + 1)
+    )
+
+    let cleared = try #require(InlineTextMarkMarkdown.mutation(
+        in: source,
+        selection: selection,
+        applying: nil
+    ))
+    let clearedSource = (source as NSString).replacingCharacters(
+        in: cleared.range,
+        with: cleared.replacementText
+    )
+    #expect(clearedSource == "[甲]{.important}乙 和 丙[丁]{.concept}")
+    // 清除后选区落在被取消标记的文字上。
+    #expect(cleared.selectionRange == (clearedSource as NSString).range(of: "乙 和 丙"))
+
+    // 换成荧光：选中的部分变成新标记，选区外的「甲」「丁」保留原标记。
+    let rekindled = try #require(InlineTextMarkMarkdown.mutation(
+        in: source,
+        selection: selection,
+        applying: .highlight
+    ))
+    let rekindledSource = (source as NSString).replacingCharacters(
+        in: rekindled.range,
+        with: rekindled.replacementText
+    )
+    #expect(rekindledSource == "[甲]{.important}[乙 和 丙]{.mark}[丁]{.concept}")
+    #expect(InlineTextMarkMarkdown.spans(in: rekindledSource).map(\.kind) == [
+        .important,
+        .highlight,
+        .concept,
+    ])
+}
+
+@Test func clearingSelectionsSpanningWholeMarksUnmarksEverything() throws {
+    let source = "前[甲]{.important}中[乙]{.concept}后"
+    let spans = InlineTextMarkMarkdown.spans(in: source)
+    let selection = NSRange(
+        location: spans[0].fullRange.location,
+        length: NSMaxRange(spans[1].fullRange) - spans[0].fullRange.location
+    )
+    let cleared = try #require(InlineTextMarkMarkdown.mutation(
+        in: source,
+        selection: selection,
+        applying: nil
+    ))
+    // 选区从「[」开始到第二个标记结尾：选区内的语法全部剥掉。
+    #expect(cleared.replacementText == "甲中乙")
+    let restored = (source as NSString).replacingCharacters(
+        in: cleared.range,
+        with: cleared.replacementText
+    )
+    #expect(restored == "前甲中乙后")
+    #expect(cleared.selectionRange == (restored as NSString).range(of: "甲中乙"))
+}
+
+@Test func clearingSelectionTouchingOnlySyntaxKeepsTheMarkIntact() throws {
+    let source = "前[甲]{.important}后"
+    let span = try #require(InlineTextMarkMarkdown.spans(in: source).first)
+    // 只选中开头的「[」：标记整体保留，不做任何改动。
+    let cleared = try #require(InlineTextMarkMarkdown.mutation(
+        in: source,
+        selection: span.prefixRange,
+        applying: nil
+    ))
+    let restored = (source as NSString).replacingCharacters(
+        in: cleared.range,
+        with: cleared.replacementText
+    )
+    #expect(restored == source)
+}
+
 @MainActor
 @Test func editorPresentsTextMarksWithoutChangingTextMetrics() throws {
     let source = "[荧光]{.mark} [警示]{.important} [概念]{.concept} [句子]{.underline}"
@@ -1365,7 +1444,7 @@ import PDFKit
 }
 
 @MainActor
-@Test func editorCollapsesInactiveTextMarkSyntaxAndRevealsTheActiveMark() throws {
+@Test func editorAlwaysCollapsesTextMarkSyntaxEvenWhenTheWholeMarkIsSelected() throws {
     let source = "前文 [重点结论]{.important} 后文"
     let span = try #require(InlineTextMarkMarkdown.spans(in: source).first)
     let scrollView = NSScrollView(
@@ -1384,24 +1463,35 @@ import PDFKit
     textView.string = source
     scrollView.documentView = textView
 
-    textView.setSelectedRange(NSRange(location: source.utf16.count, length: 0))
-    textView.updateSelectionAnnotationButton()
     let layoutManager = try #require(textView.layoutManager)
     let textContainer = try #require(textView.textContainer)
-    layoutManager.ensureLayout(for: textContainer)
     let hiddenGlyphIndex = layoutManager.glyphIndexForCharacter(
         at: span.prefixRange.location
     )
-    #expect(layoutManager.propertyForGlyph(at: hiddenGlyphIndex).contains(.null))
-
-    textView.setSelectedRange(span.contentRange)
-    textView.updateSelectionAnnotationButton()
-    layoutManager.ensureLayout(for: textContainer)
-    let revealedGlyphIndex = layoutManager.glyphIndexForCharacter(
-        at: span.prefixRange.location
+    let suffixGlyphIndex = layoutManager.glyphIndexForCharacter(
+        at: span.suffixRange.location
     )
-    #expect(!layoutManager.propertyForGlyph(at: revealedGlyphIndex).contains(.null))
-    #expect(textView.selectedRange() == span.contentRange)
+
+    func expectCollapsed() {
+        textView.updateSelectionAnnotationButton()
+        layoutManager.ensureLayout(for: textContainer)
+        #expect(layoutManager.propertyForGlyph(at: hiddenGlyphIndex).contains(.null))
+        #expect(layoutManager.propertyForGlyph(at: suffixGlyphIndex).contains(.null))
+    }
+
+    // 光标停在标记外、标记内，乃至全选整句：语法一律收起。
+    textView.setSelectedRange(NSRange(location: source.utf16.count, length: 0))
+    expectCollapsed()
+
+    textView.setSelectedRange(NSRange(
+        location: span.contentRange.location + 1,
+        length: 0
+    ))
+    expectCollapsed()
+
+    textView.setSelectedRange(span.fullRange)
+    expectCollapsed()
+    #expect(textView.selectedRange() == span.fullRange)
 }
 
 @MainActor

@@ -242,6 +242,7 @@ enum MarkdownReadingAttributedRenderer {
         baseURL: URL? = nil
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
+        var annotationNumber = 0
         for block in MarkdownReadingParser.parse(markdown) {
             switch block.kind {
             case .heading(let level):
@@ -282,7 +283,12 @@ enum MarkdownReadingAttributedRenderer {
                     spacingAfter: 14
                 )
             case .annotation:
-                appendAnnotation(block.content, to: result)
+                annotationNumber += 1
+                appendAnnotation(
+                    block.content,
+                    number: annotationNumber,
+                    to: result
+                )
             case .unorderedList(let indentation):
                 append(
                     "•  \(block.content)",
@@ -356,6 +362,7 @@ enum MarkdownReadingAttributedRenderer {
 
     private static func appendAnnotation(
         _ source: String,
+        number: Int,
         to result: NSMutableAttributedString
     ) {
         var lines = source.components(separatedBy: .newlines)
@@ -375,9 +382,17 @@ enum MarkdownReadingAttributedRenderer {
             spacingBefore: 10,
             spacingAfter: 4
         )
+        append(
+            " " + InlineAnnotationMarkdown.circledNumber(number),
+            to: result,
+            font: .systemFont(ofSize: 12, weight: .semibold),
+            color: ZhijingTheme.annotationWaveNSColor,
+            backgroundColor: background,
+            spacingAfter: 4
+        )
         if !context.isEmpty {
             append(
-                context,
+                InlineAnnotationMarkdown.shortenedExcerpt(from: context),
                 to: result,
                 font: .systemFont(ofSize: 13),
                 color: .secondaryLabelColor,

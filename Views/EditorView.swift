@@ -188,7 +188,9 @@ struct EditorView: View {
                     onChange: store.editorDidChange,
                     onSelectionChange: store.editorSelectionDidChange,
                     onFindResultChange: store.updateDocumentFindResult,
-                    onFindCommand: store.handleDocumentFindCommand
+                    onFindCommand: store.handleDocumentFindCommand,
+                    onAnnotationCreated: store.registerInlineAnnotation,
+                    onAnnotationDeleted: store.deleteAnnotation
                 )
                 .accessibilityLabel("\(document.title) 编辑器")
             }

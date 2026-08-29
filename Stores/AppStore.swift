@@ -557,6 +557,30 @@ final class AppStore {
         persistAnnotations(for: document)
     }
 
+    /// 编辑器插入批注块后调用：把这条批注登记进注册表，
+    /// 它才有锚点解析、波浪线与侧轨显示，并随文稿持久化。
+    func registerInlineAnnotation(text: String, selection: NSRange) {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, let document = selectedDocument else { return }
+        let source = editorText as NSString
+        guard selection.length > 0, NSMaxRange(selection) <= source.length else {
+            return
+        }
+        let validSelection = validEditorSelection(EditorTextSelection(
+            documentID: document.id,
+            range: selection,
+            text: source.substring(with: selection)
+        ))
+        guard let validSelection,
+              annotationController.add(
+                  text: value,
+                  selection: validSelection,
+                  document: document,
+                  documentText: editorText
+              ) else { return }
+        persistAnnotations(for: document)
+    }
+
     func updateAnnotation(id: UUID, text: String) {
         guard annotationController.update(
             id: id,

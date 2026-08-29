@@ -4,6 +4,8 @@ import SwiftUI
 final class MarkdownEditorTextView: NSTextView {
     var markdownLinks: [MarkdownEditorLink] = []
     var onFindCommand: ((DocumentFindCommand) -> Void)?
+    var onAnnotationCreated: ((String, NSRange) -> Void)?
+    var onAnnotationDeleted: ((UUID) -> Void)?
     var annotationDocumentID: String?
     private var linkTrackingArea: NSTrackingArea?
     private var selectionAnnotationButton: SelectionAnnotationButton?
@@ -15,6 +17,18 @@ final class MarkdownEditorTextView: NSTextView {
     private var resolvedAnnotations: [ResolvedTextAnnotation] = []
     private var highlightedAnnotationRanges: [NSRange] = []
     private var pendingTextMutation: EditorTextMutation?
+    private(set) var annotationVisuals: [AnnotationAnchorVisual] = []
+    private var annotationHeadingRanges: [NSRange] = []
+    private var annotationHeadingIDs: [UUID?] = []
+
+    struct AnnotationAnchorVisual: Equatable {
+        let range: NSRange
+        let number: Int
+        let annotationID: UUID
+    }
+
+    private static let annotationWaveOffset: CGFloat = 9
+    private static let annotationWaveLineWidth: CGFloat = 1.5
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
@@ -33,6 +47,11 @@ final class MarkdownEditorTextView: NSTextView {
     override func layout() {
         super.layout()
         layoutSelectionAnnotationButton()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        drawAnnotationAnchors(in: dirtyRect)
     }
 
     override func shouldChangeText(
@@ -253,6 +272,20 @@ final class MarkdownEditorTextView: NSTextView {
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event) ?? NSMenu()
+        if let blockRange = InlineAnnotationMarkdown.annotationBlockRange(
+            at: selectedRange().location,
+            in: string
+        ) {
+            menu.addItem(.separator())
+            let deleteItem = NSMenuItem(
+                title: "删除批注",
+                action: #selector(deleteAnnotationBlock(_:)),
+                keyEquivalent: ""
+            )
+            deleteItem.target = self
+            deleteItem.representedObject = NSValue(range: blockRange)
+            menu.addItem(deleteItem)
+        }
         guard selectedRange().length > 0 else { return menu }
         menu.addItem(.separator())
         appendTextMarkItems(to: menu)
@@ -320,27 +353,16 @@ final class MarkdownEditorTextView: NSTextView {
 
     private func updateTextMarkSyntaxVisibility() {
         guard let textMarkSyntaxVisibilityController else { return }
-        let selection = selectedRange()
-        let hiddenRanges = InlineTextMarkMarkdown.spans(in: string).flatMap { span in
-            shouldRevealTextMarkSyntax(span, selection: selection)
-                ? []
-                : [span.prefixRange, span.suffixRange]
+        // 标记语法永远收起：选区覆盖整句也不露出，正文样式即标记。
+        var hiddenRanges = InlineTextMarkMarkdown.spans(in: string).flatMap { span in
+            [span.prefixRange, span.suffixRange]
         }
+        // 批注块的「原文」行与空分隔行整段折叠，块只剩标题和内容两行。
+        hiddenRanges.append(contentsOf: InlineAnnotationMarkdown.hiddenExcerptRanges(in: string))
         textMarkSyntaxVisibilityController.updateHiddenRanges(
             hiddenRanges,
             textLength: (string as NSString).length
         )
-    }
-
-    private func shouldRevealTextMarkSyntax(
-        _ span: InlineTextMarkSpan,
-        selection: NSRange
-    ) -> Bool {
-        if selection.length == 0 {
-            return selection.location >= span.fullRange.location
-                && selection.location < NSMaxRange(span.fullRange)
-        }
-        return NSIntersectionRange(selection, span.fullRange).length > 0
     }
 
     @objc private func applyTextMarkFromMenu(_ sender: NSMenuItem) {
@@ -356,6 +378,42 @@ final class MarkdownEditorTextView: NSTextView {
 
     @objc private func clearTextMark(_ sender: Any?) {
         _ = applyTextMark(nil)
+    }
+
+    @objc private func deleteAnnotationBlock(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? NSValue else { return }
+        let blockRange = value.rangeValue
+        guard NSMaxRange(blockRange) <= (string as NSString).length else { return }
+        // 正文块与注册表锚点一起清掉；编辑操作走撤销栈，Cmd+Z 可恢复。
+        let headingIndex = annotationHeadingRanges.filter {
+            $0.location < NSMaxRange(blockRange)
+        }.count - 1
+        var pairedID: UUID?
+        if headingIndex >= 0, headingIndex < annotationHeadingIDs.count {
+            pairedID = annotationHeadingIDs[headingIndex]
+        }
+        guard shouldChangeText(in: blockRange, replacementString: "") else {
+            return
+        }
+        textStorage?.replaceCharacters(in: blockRange, with: "")
+        didChangeText()
+        if let pairedID {
+            onAnnotationDeleted?(pairedID)
+        }
+    }
+
+    override func deleteBackward(_ sender: Any?) {
+        // 光标前是折叠的批注原文段时，一次退格吞掉整段不可见文字。
+        let location = selectedRange().location
+        if selectedRange().length == 0, location > 0,
+           let hidden = InlineAnnotationMarkdown.hiddenExcerptRanges(in: string)
+               .first(where: { NSMaxRange($0) == location }),
+           shouldChangeText(in: hidden, replacementString: "") {
+            textStorage?.replaceCharacters(in: hidden, with: "")
+            didChangeText()
+            return
+        }
+        super.deleteBackward(sender)
     }
 
     @discardableResult
@@ -513,6 +571,7 @@ final class MarkdownEditorTextView: NSTextView {
 
     func applyAnnotationHighlights() {
         guard let layoutManager else { return }
+        // 清掉旧版蓝色下划线高亮，锚点改由 draw(_:) 绘制红波浪与编号。
         for range in highlightedAnnotationRanges where range.length > 0 {
             layoutManager.removeTemporaryAttribute(
                 .underlineStyle,
@@ -527,17 +586,181 @@ final class MarkdownEditorTextView: NSTextView {
                 forCharacterRange: range
             )
         }
-        highlightedAnnotationRanges = resolvedAnnotations.map(\.range)
-        for range in highlightedAnnotationRanges where range.length > 0 {
-            layoutManager.addTemporaryAttributes(
-                [
-                    .underlineStyle: NSUnderlineStyle.single.rawValue,
-                    .underlineColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.7),
-                    .backgroundColor: ZhijingTheme.annotationNSColor.withAlphaComponent(0.075)
-                ],
-                forCharacterRange: range
+        highlightedAnnotationRanges = []
+        refreshAnnotationVisuals()
+    }
+
+    private func refreshAnnotationVisuals() {
+        let headingRanges = InlineAnnotationMarkdown.annotationHeadingContentRanges(
+            in: string
+        )
+        // 编号来自文档里的批注块顺序；波浪线锚点按位置与块一一配对。
+        let sortedAnnotations = resolvedAnnotations.sorted {
+            $0.range.location < $1.range.location
+        }
+        var visuals: [AnnotationAnchorVisual] = []
+        var headingIDs: [UUID?] = []
+        var index = 0
+        for (blockIndex, headingRange) in headingRanges.enumerated() {
+            var pairedID: UUID?
+            if index < sortedAnnotations.count,
+               NSMaxRange(sortedAnnotations[index].range) <= headingRange.location {
+                let annotation = sortedAnnotations[index]
+                pairedID = annotation.annotation.id
+                visuals.append(AnnotationAnchorVisual(
+                    range: annotation.range,
+                    number: blockIndex + 1,
+                    annotationID: annotation.annotation.id
+                ))
+                index += 1
+            }
+            headingIDs.append(pairedID)
+        }
+        annotationVisuals = visuals
+        annotationHeadingRanges = headingRanges
+        annotationHeadingIDs = headingIDs
+        needsDisplay = true
+    }
+
+    private func drawAnnotationAnchors(in dirtyRect: NSRect) {
+        guard !annotationVisuals.isEmpty || !annotationHeadingRanges.isEmpty,
+              let layoutManager, let textContainer else { return }
+        let origin = textContainerOrigin
+
+        for visual in annotationVisuals {
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: visual.range,
+                actualCharacterRange: nil
+            )
+            guard glyphRange.length > 0 else { continue }
+            var glyphLocation = glyphRange.location
+            let glyphEnd = NSMaxRange(glyphRange)
+            var waveEndX: CGFloat?
+            var waveBaseline: CGFloat = 0
+            while glyphLocation < glyphEnd {
+                var lineGlyphRange = NSRange()
+                _ = layoutManager.lineFragmentRect(
+                    forGlyphAt: glyphLocation,
+                    effectiveRange: &lineGlyphRange
+                )
+                let usedRect = layoutManager.lineFragmentUsedRect(
+                    forGlyphAt: glyphLocation,
+                    effectiveRange: nil
+                )
+                let intersection = NSIntersectionRange(lineGlyphRange, glyphRange)
+                if intersection.length > 0 {
+                    let glyphRect = layoutManager.boundingRect(
+                        forGlyphRange: intersection,
+                        in: textContainer
+                    )
+                    let font = anchorFont(
+                        at: layoutManager.characterIndexForGlyph(
+                            at: intersection.location
+                        )
+                    )
+                    let baseline = usedRect.minY
+                        + max(font.ascender, 0) + origin.y
+                    drawWave(
+                        from: glyphRect.minX + origin.x,
+                        to: glyphRect.maxX + origin.x,
+                        at: baseline + Self.annotationWaveOffset
+                    )
+                    waveEndX = glyphRect.maxX + origin.x
+                    waveBaseline = baseline
+                }
+                guard NSMaxRange(lineGlyphRange) > glyphLocation else { break }
+                glyphLocation = NSMaxRange(lineGlyphRange)
+            }
+            // 批注段末尾画红色上标圈号，指回对应批注块。
+            if let waveEndX {
+                let symbol = InlineAnnotationMarkdown.circledNumber(visual.number)
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 10.5, weight: .bold),
+                    .foregroundColor: ZhijingTheme.annotationWaveNSColor
+                ]
+                let size = (symbol as NSString).size(withAttributes: attributes)
+                NSAttributedString(string: symbol, attributes: attributes).draw(at: NSPoint(
+                    x: waveEndX + 2,
+                    y: waveBaseline - size.height - 3
+                ))
+            }
+        }
+
+        for (blockIndex, headingRange) in annotationHeadingRanges.enumerated() {
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: headingRange,
+                actualCharacterRange: nil
+            )
+            guard glyphRange.length > 0 else { continue }
+            let usedRect = layoutManager.lineFragmentUsedRect(
+                forGlyphAt: glyphRange.location,
+                effectiveRange: nil
+            )
+            let glyphRect = layoutManager.boundingRect(
+                forGlyphRange: glyphRange,
+                in: textContainer
+            )
+            let font = anchorFont(
+                at: layoutManager.characterIndexForGlyph(at: glyphRange.location)
+            )
+            let baseline = usedRect.minY + max(font.ascender, 0) + origin.y
+            let symbol = InlineAnnotationMarkdown.circledNumber(blockIndex + 1)
+            // 平排圈号：基线与「批注」对齐，略小一号。
+            let numberFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: numberFont,
+                .foregroundColor: ZhijingTheme.annotationWaveNSColor
+            ]
+            NSAttributedString(string: symbol, attributes: attributes).draw(at: NSPoint(
+                x: glyphRect.maxX + origin.x + 3,
+                y: baseline - numberFont.ascender
+            ))
+        }
+    }
+
+    private func anchorFont(at characterIndex: Int) -> NSFont {
+        let length = (string as NSString).length
+        guard characterIndex >= 0, characterIndex < length,
+              let font = textStorage?.attribute(
+                  .font,
+                  at: characterIndex,
+                  effectiveRange: nil
+              ) as? NSFont else {
+            return self.font ?? NSFont.systemFont(ofSize: 15)
+        }
+        return font
+    }
+
+    private func drawWave(from startX: CGFloat, to endX: CGFloat, at baselineY: CGFloat) {
+        guard endX > startX else { return }
+        let path = NSBezierPath()
+        path.lineWidth = Self.annotationWaveLineWidth
+        path.lineCapStyle = .round
+        let amplitude: CGFloat = 1.3
+        let halfWave: CGFloat = 3.2
+        path.move(to: NSPoint(x: startX, y: baselineY))
+        var x = startX
+        var crest = true
+        while x + halfWave <= endX {
+            let control = baselineY + (crest ? amplitude : -amplitude) * 1.4
+            path.curve(
+                to: NSPoint(x: x + halfWave, y: baselineY),
+                controlPoint1: NSPoint(x: x + halfWave * 0.25, y: control),
+                controlPoint2: NSPoint(x: x + halfWave * 0.75, y: control)
+            )
+            x += halfWave
+            crest.toggle()
+        }
+        if endX - x > 0.5 {
+            let control = baselineY + (crest ? amplitude : -amplitude)
+            path.curve(
+                to: NSPoint(x: endX, y: baselineY),
+                controlPoint1: NSPoint(x: x + (endX - x) * 0.35, y: control),
+                controlPoint2: NSPoint(x: x + (endX - x) * 0.7, y: baselineY)
             )
         }
+        ZhijingTheme.annotationWaveNSColor.setStroke()
+        path.stroke()
     }
 
     @objc private func showAnnotationComposer(_ sender: Any?) {
@@ -576,7 +799,11 @@ final class MarkdownEditorTextView: NSTextView {
                 selectedText: selection.text,
                 onSave: { [weak self, weak popover] text in
                     popover?.close()
-                    self?.insertInlineAnnotation(text, for: selection.range)
+                    guard let self,
+                          self.insertInlineAnnotation(text, for: selection.range)
+                    else { return }
+                    // 块写入正文后登记注册表，批注才有锚点解析与波浪线。
+                    self.onAnnotationCreated?(text, selection.range)
                 },
                 onCancel: { [weak popover] in
                     popover?.close()
@@ -718,6 +945,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
     let onSelectionChange: (EditorTextSelection?) -> Void
     let onFindResultChange: (DocumentFindResult) -> Void
     let onFindCommand: (DocumentFindCommand) -> Void
+    var onAnnotationCreated: ((String, NSRange) -> Void)?
+    var onAnnotationDeleted: ((UUID) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -733,6 +962,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.annotationDocumentID = documentID
         textView.onFindCommand = onFindCommand
+        textView.onAnnotationCreated = onAnnotationCreated
+        textView.onAnnotationDeleted = onAnnotationDeleted
         scrollView.documentView = textView
         context.coordinator.observeScrolling(in: scrollView, textView: textView)
 
@@ -773,6 +1004,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         }
         textView.annotationDocumentID = documentID
         textView.onFindCommand = onFindCommand
+        textView.onAnnotationCreated = onAnnotationCreated
+        textView.onAnnotationDeleted = onAnnotationDeleted
         context.coordinator.synchronize(
             text: text,
             documentID: documentID,
