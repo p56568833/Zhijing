@@ -135,11 +135,13 @@ enum InlineTextMarkMarkdown {
               NSMaxRange(selection) <= nsSource.length else { return nil }
 
         let allSpans = spans(in: source)
+        // 光标在单个标记内（选区碰到正文）→ 整个标记换色或清除；
+        // 选区只压住语法字符时走下面的改写路径，标记保持原样。
         if let existing = containingSpan(
             in: source,
             selection: selection,
             spans: allSpans
-        ) {
+        ), NSIntersectionRange(existing.contentRange, selection).length > 0 {
             let content = nsSource.substring(with: existing.contentRange)
             let nextKind = requestedKind == existing.kind ? nil : requestedKind
             let replacement = nextKind.map { encoded(content, as: $0) } ?? content
@@ -157,36 +159,42 @@ enum InlineTextMarkMarkdown {
         let intersectingSpans = allSpans.filter {
             NSIntersectionRange($0.fullRange, selection).length > 0
         }
-        if requestedKind == nil {
-            return removingMarks(
-                from: nsSource,
+        if intersectingSpans.isEmpty {
+            guard let requestedKind else { return nil }
+            return encodingPlainSelection(
+                source: nsSource,
                 selection: selection,
-                intersectingSpans: intersectingSpans
+                requestedKind: requestedKind
             )
         }
+        return rewritingMarks(
+            source: nsSource,
+            selection: selection,
+            intersectingSpans: intersectingSpans,
+            requestedKind: requestedKind
+        )
+    }
 
-        guard intersectingSpans.allSatisfy({
-            contains(selection, $0.fullRange)
-        }) else { return nil }
-
-        let selectedText = nsSource.substring(with: selection)
-        guard MarkdownLinkDetector.links(in: source).allSatisfy({
+    private static func encodingPlainSelection(
+        source: NSString,
+        selection: NSRange,
+        requestedKind: InlineTextMarkKind
+    ) -> InlineTextMarkMutation? {
+        let selectedText = source.substring(with: selection)
+        guard MarkdownLinkDetector.links(in: source as String).allSatisfy({
                   NSIntersectionRange($0.range, selection).length == 0
               }),
               !intersectsCodeFence(
-                  in: source,
+                  in: source as String,
                   selection: selection,
                   selectedText: selectedText
               ),
-              let requestedKind else { return nil }
-
-        let plainSelection = removingSyntax(from: selectedText)
-        guard let encodedSelection = encodedSelection(
-            plainSelection,
-            source: nsSource,
-            sourceLocation: selection.location,
-            as: requestedKind
-        ) else { return nil }
+              let encodedSelection = encodedSelection(
+                  selectedText,
+                  source: source,
+                  sourceLocation: selection.location,
+                  as: requestedKind
+              ) else { return nil }
 
         let replacementLength = (encodedSelection.text as NSString).length
         let nextSelection: NSRange
@@ -210,6 +218,129 @@ enum InlineTextMarkMarkdown {
         )
     }
 
+    /// 选区横跨（或只切中一部分）多个标记时的改写：
+    /// 被选中的内容按请求处理——清除或换成新标记；
+    /// 边缘标记落在选区外的部分保留原标记，不静默丢弃已有样式。
+    private static func rewritingMarks(
+        source: NSString,
+        selection: NSRange,
+        intersectingSpans: [InlineTextMarkSpan],
+        requestedKind: InlineTextMarkKind?
+    ) -> InlineTextMarkMutation? {
+        guard let first = intersectingSpans.first,
+              let last = intersectingSpans.last else { return nil }
+        let unionStart = min(first.fullRange.location, selection.location)
+        let unionEnd = max(NSMaxRange(last.fullRange), NSMaxRange(selection))
+
+        var head = ""
+        var midPlain = ""
+        var tail = ""
+
+        // 把一段原文按位置分桶：选区前 / 选区内 / 选区后。
+        func emitVerbatim(_ range: NSRange) {
+            guard range.length > 0 else { return }
+            let headEnd = min(NSMaxRange(range), selection.location)
+            if headEnd > range.location {
+                head += source.substring(with: NSRange(
+                    location: range.location,
+                    length: headEnd - range.location
+                ))
+            }
+            let midStart = max(range.location, selection.location)
+            let midEnd = min(NSMaxRange(range), NSMaxRange(selection))
+            if midEnd > midStart {
+                midPlain += source.substring(with: NSRange(
+                    location: midStart,
+                    length: midEnd - midStart
+                ))
+            }
+            let tailStart = max(range.location, NSMaxRange(selection))
+            if NSMaxRange(range) > tailStart {
+                tail += source.substring(with: NSRange(
+                    location: tailStart,
+                    length: NSMaxRange(range) - tailStart
+                ))
+            }
+        }
+
+        var cursor = unionStart
+        for span in intersectingSpans {
+            emitVerbatim(NSRange(
+                location: cursor,
+                length: span.fullRange.location - cursor
+            ))
+            let keptLeftEnd = min(selection.location, NSMaxRange(span.contentRange))
+            if keptLeftEnd > span.contentRange.location {
+                head += encoded(source.substring(with: NSRange(
+                    location: span.contentRange.location,
+                    length: keptLeftEnd - span.contentRange.location
+                )), as: span.kind)
+            }
+            let covered = NSIntersectionRange(span.contentRange, selection)
+            if covered.length > 0 {
+                midPlain += source.substring(with: covered)
+            }
+            let keptRightStart = max(
+                NSMaxRange(selection),
+                span.contentRange.location
+            )
+            if NSMaxRange(span.contentRange) > keptRightStart {
+                tail += encoded(source.substring(with: NSRange(
+                    location: keptRightStart,
+                    length: NSMaxRange(span.contentRange) - keptRightStart
+                )), as: span.kind)
+            }
+            cursor = NSMaxRange(span.fullRange)
+        }
+        emitVerbatim(NSRange(location: cursor, length: unionEnd - cursor))
+
+        let replacementText: String
+        let selectionRange: NSRange
+        if let requestedKind {
+            let selectedText = source.substring(with: selection)
+            guard MarkdownLinkDetector.links(in: source as String).allSatisfy({
+                      NSIntersectionRange($0.range, selection).length == 0
+                  }),
+                  !intersectsCodeFence(
+                      in: source as String,
+                      selection: selection,
+                      selectedText: selectedText
+                  ),
+                  let encodedSelection = encodedSelection(
+                      midPlain,
+                      source: source,
+                      sourceLocation: selection.location,
+                      as: requestedKind
+                  ) else { return nil }
+            let midStart = unionStart + (head as NSString).length
+            replacementText = head + encodedSelection.text + tail
+            if encodedSelection.contentRanges.count == 1,
+               let contentRange = encodedSelection.contentRanges.first {
+                selectionRange = NSRange(
+                    location: midStart + contentRange.location,
+                    length: contentRange.length
+                )
+            } else {
+                selectionRange = NSRange(
+                    location: midStart,
+                    length: (encodedSelection.text as NSString).length
+                )
+            }
+        } else {
+            replacementText = head + midPlain + tail
+            selectionRange = NSRange(
+                location: unionStart + (head as NSString).length,
+                length: (midPlain as NSString).length
+            )
+        }
+
+        return InlineTextMarkMutation(
+            range: NSRange(location: unionStart, length: unionEnd - unionStart),
+            replacementText: replacementText,
+            selectionRange: selectionRange
+        )
+    }
+
     static func encoded(_ content: String, as kind: InlineTextMarkKind) -> String {
         "[\(content)]{.\(kind.rawValue)}"
     }
@@ -222,38 +353,6 @@ enum InlineTextMarkMarkdown {
             in: source,
             range: NSRange(location: 0, length: (source as NSString).length),
             withTemplate: "$1"
-        )
-    }
-
-    private static func removingMarks(
-        from source: NSString,
-        selection: NSRange,
-        intersectingSpans: [InlineTextMarkSpan]
-    ) -> InlineTextMarkMutation? {
-        guard !intersectingSpans.isEmpty,
-              intersectingSpans.allSatisfy({
-                  contains(selection, $0.fullRange)
-              }),
-              let first = intersectingSpans.first,
-              let last = intersectingSpans.last else { return nil }
-
-        let mutationRange = NSRange(
-            location: first.fullRange.location,
-            length: NSMaxRange(last.fullRange) - first.fullRange.location
-        )
-        let replacement = removingSyntax(
-            from: source.substring(with: mutationRange)
-        )
-        let removedLength = intersectingSpans.reduce(0) { partial, span in
-            partial + span.fullRange.length - span.contentRange.length
-        }
-        return InlineTextMarkMutation(
-            range: mutationRange,
-            replacementText: replacement,
-            selectionRange: NSRange(
-                location: selection.location,
-                length: selection.length - removedLength
-            )
         )
     }
 

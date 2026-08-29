@@ -83,12 +83,23 @@ final class SelectionMarkButton: NSButton {
                 : accent.withAlphaComponent(kind == .highlight ? 0.90 : 0.86)
         }
         if isActive {
-            return accent.withAlphaComponent(kind == .highlight ? 0.48 : 0.18)
+            return opaqueTint(kind == .highlight ? 0.48 : 0.18, accent: accent)
         }
         if kind == .highlight {
-            return accent.withAlphaComponent(0.16)
+            return opaqueTint(0.16, accent: accent)
         }
         return NSColor.controlBackgroundColor.withAlphaComponent(0.96)
+    }
+
+    /// 低透明度色底叠在选区高亮上会糊掉；混进不透明底色，胶囊在任何背景上都可读。
+    private func opaqueTint(
+        _ fraction: CGFloat,
+        accent: NSColor
+    ) -> NSColor {
+        NSColor.controlBackgroundColor.blended(
+            withFraction: fraction,
+            of: accent
+        ) ?? accent.withAlphaComponent(fraction)
     }
 
     private func borderColor(accent: NSColor) -> NSColor {
