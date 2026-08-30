@@ -12,24 +12,34 @@ private struct TabFrameKey: PreferenceKey {
     }
 }
 
+/// 标签拖拽（Chrome 式）：拖的是标签本体，1:1 跟手；被拖标签在布局流里
+/// 原位隐身充当「洞」（视图身份不变，手势不会因视图替换被打断），洞跨过
+/// 相邻兄弟的可见中心时兄弟才让位。松手时洞的位置就是最终位置，本体原地
+/// 显形，没有二次归位动画。
 struct DocumentTabBar: View {
     let store: AppStore
-    @State private var draggingTabID: String?
-    @State private var dragGhostOffsetX: CGFloat = 0
-    @State private var dragGhostBaseOffsetX: CGFloat = 0
-    @State private var dragStartMidX: CGFloat?
-    @State private var dragSlotMidXs: [CGFloat] = []
-    @State private var dragActiveOrder: [NoteDocument]?
-    @State private var dragMovedAny = false
+    @State private var drag: TabDragState?
     @State private var tabFrames: [String: CGRect] = [:]
 
+    /// 拖拽期状态。兄弟标签的相对顺序和基准中心全程固定，
+    /// 拖拽中唯一变化的量是洞的位置（insertionIndex）。
+    private struct TabDragState {
+        let document: NoteDocument
+        let originalIndex: Int
+        let width: CGFloat
+        let baseMinX: CGFloat              // 拖起时相对首标签左缘的偏移
+        let contentWidth: CGFloat          // 拖起时整行内容宽度
+        let siblings: [NoteDocument]
+        let siblingBaseCenters: [CGFloat]  // 兄弟标签拖起时的中心
+        var translation: CGFloat = 0
+        var insertionIndex: Int
+    }
+
     var body: some View {
-        let tabs = dragActiveOrder ?? store.openDocuments
-        let orderSignature = tabs.map(\.id).joined(separator: "\u{2028}")
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 4) {
-                ForEach(tabs) { document in
-                    let isDragged = draggingTabID == document.id
+                ForEach(displayOrder) { document in
+                    let isDragged = drag?.document.id == document.id
                     DocumentTabItem(
                         title: document.title,
                         isSelected: store.selectedDocument?.id == document.id,
@@ -37,15 +47,18 @@ struct DocumentTabBar: View {
                         close: { store.closeDocumentTab(document) }
                     )
                     .background(frameReader(for: document))
-                    // 被拖标签的原位隐身，充当占位空隙；真实外观由浮层负责
+                    // 被拖标签原位隐身充当洞；真实外观由跟手浮层负责。
+                    // 动画只挂在标签自身上，不要包住浮层——否则每次换位
+                    // 浮层的 offset 都会被拽着做动画，跟不上手。
                     .opacity(isDragged ? 0 : 1)
-                    .animation(.snappy(duration: 0.24), value: orderSignature)
+                    .animation(.snappy(duration: 0.22), value: orderSignature)
                 }
             }
-            .overlay(alignment: .leading) {
-                dragGhost(tabs: tabs)
-            }
-            .gesture(reorderGesture())
+            .overlay(alignment: .leading) { floatingTab }
+            // 标签本体是 Button，普通 .gesture 会输给按钮的点击追踪，
+            // 从标签文字上按下的拖动拿不到 move 事件（浮层不动）。
+            // 高优先级手势：未移动 5pt 前点击照常，越过后拖动立即接管。
+            .highPriorityGesture(reorderGesture())
             .coordinateSpace(name: "tabBarSpace")
             .padding(.horizontal, 8)
         }
@@ -53,23 +66,36 @@ struct DocumentTabBar: View {
         .onPreferenceChange(TabFrameKey.self) { tabFrames = $0 }
     }
 
-    /// 跟随指针的浮层标签：位置 = 原槽位 + 纯指针位移。
-    /// 它不参与布局，换位时其余标签怎么动都影响不到它。
+    /// 拖拽中：兄弟按原相对顺序排布，被拖标签插在 insertionIndex 处
+    /// （隐身即洞）；平时：按 store 里的打开顺序排布。
+    private var displayOrder: [NoteDocument] {
+        guard let drag else { return store.openDocuments }
+        var slots = drag.siblings
+        slots.insert(drag.document, at: min(drag.insertionIndex, slots.count))
+        return slots
+    }
+
+    private var orderSignature: String {
+        displayOrder.map(\.id).joined(separator: "\u{2028}")
+    }
+
+    /// 跟手的标签本体：位置 = 拖起位置 + 夹在行内的指针位移。
+    /// 拖动中按选中态渲染（实底背景），无论原本是否选中都清晰可见。
     @ViewBuilder
-    private func dragGhost(tabs: [NoteDocument]) -> some View {
-        if let id = draggingTabID,
-           let document = tabs.first(where: { $0.id == id }) {
+    private var floatingTab: some View {
+        if let drag {
             DocumentTabItem(
-                title: document.title,
-                isSelected: store.selectedDocument?.id == document.id,
+                title: drag.document.title,
+                isSelected: true,
                 select: {},
                 close: {}
             )
+            .frame(width: drag.width)
             .scaleEffect(1.05)
-            .shadow(color: .black.opacity(0.25), radius: 10, y: 4)
-            .offset(x: dragGhostBaseOffsetX + dragGhostOffsetX)
+            .shadow(color: .black.opacity(0.28), radius: 14, y: 6)
+            .offset(x: drag.baseMinX + drag.translation)
             .allowsHitTesting(false)
-            .animation(.snappy(duration: 0.16), value: draggingTabID == nil)
+            .transition(.identity)
         }
     }
 
@@ -89,93 +115,93 @@ struct DocumentTabBar: View {
         }
     }
 
-    /// 标签栏级拖拽手势：起点落在哪个标签就拖哪个。
-    /// 手势挂在标签栏容器上——容器本身在拖拽期间永远不动，
-    /// translation 始终是纯指针位移，从根上杜绝位移污染造成的乱飞。
     private func reorderGesture() -> some Gesture {
         DragGesture(minimumDistance: 5, coordinateSpace: .named("tabBarSpace"))
             .onChanged { value in
-                if dragActiveOrder == nil {
-                    let tabs = store.openDocuments
-                    guard !tabs.isEmpty,
-                          tabs.allSatisfy({ tabFrames[$0.id] != nil }),
-                          let document = tab(at: value.startLocation),
-                          let frame = tabFrames[document.id],
-                          let firstFrame = tabFrames[tabs[0].id]
-                    else { return }
-                    draggingTabID = document.id
-                    dragStartMidX = frame.midX
-                    dragSlotMidXs = tabs.map { tabFrames[$0.id]!.midX }
-                    dragGhostBaseOffsetX = frame.minX - firstFrame.minX
-                    dragGhostOffsetX = 0
-                    dragActiveOrder = tabs
-                    dragMovedAny = false
-                    NSCursor.closedHand.push()
+                if drag == nil {
+                    beginDrag(at: value.startLocation)
+                    guard drag != nil else { return }
                 }
-                guard let startMidX = dragStartMidX,
-                      let visible = dragActiveOrder,
-                      let draggedID = draggingTabID,
-                      let index = visible.firstIndex(where: { $0.id == draggedID }),
-                      !dragSlotMidXs.isEmpty,
-                      index < dragSlotMidXs.count
-                else { return }
-
-                // 跟手，但夹在首尾槽位中线之间：标签拖不出标签栏。
-                let visualMidX = min(
-                    max(startMidX + value.translation.width, dragSlotMidXs.first!),
-                    dragSlotMidXs.last!
-                )
-                dragGhostOffsetX = visualMidX - startMidX
-
-                var target = index
-                while target + 1 < dragSlotMidXs.count,
-                      visualMidX > (dragSlotMidXs[target] + dragSlotMidXs[target + 1]) / 2 {
-                    target += 1
-                }
-                while target > 0,
-                      visualMidX < (dragSlotMidXs[target - 1] + dragSlotMidXs[target]) / 2 {
-                    target -= 1
-                }
-                guard target != index else { return }
-                dragActiveOrder = DocumentOrdering.moved(
-                    visible, fromIndex: index, toIndex: target
-                )
-                dragMovedAny = true
+                updateDrag(with: value.translation.width)
             }
-            .onEnded { _ in
-                finishDrag()
+            .onEnded { value in
+                finishDrag(finalTranslation: value.translation.width)
             }
     }
 
-    /// 松手：最终位置一次性提交回 store，浮层从指针处弹回空隙槽位；
-    /// 真实标签保持隐身，等浮层落稳后再显形，位置逐像素相同。
-    private func finishDrag() {
-        guard let activeOrder = dragActiveOrder,
-              let draggedID = draggingTabID,
-              let startMidX = dragStartMidX,
-              let index = activeOrder.firstIndex(where: { $0.id == draggedID }),
-              !dragSlotMidXs.isEmpty,
-              index < dragSlotMidXs.count
+    private func beginDrag(at startLocation: CGPoint) {
+        let tabs = store.openDocuments
+        guard !tabs.isEmpty,
+              tabs.allSatisfy({ tabFrames[$0.id] != nil }),
+              let document = tab(at: startLocation),
+              let frame = tabFrames[document.id],
+              let firstFrame = tabFrames[tabs[0].id],
+              let lastFrame = tabFrames[tabs[tabs.count - 1].id]
         else { return }
+        let index = tabs.firstIndex(where: { $0.id == document.id }) ?? 0
+        drag = TabDragState(
+            document: document,
+            originalIndex: index,
+            width: frame.width,
+            baseMinX: frame.minX - firstFrame.minX,
+            contentWidth: lastFrame.maxX - firstFrame.minX,
+            siblings: tabs.filter { $0.id != document.id },
+            siblingBaseCenters: tabs.compactMap {
+                $0.id == document.id ? nil : tabFrames[$0.id]?.midX
+            },
+            insertionIndex: index
+        )
+        NSCursor.closedHand.push()
+    }
+
+    private func updateDrag(with translation: CGFloat) {
+        guard var drag else { return }
+        let maxX = max(0, drag.contentWidth - drag.width)
+        let x = min(max(drag.baseMinX + translation, 0), maxX)
+        drag.translation = x - drag.baseMinX
+        drag.insertionIndex = insertionIndex(forCenter: x + drag.width / 2, of: drag)
+        self.drag = drag
+    }
+
+    /// 让位阈值取相邻兄弟的「当前可见中心」：洞右侧的兄弟被推右了
+    /// (标签宽 + 间距)，向右拖要越过推移后的中心；洞左侧的兄弟在
+    /// 原位，向左拖越过原中心即可。阈值随换位切换，天然带滞后。
+    private func insertionIndex(forCenter center: CGFloat, of drag: TabDragState) -> Int {
+        let shift = drag.width + 4
+        var index = drag.insertionIndex
+        while index < drag.siblingBaseCenters.count,
+              center > drag.siblingBaseCenters[index] + shift {
+            index += 1
+        }
+        while index > 0,
+              center < drag.siblingBaseCenters[index - 1] {
+            index -= 1
+        }
+        return index
+    }
+
+    private func finishDrag(finalTranslation: CGFloat?) {
+        guard var settledDrag = drag else { return }
         NSCursor.pop()
-        let moved = dragMovedAny
-        dragMovedAny = false
-        dragActiveOrder = nil
-        dragStartMidX = nil
-        if moved {
-            store.moveDocumentTab(activeOrder[index], toIndex: index)
+        // 中途的 move 事件可能被合并或丢弃，松手时用最终位移
+        // 兜底重算洞位，避免「拖到位了却弹回原位」。
+        if let finalTranslation {
+            let maxX = max(0, settledDrag.contentWidth - settledDrag.width)
+            let x = min(
+                max(settledDrag.baseMinX + finalTranslation, 0),
+                maxX
+            )
+            settledDrag.translation = x - settledDrag.baseMinX
+            settledDrag.insertionIndex = insertionIndex(
+                forCenter: x + settledDrag.width / 2,
+                of: settledDrag
+            )
         }
-        let landingOffset = dragSlotMidXs[index] - startMidX
-        dragSlotMidXs = []
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
-            dragGhostOffsetX = landingOffset
+        drag = nil
+        guard settledDrag.insertionIndex != settledDrag.originalIndex else {
+            return
         }
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(0.4))
-            if draggingTabID == draggedID, dragActiveOrder == nil {
-                draggingTabID = nil
-            }
-        }
+        store.moveDocumentTab(settledDrag.document, toIndex: settledDrag.insertionIndex)
     }
 }
 
