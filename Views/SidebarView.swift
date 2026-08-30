@@ -46,6 +46,12 @@ struct SidebarView: View {
     @State private var renameTargetRowKey: String?
     @State private var deleteFolderTarget: String?
     @State private var libraryScope: LibraryScope = .all
+    @AppStorage("sidebarLibraryViewMode")
+    private var libraryViewModeRaw: String = LibraryViewMode.tree.rawValue
+    @AppStorage("sidebarCollapsedFolderPaths")
+    private var collapsedFoldersJSON: String = "[]"
+    @AppStorage("sidebarFolderOrder")
+    private var folderOrderJSON: String = "{}"
     @State private var draggingDocumentPath: String?
     @State private var dragGhostOffset: CGFloat = 0
     @State private var dragGhostBaseOffset: CGFloat = 0
@@ -62,6 +68,11 @@ struct SidebarView: View {
         case folder(String)
     }
 
+    private enum LibraryViewMode: String {
+        case tree
+        case list
+    }
+
     private enum RenameFocus: Hashable {
         case document(String)
     }
@@ -73,7 +84,11 @@ struct SidebarView: View {
             case .library:
                 searchBar
                 if store.searchQuery.isEmpty {
-                    scopeAndSortBar
+                    if libraryViewMode == .tree {
+                        libraryRootBar
+                        selectionBreadcrumb
+                    }
+                    libraryToolbar
                 }
             case .outline:
                 outlineHeader
@@ -96,6 +111,9 @@ struct SidebarView: View {
         }
         .onChange(of: store.selectedDocument?.id) { _, _ in
             selectedOutlineItemID = nil
+            if libraryViewMode == .tree, let folder = store.selectedDocument?.folder {
+                expandFolderChain(for: folder)
+            }
         }
         .confirmationDialog(
             "要将“\(deleteTarget?.title ?? "")”移到废纸篓吗？",
@@ -168,14 +186,96 @@ struct SidebarView: View {
         .padding(.vertical, 10)
     }
 
-    private var scopeAndSortBar: some View {
+    private var libraryToolbar: some View {
         HStack(spacing: 6) {
-            scopePicker
-            sortPicker
+            Picker("视图", selection: Binding(
+                get: { libraryViewMode },
+                set: { libraryViewModeRaw = $0.rawValue }
+            )) {
+                Label("树", systemImage: "folder").tag(LibraryViewMode.tree)
+                Label("列表", systemImage: "list.bullet").tag(LibraryViewMode.list)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help("文件树按文件夹组织文稿；列表保留手动拖动排序")
+            if libraryViewMode == .list {
+                scopePicker
+                sortPicker
+            }
         }
         .padding(.leading, 8)
         .padding(.trailing, 10)
         .padding(.bottom, 8)
+    }
+
+    private var libraryRootBar: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "folder")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            if let root = store.libraryURL {
+                Text(abbreviatedRootPath(root))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(root.path)
+                Button {
+                    store.revealFolderInFinder("")
+                } label: {
+                    Image(systemName: "arrow.up.forward.square")
+                }
+                .buttonStyle(.plain)
+                .help("在 Finder 中显示知识库")
+                Button {
+                    store.copyFolderPathToPasteboard("")
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.plain)
+                .help("拷贝知识库路径")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    private var selectionBreadcrumb: some View {
+        Group {
+            if let document = store.selectedDocument {
+                HStack(spacing: 3) {
+                    Text("当前位置")
+                        .foregroundStyle(.tertiary)
+                    let parts = document.folder.isEmpty
+                        ? []
+                        : document.folder.split(separator: "/").map(String.init)
+                    ForEach(parts.indices, id: \.self) { index in
+                        Text("›").foregroundStyle(.tertiary)
+                        Text(parts[index])
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text("›").foregroundStyle(.tertiary)
+                    Text(document.title)
+                        .foregroundStyle(.primary)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                }
+                .font(.caption2)
+                .lineLimit(1)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private func abbreviatedRootPath(_ url: URL) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let raw = url.path
+        return raw.hasPrefix(home) ? "~" + raw.dropFirst(home.count) : raw
     }
 
     private var scopePicker: some View {
@@ -206,7 +306,11 @@ struct SidebarView: View {
     private var libraryList: some View {
         Group {
             if store.searchQuery.isEmpty {
-                documentsList
+                if libraryViewMode == .tree {
+                    libraryTreeList
+                } else {
+                    documentsList
+                }
             } else {
                 searchResultsList
             }
@@ -289,6 +393,259 @@ struct SidebarView: View {
                 description: Text("点击左下角的“+”新建文稿。")
             )
         }
+    }
+
+    private var libraryViewMode: LibraryViewMode {
+        LibraryViewMode(rawValue: libraryViewModeRaw) ?? .tree
+    }
+
+    private var folderOrder: [String: [String]] {
+        (try? JSONDecoder().decode(
+            [String: [String]].self,
+            from: Data(folderOrderJSON.utf8)
+        )) ?? [:]
+    }
+
+    private func setFolderOrder(_ value: [String: [String]]) {
+        guard let data = try? JSONEncoder().encode(value),
+              let json = String(data: data, encoding: .utf8) else { return }
+        folderOrderJSON = json
+    }
+
+    /// 同级文件夹的展示顺序：先按用户自定义排序，没排过的按名称跟在后面。
+    private func effectiveFolderOrder(parent: String, siblings: [String]) -> [String] {
+        let saved = (folderOrder[parent] ?? []).filter { siblings.contains($0) }
+        let rest = siblings.filter { !saved.contains($0) }
+        return saved + rest
+    }
+
+    private var collapsedFolders: Set<String> {
+        Set((try? JSONDecoder().decode(
+            [String].self,
+            from: Data(collapsedFoldersJSON.utf8)
+        )) ?? [])
+    }
+
+    private func setCollapsedFolders(_ value: Set<String>) {
+        guard let data = try? JSONEncoder().encode(value.sorted()),
+              let json = String(data: data, encoding: .utf8) else { return }
+        collapsedFoldersJSON = json
+    }
+
+    private func toggleFolderCollapsed(_ path: String) {
+        var collapsed = collapsedFolders
+        if collapsed.contains(path) {
+            collapsed.remove(path)
+        } else {
+            collapsed.insert(path)
+        }
+        setCollapsedFolders(collapsed)
+    }
+
+    /// 当前文稿所在文件夹及其祖先全部展开，保证选中行可见。
+    /// 外部文稿的 folder 是绝对路径，不在知识库树里，直接跳过；
+    /// 循环要求父路径严格缩短，防止根目录 `"/"` 的父目录仍是 `"/"` 导致死循环。
+    private func expandFolderChain(for folder: String) {
+        guard !folder.hasPrefix("/") else { return }
+        var collapsed = collapsedFolders
+        var current = folder
+        while !current.isEmpty {
+            collapsed.remove(current)
+            let parent = (current as NSString).deletingLastPathComponent
+            guard parent != current, parent != "." else { break }
+            current = parent
+        }
+        setCollapsedFolders(collapsed)
+    }
+
+    private var libraryTreeList: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                if !store.favoriteDocuments.isEmpty {
+                    treeSectionHeader(
+                        "star",
+                        "收藏",
+                        store.favoriteDocuments.count
+                    )
+                    ForEach(sorted(store.favoriteDocuments)) { document in
+                        LibraryRowContainer(
+                            isSelected: store.selectedDocument?.id == document.id
+                        ) {
+                            noteRow(document)
+                        }
+                        .padding(.horizontal, 6)
+                    }
+                }
+                treeSectionHeader("folder", "知识库", store.documents.count)
+                treeRows(store.libraryTree, parent: "", depth: 0)
+            }
+            .padding(.horizontal, 6)
+            .padding(.top, 2)
+            .padding(.bottom, 8)
+        }
+    }
+
+    private func treeSectionHeader(
+        _ systemImage: String,
+        _ title: String,
+        _ count: Int
+    ) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: systemImage)
+                .font(.system(size: 10))
+            Text(title)
+            Text("\(count)")
+                .foregroundStyle(.tertiary)
+                .fontWeight(.regular)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.leading, 10)
+        .padding(.top, 9)
+        .padding(.bottom, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // 递归树行：返回类型必须具体化（AnyView），否则 opaque 类型自指无法编译。
+    private func treeRows(
+        _ items: [LibraryTreeItem],
+        parent: String,
+        depth: Int
+    ) -> AnyView {
+        // 文件夹按用户自定义顺序排，文稿跟在后面。
+        let savedOrder = folderOrder[parent] ?? []
+        func rank(_ path: String) -> Int {
+            savedOrder.firstIndex(of: path) ?? Int.max
+        }
+        let folders = items.compactMap { item -> LibraryTreeItem? in
+            if case .folder = item.content { return item } else { return nil }
+        }
+        let documents = items.filter { item in
+            if case .folder = item.content { return false } else { return true }
+        }
+        let sortedFolders = folders.sorted { a, b in
+            guard case .folder(let pathA) = a.content,
+                  case .folder(let pathB) = b.content else { return false }
+            let rankA = rank(pathA), rankB = rank(pathB)
+            if rankA != rankB { return rankA < rankB }
+            return folderDisplayName(pathA)
+                .localizedStandardCompare(folderDisplayName(pathB))
+                == .orderedAscending
+        }
+        let orderedItems = sortedFolders + documents
+        let siblingPaths = orderedItems.compactMap { item -> String? in
+            if case .folder(let path) = item.content { return path } else { return nil }
+        }
+
+        return AnyView(
+            ForEach(orderedItems, id: \.self) { item in
+                switch item.content {
+                case .folder(let path):
+                    folderTreeRow(
+                        item,
+                        path: path,
+                        parent: parent,
+                        siblings: siblingPaths,
+                        depth: depth
+                    )
+                case .document(let document):
+                    LibraryRowContainer(
+                        isSelected: store.selectedDocument?.id == document.id
+                    ) {
+                        noteRow(document)
+                    }
+                    .padding(.leading, CGFloat(depth) * 14 + 8)
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func folderTreeRow(
+        _ item: LibraryTreeItem,
+        path: String,
+        parent: String,
+        siblings: [String],
+        depth: Int
+    ) -> some View {
+        let isCollapsed = collapsedFolders.contains(path)
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                Image(systemName: isCollapsed ? "folder" : "folder.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                Text(folderDisplayName(path))
+                    .font(.callout)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("\(documents(in: path).count)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.leading, CGFloat(depth) * 14 + 8)
+            .padding(.trailing, 8)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .onTapGesture { toggleFolderCollapsed(path) }
+            .contextMenu { folderContextMenu(path, parent: parent, siblings: siblings) }
+            .help(store.libraryURL?
+                .appending(path: path, directoryHint: .isDirectory)
+                .path ?? path)
+            if !isCollapsed, let children = item.children {
+                treeRows(children, parent: path, depth: depth + 1)
+                    .padding(.leading, 13)
+                    .overlay(alignment: .topLeading) {
+                        Rectangle()
+                            .fill(ZhijingTheme.hairline)
+                            .frame(width: 1)
+                            .padding(.leading, CGFloat(depth) * 14 + 15)
+                    }
+            }
+        }
+    }
+
+    private func folderContextMenu(
+        _ path: String,
+        parent: String,
+        siblings: [String]
+    ) -> some View {
+        Group {
+            Button("上移") {
+                moveFolder(path, parent: parent, siblings: siblings, offset: -1)
+            }
+            Button("下移") {
+                moveFolder(path, parent: parent, siblings: siblings, offset: 1)
+            }
+            Divider()
+            Button("在 Finder 中显示") { store.revealFolderInFinder(path) }
+            Button("拷贝文件夹路径") { store.copyFolderPathToPasteboard(path) }
+            Divider()
+            Button("移到废纸篓", role: .destructive) {
+                deleteFolderTarget = path
+            }
+        }
+    }
+
+    /// 在同级里把文件夹上移/下移一位，顺序持久化保存。
+    private func moveFolder(
+        _ path: String,
+        parent: String,
+        siblings: [String],
+        offset: Int
+    ) {
+        var order = effectiveFolderOrder(parent: parent, siblings: siblings)
+        guard let index = order.firstIndex(of: path) else { return }
+        let target = index + offset
+        guard siblings.indices.contains(target) else { return }
+        order.remove(at: index)
+        order.insert(path, at: target)
+        var all = folderOrder
+        all[parent] = order
+        setFolderOrder(all)
     }
 
     private var searchResultsList: some View {

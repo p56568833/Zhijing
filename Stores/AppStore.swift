@@ -2,6 +2,17 @@ import AppKit
 import Foundation
 import Observation
 
+struct FollowedMoveNotice: Equatable {
+    let title: String
+    let destinationFolder: String
+    let additionalCount: Int
+
+    var displayText: String {
+        let base = "已跟随移动：「\(title)」现在位于 \(destinationFolder)"
+        return additionalCount > 0 ? base + " 等 \(additionalCount + 1) 篇" : base
+    }
+}
+
 @MainActor
 @Observable
 final class AppStore {
@@ -390,32 +401,24 @@ final class AppStore {
         }
     }
 
-    /// 知识库重新扫描后，尝试为"路径消失"的已打开文稿找到新位置。
-    /// 命中时沿用应用内移动的状态迁移（收藏、批注、标签页、历史版本），
-    /// 未命中时保持原状，交由常规的外部冲突流程兜底。
+    /// 知识库重新扫描后，尝试为"路径消失"的文稿找到新位置（全库范围，
+    /// 不限于打开着的）。命中时沿用应用内移动的状态迁移（收藏、批注、
+    /// 标签页、历史版本），并弹一条安静的提示；未命中时保持原状，
+    /// 交由常规的外部冲突流程兜底。
     @discardableResult
     private func followExternallyMovedDocuments(previousDocuments: [NoteDocument]) -> Bool {
-        let previousByPath = Dictionary(
-            uniqueKeysWithValues: previousDocuments.map { ($0.relativePath, $0) }
-        )
-        var trackedPaths = openDocumentPaths
-        if let selected = selectedDocument,
-           isLibraryDocument(selected),
-           externalConflict?.document.id != selected.id,
-           !trackedPaths.contains(selected.relativePath) {
-            trackedPaths.append(selected.relativePath)
-        }
         let currentPaths = Set(documents.map(\.relativePath))
-        let trackedDocuments: [NoteDocument] = trackedPaths.compactMap { previousByPath[$0] }
+        // 全库文稿都尝试跟随移动，而不是只跟打开着的。
+        let vanishedDocuments = previousDocuments
             .filter { !currentPaths.contains($0.relativePath) }
-        guard !trackedDocuments.isEmpty else { return false }
+        guard !vanishedDocuments.isEmpty else { return false }
 
         let previousPaths = Set(previousDocuments.map(\.relativePath))
         let appearedDocuments = documents.filter { !previousPaths.contains($0.relativePath) }
         guard !appearedDocuments.isEmpty else { return false }
 
         let matches = ExternalMoveMatcher.match(
-            vanished: trackedDocuments,
+            vanished: vanishedDocuments,
             appeared: appearedDocuments
         )
         var followedSelection = false
@@ -449,7 +452,35 @@ final class AppStore {
                 }
             }
         }
+        if !matches.isEmpty {
+            showFollowedMoveNotice(for: matches)
+        }
         return followedSelection
+    }
+
+    private var followedMoveNoticeTask: Task<Void, Never>?
+    private(set) var followedMoveNotice: FollowedMoveNotice?
+
+    private func showFollowedMoveNotice(for matches: [ExternalMoveMatch]) {
+        let primary = matches[0]
+        followedMoveNotice = FollowedMoveNotice(
+            title: primary.destination.title,
+            destinationFolder: primary.destination.folder.isEmpty
+                ? "知识库根目录"
+                : primary.destination.folder,
+            additionalCount: matches.count - 1
+        )
+        followedMoveNoticeTask?.cancel()
+        followedMoveNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            self?.followedMoveNotice = nil
+        }
+    }
+
+    func dismissFollowedMoveNotice() {
+        followedMoveNoticeTask?.cancel()
+        followedMoveNotice = nil
     }
 
     func select(_ document: NoteDocument) {
@@ -1039,6 +1070,25 @@ final class AppStore {
 
     func revealInFinder(_ document: NoteDocument) {
         NSWorkspace.shared.activateFileViewerSelecting([document.url])
+    }
+
+    /// 在 Finder 中显示知识库根目录或其中某个文件夹（空串 = 根目录）。
+    func revealFolderInFinder(_ folder: String) {
+        guard let root = libraryURL else { return }
+        let url = folder.isEmpty
+            ? root
+            : root.appending(path: folder, directoryHint: .isDirectory)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// 把知识库根目录或某个文件夹的完整磁盘路径拷到剪贴板。
+    func copyFolderPathToPasteboard(_ folder: String) {
+        guard let root = libraryURL else { return }
+        let url = folder.isEmpty
+            ? root
+            : root.appending(path: folder, directoryHint: .isDirectory)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
     }
 
     /// 拖拽标签页换位：按显示顺序重排打开列表并持久化。

@@ -47,6 +47,35 @@ struct ContentView: View {
                         .help("新建 Markdown 文稿（⌘N）")
                     }
                 }
+                .overlay(alignment: .bottom) {
+                    if let notice = store.followedMoveNotice {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(notice.displayText)
+                                .lineLimit(1)
+                            Spacer(minLength: 12)
+                            Button {
+                                store.dismissFollowedMoveNotice()
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 11))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .frame(maxWidth: 520)
+                        .background(
+                            .regularMaterial,
+                            in: RoundedRectangle(cornerRadius: 10)
+                        )
+                        .padding(.bottom, 18)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .animation(.snappy(duration: 0.25), value: store.followedMoveNotice)
             }
         }
         .tint(ZhijingTheme.accent)
