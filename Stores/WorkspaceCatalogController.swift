@@ -76,8 +76,11 @@ final class WorkspaceCatalogController {
     }
 
     func rebuildDerivedState(favorites: Set<String>) {
+        // 库里出现符号链接等使两条记录同路径时取先扫到的一条，
+        // 不能因为重复 key 让整个应用崩溃。
         documentByPath = Dictionary(
-            uniqueKeysWithValues: documents.map { ($0.relativePath, $0) }
+            documents.map { ($0.relativePath, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
         recentDocuments = Array(
             documents.sorted { $0.modifiedAt > $1.modifiedAt }.prefix(8)

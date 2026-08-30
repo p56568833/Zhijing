@@ -16,6 +16,52 @@ enum MarkdownFenceStateResolver {
         }
         return inside
     }
+
+    struct FenceScan {
+        let startsInsideFence: Bool
+        /// 全文档中处于代码围栏内部的行区间（文档坐标，含围栏标记行）。
+        let fencedRanges: [NSRange]
+    }
+
+    /// 一次遍历同时得到「location 处是否在围栏内」与全文档围栏行区间。
+    /// 调用方用它把代码块里的字面链接排除掉——代码不是正文，
+    /// `[x](y)` 不该高亮更不该点开。
+    static func scan(before location: Int, in source: String) -> FenceScan {
+        let nsSource = source as NSString
+        var fencedRanges: [NSRange] = []
+        var inside = false
+        var startsInsideFence = false
+        var reported = location <= 0
+        var lineStart = 0
+        while lineStart < nsSource.length {
+            let lineRange = nsSource.lineRange(
+                for: NSRange(location: lineStart, length: 0)
+            )
+            let trimmed = nsSource.substring(with: lineRange)
+                .trimmingCharacters(in: .newlines)
+                .trimmingCharacters(in: .whitespaces)
+            let isFenceMarker = trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~")
+            if isFenceMarker || inside {
+                fencedRanges.append(lineRange)
+            }
+            if isFenceMarker {
+                inside.toggle()
+            }
+            if !reported, NSMaxRange(lineRange) >= location {
+                // location 所在行（含恰好压在行尾）处理完后的状态
+                startsInsideFence = inside
+                reported = true
+            }
+            lineStart = NSMaxRange(lineRange)
+        }
+        if !reported {
+            startsInsideFence = inside
+        }
+        return FenceScan(
+            startsInsideFence: startsInsideFence,
+            fencedRanges: fencedRanges
+        )
+    }
 }
 
 enum MarkdownPresentationStyle {
@@ -156,11 +202,13 @@ enum MarkdownPresentationHighlighter {
         startsInsideFence resolvedFenceState: Bool? = nil
     ) {
         guard let layoutManager = textView.layoutManager else { return }
-        let fullRange = NSRange(location: 0, length: textView.string.utf16.count)
+        // textView.string 每次访问都是整篇拷贝，热路径上只取一次。
+        let source = textView.string
+        let fullRange = NSRange(location: 0, length: source.utf16.count)
         let stylingRange: NSRange
         if let requestedRange {
             let safeRange = NSIntersectionRange(requestedRange, fullRange)
-            stylingRange = (textView.string as NSString).lineRange(for: safeRange)
+            stylingRange = (source as NSString).lineRange(for: safeRange)
         } else {
             stylingRange = fullRange
         }
@@ -168,30 +216,30 @@ enum MarkdownPresentationHighlighter {
             layoutManager.removeTemporaryAttribute(key, forCharacterRange: stylingRange)
         }
 
-        let source: String
+        let styledSource: String
         let baseLocation: Int
         let startsInsideFence: Bool
         if stylingRange.location == 0, stylingRange.length == fullRange.length {
-            source = textView.string
+            styledSource = source
             baseLocation = 0
             startsInsideFence = false
         } else {
-            let nsSource = textView.string as NSString
-            source = nsSource.substring(with: stylingRange)
+            let nsSource = source as NSString
+            styledSource = nsSource.substring(with: stylingRange)
             baseLocation = stylingRange.location
             startsInsideFence = resolvedFenceState
                 ?? MarkdownFenceStateResolver.isInsideFence(
                     before: stylingRange.location,
-                    in: textView.string
+                    in: source
                 )
         }
 
-        let resolvedLinks = links ?? MarkdownLinkDetector.links(in: textView.string)
+        let resolvedLinks = links ?? MarkdownLinkDetector.links(in: source)
         let linksInRange = resolvedLinks.filter {
             NSIntersectionRange($0.range, stylingRange).length > 0
         }
         for span in spans(
-            in: source,
+            in: styledSource,
             baseLocation: baseLocation,
             links: linksInRange,
             startsInsideFence: startsInsideFence
@@ -312,7 +360,23 @@ enum MarkdownPresentationHighlighter {
             result.append(.init(range: mark.prefixRange, style: .textMarkSyntax))
             result.append(.init(range: mark.suffixRange, style: .textMarkSyntax))
         }
-        for link in links ?? MarkdownLinkDetector.links(in: source) {
+        // 回退路径在子串上本地扫描，range 必须补回 baseLocation 偏移，
+        // 否则调用方拿到的是子串坐标，高亮整体错位。
+        let resolvedLinks: [MarkdownEditorLink]
+        if let links {
+            resolvedLinks = links
+        } else {
+            resolvedLinks = MarkdownLinkDetector.links(in: source).map { link in
+                MarkdownEditorLink(
+                    range: NSRange(
+                        location: baseLocation + link.range.location,
+                        length: link.range.length
+                    ),
+                    url: link.url
+                )
+            }
+        }
+        for link in resolvedLinks {
             result.append(.init(range: link.range, style: .link))
         }
         return result

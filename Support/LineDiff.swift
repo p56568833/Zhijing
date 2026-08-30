@@ -17,10 +17,17 @@ struct LineDiff {
     let removedOffsets: Set<Int>
     let insertedOffsets: Set<Int>
     let hunks: [LineDiffHunk]
+    /// 原文的主导行尾符。components(separatedBy: .newlines) 会丢掉 \r，
+    /// 重建全文时必须用原文自己的行尾，否则接受一个 hunk 就把
+    /// CRLF 文件（SRT、Windows 工具编辑过的稿子）整体改写成 LF。
+    let originalLineSeparator: String
 
     init(original: String, replacement: String) {
-        let oldLines = original.components(separatedBy: .newlines)
-        let newLines = replacement.components(separatedBy: .newlines)
+        // .newlines 的 CharacterSet 切分会把 \r\n 拆成两个分隔符，
+        // 在 CRLF 文件里制造幽灵空行；先归一化再切，行尾由
+        // originalLineSeparator 在重建时还原。
+        let oldLines = Self.normalizedLines(original)
+        let newLines = Self.normalizedLines(replacement)
         let difference = newLines.difference(from: oldLines)
         var removed: Set<Int> = []
         var inserted: Set<Int> = []
@@ -37,12 +44,26 @@ struct LineDiff {
         replacementLines = newLines
         removedOffsets = removed
         insertedOffsets = inserted
+        originalLineSeparator = Self.dominantLineSeparator(in: original)
         hunks = Self.makeHunks(
             originalLines: oldLines,
             replacementLines: newLines,
             removedOffsets: removed,
             insertedOffsets: inserted
         )
+    }
+
+    private static func normalizedLines(_ text: String) -> [String] {
+        text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+    }
+
+    private static func dominantLineSeparator(in text: String) -> String {
+        if text.contains("\r\n") { return "\r\n" }
+        if text.contains("\r") { return "\r" }
+        return "\n"
     }
 
     func applying(acceptedHunkIDs: Set<LineDiffHunk.ID>) -> String {
@@ -64,7 +85,7 @@ struct LineDiff {
         if originalCursor < originalLines.count {
             result.append(contentsOf: originalLines[originalCursor...])
         }
-        return result.joined(separator: "\n")
+        return result.joined(separator: originalLineSeparator)
     }
 
     func resolving(

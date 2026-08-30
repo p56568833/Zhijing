@@ -300,11 +300,15 @@ final class MarkdownEditorTextView: NSTextView {
         return menu
     }
 
-    func updateSelectionAnnotationButton() {
-        updateTextMarkSyntaxVisibility()
+    func updateSelectionAnnotationButton(refreshingSyntaxFolding: Bool = true) {
+        if refreshingSyntaxFolding {
+            updateTextMarkSyntaxVisibility()
+        }
+        let source = string
+        let sourceLength = (source as NSString).length
         let range = selectedRange()
         guard range.length > 0,
-              NSMaxRange(range) <= (string as NSString).length else {
+              NSMaxRange(range) <= sourceLength else {
             selectionAnnotationButton?.isHidden = true
             selectionMarkButtons.values.forEach { $0.isHidden = true }
             selectionClearMarkButton?.isHidden = true
@@ -317,18 +321,22 @@ final class MarkdownEditorTextView: NSTextView {
         }
         let clearButton = selectionClearMarkButton
             ?? makeSelectionClearMarkButton()
+        // 一次全文扫描，三种判定共用；这里在每次按键/选区变化的
+        // 热路径上，不能再各扫一遍。
+        let allSpans = InlineTextMarkMarkdown.spans(in: source)
         let activeKind = InlineTextMarkMarkdown.kind(
-            in: string,
-            at: range
+            at: range,
+            spans: allSpans
         )
         let containsTextMark = InlineTextMarkMarkdown.containsMark(
-            in: string,
-            intersecting: range
+            intersecting: range,
+            spans: allSpans
         )
         let canApplyTextMark = activeKind != nil || InlineTextMarkMarkdown.mutation(
-            in: string,
+            in: source,
             selection: range,
-            applying: .highlight
+            applying: .highlight,
+            spans: allSpans
         ) != nil
         for (kind, button) in selectionMarkButtons {
             button.isHidden = false
@@ -1200,7 +1208,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             guard range.length > 0,
                   NSMaxRange(range) <= (textView.string as NSString).length else {
                 onSelectionChange(nil)
-                textView.updateSelectionAnnotationButton()
+                // 纯选区变化不影响折叠区间，跳过全文重扫。
+                textView.updateSelectionAnnotationButton(refreshingSyntaxFolding: false)
                 return
             }
             onSelectionChange(EditorTextSelection(
@@ -1208,7 +1217,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                 range: range,
                 text: (textView.string as NSString).substring(with: range)
             ))
-            textView.updateSelectionAnnotationButton()
+            textView.updateSelectionAnnotationButton(refreshingSyntaxFolding: false)
         }
 
         func synchronize(
@@ -1448,16 +1457,19 @@ struct MarkdownSourceEditor: NSViewRepresentable {
                         NSRange(location: 0, length: nsSource.length)
                     )
                     let stylingRange = nsSource.lineRange(for: safeRange)
-                    return (
-                        MarkdownLinkDetector.links(
-                            in: source,
-                            characterRange: stylingRange
-                        ),
-                        MarkdownFenceStateResolver.isInsideFence(
-                            before: stylingRange.location,
-                            in: source
-                        )
+                    let fenceScan = MarkdownFenceStateResolver.scan(
+                        before: stylingRange.location,
+                        in: source
                     )
+                    // 代码块里的字面链接只当代码着色，不参与链接高亮与点击。
+                    let links = MarkdownLinkDetector
+                        .links(in: source, characterRange: stylingRange)
+                        .filter { link in
+                            fenceScan.fencedRanges.allSatisfy {
+                                NSIntersectionRange($0, link.range).length == 0
+                            }
+                        }
+                    return (links, fenceScan.startsInsideFence)
                 }.value
                 guard !Task.isCancelled,
                       generation == self.presentationGeneration else { return }

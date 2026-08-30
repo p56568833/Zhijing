@@ -44,7 +44,11 @@ struct KnowledgeBaseService: Sendable {
         for case let url as URL in enumerator {
             let relative = relativePath(of: url, root: root)
             let components = relative.split(separator: "/").map(String.init)
-            let values = try url.resourceValues(forKeys: Set(keys))
+            // 单个条目读不出属性（权限受限、坏符号链接）时跳过它，
+            // 不能让整个知识库扫描失败。
+            guard let values = try? url.resourceValues(forKeys: Set(keys)) else {
+                continue
+            }
             if components.contains(where: exclusions.contains) {
                 if values.isDirectory == true {
                     enumerator.skipDescendants()

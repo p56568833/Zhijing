@@ -26,7 +26,8 @@ enum DocumentOrdering {
     ) -> [String] {
         let pathSet = Set(paths)
         let ordered = manualOrder.filter { pathSet.contains($0) }
-        let leftovers = paths.filter { !manualOrder.contains($0) }
+        let manualSet = Set(manualOrder)
+        let leftovers = paths.filter { !manualSet.contains($0) }
         return ordered + leftovers
     }
 

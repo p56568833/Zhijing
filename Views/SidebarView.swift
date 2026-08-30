@@ -52,6 +52,10 @@ struct SidebarView: View {
     private var collapsedFoldersJSON: String = "[]"
     @AppStorage("sidebarFolderOrder")
     private var folderOrderJSON: String = "{}"
+    /// 解码后的布局偏好缓存：树视图每个文件夹行都会读，
+    /// 不能每行都跑一次 JSONDecoder。
+    @State private var folderOrderCache: [String: [String]] = [:]
+    @State private var collapsedFoldersCache: Set<String> = []
     @State private var draggingDocumentPath: String?
     @State private var dragGhostOffset: CGFloat = 0
     @State private var dragGhostBaseOffset: CGFloat = 0
@@ -106,6 +110,9 @@ struct SidebarView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(ZhijingTheme.sidebar)
         .animation(.snappy(duration: 0.24), value: contentMode)
+        .onAppear { reloadLayoutPreferenceCaches() }
+        .onChange(of: folderOrderJSON) { _, _ in reloadLayoutPreferenceCaches() }
+        .onChange(of: collapsedFoldersJSON) { _, _ in reloadLayoutPreferenceCaches() }
         .task(id: outlineRefreshID) {
             await refreshOutline()
         }
@@ -400,15 +407,13 @@ struct SidebarView: View {
     }
 
     private var folderOrder: [String: [String]] {
-        (try? JSONDecoder().decode(
-            [String: [String]].self,
-            from: Data(folderOrderJSON.utf8)
-        )) ?? [:]
+        folderOrderCache
     }
 
     private func setFolderOrder(_ value: [String: [String]]) {
         guard let data = try? JSONEncoder().encode(value),
               let json = String(data: data, encoding: .utf8) else { return }
+        folderOrderCache = value
         folderOrderJSON = json
     }
 
@@ -420,16 +425,25 @@ struct SidebarView: View {
     }
 
     private var collapsedFolders: Set<String> {
-        Set((try? JSONDecoder().decode(
-            [String].self,
-            from: Data(collapsedFoldersJSON.utf8)
-        )) ?? [])
+        collapsedFoldersCache
     }
 
     private func setCollapsedFolders(_ value: Set<String>) {
         guard let data = try? JSONEncoder().encode(value.sorted()),
               let json = String(data: data, encoding: .utf8) else { return }
+        collapsedFoldersCache = value
         collapsedFoldersJSON = json
+    }
+
+    private func reloadLayoutPreferenceCaches() {
+        folderOrderCache = (try? JSONDecoder().decode(
+            [String: [String]].self,
+            from: Data(folderOrderJSON.utf8)
+        )) ?? [:]
+        collapsedFoldersCache = Set((try? JSONDecoder().decode(
+            [String].self,
+            from: Data(collapsedFoldersJSON.utf8)
+        )) ?? [])
     }
 
     private func toggleFolderCollapsed(_ path: String) {
@@ -460,6 +474,9 @@ struct SidebarView: View {
 
     private var libraryTreeList: some View {
         ScrollView {
+            // 每个文件夹行的文稿计数共用这一张表，
+            // 不再每行都全库扫一遍前缀。
+            let folderCounts = folderDocumentCounts()
             VStack(spacing: 0) {
                 if !store.favoriteDocuments.isEmpty {
                     treeSectionHeader(
@@ -477,12 +494,31 @@ struct SidebarView: View {
                     }
                 }
                 treeSectionHeader("folder", "知识库", store.documents.count)
-                treeRows(store.libraryTree, parent: "", depth: 0)
+                treeRows(
+                    store.libraryTree,
+                    parent: "",
+                    depth: 0,
+                    folderCounts: folderCounts
+                )
             }
             .padding(.horizontal, 6)
             .padding(.top, 2)
             .padding(.bottom, 8)
         }
+    }
+
+    /// 文件夹（含其子文件夹）的文稿数，一次遍历构建。
+    private func folderDocumentCounts() -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for document in store.documents {
+            var current = document.folder
+            while !current.isEmpty {
+                counts[current, default: 0] += 1
+                current = (current as NSString).deletingLastPathComponent
+                if current == "." { break }
+            }
+        }
+        return counts
     }
 
     private func treeSectionHeader(
@@ -510,7 +546,8 @@ struct SidebarView: View {
     private func treeRows(
         _ items: [LibraryTreeItem],
         parent: String,
-        depth: Int
+        depth: Int,
+        folderCounts: [String: Int]
     ) -> AnyView {
         // 文件夹按用户自定义顺序排，文稿跟在后面。
         let savedOrder = folderOrder[parent] ?? []
@@ -546,7 +583,8 @@ struct SidebarView: View {
                         path: path,
                         parent: parent,
                         siblings: siblingPaths,
-                        depth: depth
+                        depth: depth,
+                        folderCounts: folderCounts
                     )
                 case .document(let document):
                     LibraryRowContainer(
@@ -566,7 +604,8 @@ struct SidebarView: View {
         path: String,
         parent: String,
         siblings: [String],
-        depth: Int
+        depth: Int,
+        folderCounts: [String: Int]
     ) -> some View {
         let isCollapsed = collapsedFolders.contains(path)
         VStack(spacing: 0) {
@@ -582,7 +621,7 @@ struct SidebarView: View {
                     .font(.callout)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                Text("\(documents(in: path).count)")
+                Text("\(folderCounts[path] ?? 0)")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -596,8 +635,13 @@ struct SidebarView: View {
                 .appending(path: path, directoryHint: .isDirectory)
                 .path ?? path)
             if !isCollapsed, let children = item.children {
-                treeRows(children, parent: path, depth: depth + 1)
-                    .padding(.leading, 13)
+                treeRows(
+                    children,
+                    parent: path,
+                    depth: depth + 1,
+                    folderCounts: folderCounts
+                )
+                .padding(.leading, 13)
                     .overlay(alignment: .topLeading) {
                         Rectangle()
                             .fill(ZhijingTheme.hairline)
@@ -708,7 +752,8 @@ struct SidebarView: View {
 
     private func sorted(_ documents: [NoteDocument]) -> [NoteDocument] {
         let byPath = Dictionary(
-            uniqueKeysWithValues: documents.map { ($0.relativePath, $0) }
+            documents.map { ($0.relativePath, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
         switch store.documentSort {
         case .recent:

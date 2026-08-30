@@ -114,7 +114,11 @@ final class AnnotationPersistenceService: @unchecked Sendable {
                 document: document
             )
         }
-        queue.sync {}
+        // 强制把队列里的批次同步跑完（包括还在退避等待重试的），
+        // 退出前给失败过的写入最后一次落盘机会。
+        queue.sync { [weak self] in
+            self?.drainPendingSaves()
+        }
         lock.lock(); defer { lock.unlock() }
         if let lastError { throw lastError }
     }
@@ -143,6 +147,7 @@ final class AnnotationPersistenceService: @unchecked Sendable {
     }
 
     private func drainPendingSaves() {
+        var consecutiveFailures = 0
         while true {
             lock.lock()
             let annotations = pendingAnnotations
@@ -156,21 +161,54 @@ final class AnnotationPersistenceService: @unchecked Sendable {
             }
             lock.unlock()
 
-            do {
-                if let annotations {
+            // 遗留缓存与每个便携文件分开写：一个目标损坏不能
+            // 连带放弃其余目标的落盘。
+            var legacyFailed = false
+            var failedPortableWrites: [(URL, [String: [TextAnnotation]])] = []
+            if let annotations {
+                do {
                     try writeLegacyCache(annotations)
+                } catch {
+                    lock.lock()
+                    lastError = error
+                    lock.unlock()
+                    legacyFailed = true
                 }
-                for (url, documents) in portableWrites {
-                    try writePortable(documents: documents, to: url)
-                }
-                lock.lock()
-                lastError = nil
-                lock.unlock()
-            } catch {
-                lock.lock()
-                lastError = error
-                lock.unlock()
             }
+            for portableWrite in portableWrites {
+                do {
+                    try writePortable(documents: portableWrite.1, to: portableWrite.0)
+                } catch {
+                    lock.lock()
+                    lastError = error
+                    lock.unlock()
+                    failedPortableWrites.append(portableWrite)
+                }
+            }
+
+            lock.lock()
+            if !legacyFailed, failedPortableWrites.isEmpty {
+                lastError = nil
+                consecutiveFailures = 0
+                lock.unlock()
+                continue
+            }
+            // 失败的批次重新入队，退避后重试；中途的新保存
+            // 也合并进同一轮，不丢数据。
+            if legacyFailed {
+                pendingAnnotations = annotations
+            }
+            for write in failedPortableWrites {
+                pendingPortableWrites[write.0.standardizedFileURL.path] = write
+            }
+            consecutiveFailures += 1
+            let retryDelay = min(30.0, pow(2.0, Double(min(consecutiveFailures, 5))))
+            lock.unlock()
+
+            queue.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                self?.drainPendingSaves()
+            }
+            return
         }
     }
 

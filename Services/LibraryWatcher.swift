@@ -27,6 +27,7 @@ final class LibraryWatcher: LibraryWatching {
     )
     private var stream: FSEventStreamRef?
     private var handlerBox: EventHandlerBox?
+    private var watchedConfiguration: [String]?
 
     deinit {
         queue.sync {
@@ -68,7 +69,15 @@ final class LibraryWatcher: LibraryWatching {
         }
 
         queue.sync {
+            // 监听配置没变就不重建流：stop→start 的间隙会漏掉磁盘事件，
+            // 漏掉的外部修改随后会被自动保存覆盖。刷新知识库高频调用
+            // start，必须在这里挡住无谓的重建。
+            if watchedConfiguration == watchedPaths, stream != nil {
+                handlerBox = handler
+                return
+            }
             stopOnQueue()
+            watchedConfiguration = watchedPaths
             startOnQueue(paths: watchedPaths, handler: handler)
         }
     }
@@ -125,6 +134,7 @@ final class LibraryWatcher: LibraryWatching {
             self.stream = nil
         }
         handlerBox = nil
+        watchedConfiguration = nil
     }
 
     private static let handleEvents: FSEventStreamCallback = {

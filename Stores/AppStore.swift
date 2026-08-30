@@ -436,10 +436,14 @@ final class AppStore {
                 newRelativePath: match.destination.relativePath,
                 updateSelection: isSelected
             )
-            try? knowledgeBase.migrateRevisions(
-                from: match.vanished,
-                to: match.destination.url
-            )
+            do {
+                try knowledgeBase.migrateRevisions(
+                    from: match.vanished,
+                    to: match.destination.url
+                )
+            } catch {
+                errorMessage = "文稿已跟随移动，但历史版本迁移失败：\(error.localizedDescription)"
+            }
             if isSelected {
                 followedSelection = true
                 if hasUnsavedChanges {
@@ -1628,9 +1632,11 @@ final class AppStore {
     private func reconcileOpenDocuments() {
         let validPaths = Set(documents.map(\.relativePath))
         var seen: Set<String> = []
-        openDocumentPaths = openDocumentPaths.filter { path in
+        let reconciled = openDocumentPaths.filter { path in
             validPaths.contains(path) && seen.insert(path).inserted
         }
+        guard reconciled != openDocumentPaths else { return }
+        openDocumentPaths = reconciled
         persistOpenDocuments()
     }
 

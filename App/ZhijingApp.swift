@@ -35,6 +35,18 @@ struct ZhijingApp: App {
                 Button("新建文件夹") { store.createFolder() }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
             }
+            CommandGroup(before: .newItem) {
+                // 放在 File 菜单最前、系统「关闭窗口」之前：
+                // 有文稿时 ⌘W 优先关标签页，没有文稿时按钮禁用，
+                // 按键自然落到系统的关闭窗口。
+                Button("关闭标签页") {
+                    if let document = store.selectedDocument {
+                        store.closeDocumentTab(document)
+                    }
+                }
+                .keyboardShortcut("w")
+                .disabled(store.selectedDocument == nil)
+            }
             CommandGroup(after: .textEditing) {
                 Button("查找…") {
                     store.showDocumentFind()

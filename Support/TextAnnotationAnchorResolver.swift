@@ -88,19 +88,40 @@ enum TextAnnotationAnchorResolver {
         return ResolvedTextAnnotation(annotation: annotation, range: bestRange)
     }
 
+    /// 推断 oldText → newText 的单点编辑。与具体批注无关，
+    /// 对一批批注做 reanchor 时只需调用方算一次。
+    static func edit(
+        mutation: EditorTextMutation?,
+        from oldText: String,
+        to newText: String
+    ) -> EditorTextMutation? {
+        verifiedEdit(mutation, oldText: oldText, newText: newText)
+            ?? inferredEdit(from: oldText, to: newText)
+    }
+
     static func reanchor(
         _ annotation: TextAnnotation,
         from oldText: String,
         to newText: String,
         mutation: EditorTextMutation? = nil
     ) -> TextAnnotation {
+        reanchor(
+            annotation,
+            from: oldText,
+            to: newText,
+            edit: edit(mutation: mutation, from: oldText, to: newText)
+        )
+    }
+
+    static func reanchor(
+        _ annotation: TextAnnotation,
+        from oldText: String,
+        to newText: String,
+        edit: EditorTextMutation?
+    ) -> TextAnnotation {
         guard oldText != newText,
               let oldResolved = resolve(annotation, in: oldText),
-              let edit = verifiedEdit(
-                  mutation,
-                  oldText: oldText,
-                  newText: newText
-              ) ?? inferredEdit(from: oldText, to: newText),
+              let edit,
               let newRange = transformed(
                   oldResolved.range,
                   through: edit,

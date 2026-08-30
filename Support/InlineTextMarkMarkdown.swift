@@ -72,13 +72,22 @@ private struct EncodedInlineTextMarkSelection {
 }
 
 enum InlineTextMarkMarkdown {
+    /// 热路径（每次按键/选区变化）都会调用，正则一律静态编译一次。
+    private static let spanExpression = try? NSRegularExpression(
+        pattern: #"\[([^\]\n]+)\]\{\.("# + InlineTextMarkKind.syntaxAlternation + #")\}"#
+    )
+    private static let lineBreakExpression = try? NSRegularExpression(
+        pattern: #"\r\n|\n|\r"#
+    )
+    private static let blockPrefixExpression = try? NSRegularExpression(
+        pattern: #"^(?:#{1,6}[ \t]+|>[ \t]?|[-+*][ \t]+\[[ xX]\][ \t]+|(?:[-+*]|[0-9]+[.)])[ \t]+)"#
+    )
+
     static func spans(
         in source: String,
         baseLocation: Int = 0
     ) -> [InlineTextMarkSpan] {
-        guard let expression = try? NSRegularExpression(
-            pattern: #"\[([^\]\n]+)\]\{\.("# + InlineTextMarkKind.syntaxAlternation + #")\}"#
-        ) else { return [] }
+        guard let expression = spanExpression else { return [] }
         let nsSource = source as NSString
         let fullRange = NSRange(location: 0, length: nsSource.length)
 
@@ -115,6 +124,13 @@ enum InlineTextMarkMarkdown {
         containingSpan(in: source, selection: selection)?.kind
     }
 
+    static func kind(
+        at selection: NSRange,
+        spans: [InlineTextMarkSpan]
+    ) -> InlineTextMarkKind? {
+        containingSpan(selection: selection, spans: spans)?.kind
+    }
+
     static func containsMark(
         in source: String,
         intersecting selection: NSRange
@@ -124,21 +140,42 @@ enum InlineTextMarkMarkdown {
         }
     }
 
+    static func containsMark(
+        intersecting selection: NSRange,
+        spans: [InlineTextMarkSpan]
+    ) -> Bool {
+        spans.contains {
+            NSIntersectionRange($0.fullRange, selection).length > 0
+        }
+    }
+
     static func mutation(
         in source: String,
         selection: NSRange,
         applying requestedKind: InlineTextMarkKind?
+    ) -> InlineTextMarkMutation? {
+        return mutation(
+            in: source,
+            selection: selection,
+            applying: requestedKind,
+            spans: spans(in: source)
+        )
+    }
+
+    static func mutation(
+        in source: String,
+        selection: NSRange,
+        applying requestedKind: InlineTextMarkKind?,
+        spans allSpans: [InlineTextMarkSpan]
     ) -> InlineTextMarkMutation? {
         let nsSource = source as NSString
         guard selection.length > 0,
               selection.location >= 0,
               NSMaxRange(selection) <= nsSource.length else { return nil }
 
-        let allSpans = spans(in: source)
         // 光标在单个标记内（选区碰到正文）→ 整个标记换色或清除；
         // 选区只压住语法字符时走下面的改写路径，标记保持原样。
         if let existing = containingSpan(
-            in: source,
             selection: selection,
             spans: allSpans
         ), NSIntersectionRange(existing.contentRange, selection).length > 0 {
@@ -346,9 +383,7 @@ enum InlineTextMarkMarkdown {
     }
 
     static func removingSyntax(from source: String) -> String {
-        guard let expression = try? NSRegularExpression(
-            pattern: #"\[([^\]\n]+)\]\{\.("# + InlineTextMarkKind.syntaxAlternation + #")\}"#
-        ) else { return source }
+        guard let expression = spanExpression else { return source }
         return expression.stringByReplacingMatches(
             in: source,
             range: NSRange(location: 0, length: (source as NSString).length),
@@ -362,9 +397,7 @@ enum InlineTextMarkMarkdown {
         sourceLocation: Int,
         as kind: InlineTextMarkKind
     ) -> EncodedInlineTextMarkSelection? {
-        guard let lineBreakExpression = try? NSRegularExpression(
-            pattern: #"\r\n|\n|\r"#
-        ) else { return nil }
+        guard let lineBreakExpression else { return nil }
 
         let nsSelection = selection as NSString
         let lineBreaks = lineBreakExpression.matches(
@@ -473,9 +506,8 @@ enum InlineTextMarkMarkdown {
                 return nil
             }
             if isThematicBreak(candidate) { return nil }
-            if let expression = try? NSRegularExpression(
-                pattern: #"^(?:#{1,6}[ \t]+|>[ \t]?|[-+*][ \t]+\[[ xX]\][ \t]+|(?:[-+*]|[0-9]+[.)])[ \t]+)"#
-            ), let match = expression.firstMatch(
+            if let expression = blockPrefixExpression,
+               let match = expression.firstMatch(
                 in: candidate,
                 range: NSRange(location: 0, length: (candidate as NSString).length)
             ) {
@@ -535,10 +567,16 @@ enum InlineTextMarkMarkdown {
 
     private static func containingSpan(
         in source: String,
-        selection: NSRange,
-        spans: [InlineTextMarkSpan]? = nil
+        selection: NSRange
     ) -> InlineTextMarkSpan? {
-        (spans ?? self.spans(in: source)).first { span in
+        containingSpan(selection: selection, spans: spans(in: source))
+    }
+
+    private static func containingSpan(
+        selection: NSRange,
+        spans: [InlineTextMarkSpan]
+    ) -> InlineTextMarkSpan? {
+        spans.first { span in
             contains(span.contentRange, selection) || contains(span.fullRange, selection)
         }
     }

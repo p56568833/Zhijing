@@ -96,6 +96,10 @@ final class AnnotationRepository {
     private let persistence: AnnotationPersistenceService
     private var loadedLibraryRootPath: String?
     private var blockedLibraryRootPaths: Set<String> = []
+    /// 损坏文件的重试冷却：加载失败的库短时间不再反复读盘报错，
+    /// 否则每次自动保存都会重弹一次错误。
+    private var loadFailureCooldowns: [String: Date] = [:]
+    private static let loadRetryInterval: TimeInterval = 60
     private var resolutionCache = AnnotationResolutionCache()
 
     init(persistence: AnnotationPersistenceService = .init()) {
@@ -124,12 +128,19 @@ final class AnnotationRepository {
         to newText: String,
         mutation: EditorTextMutation?
     ) -> [TextAnnotation] {
-        annotations.map {
+        // 编辑推断与单条批注无关，循环外算一次，
+        // 避免每个按键对每条批注重付一遍 O(n)。
+        let edit = TextAnnotationAnchorResolver.edit(
+            mutation: mutation,
+            from: oldText,
+            to: newText
+        )
+        return annotations.map {
             TextAnnotationAnchorResolver.reanchor(
                 $0,
                 from: oldText,
                 to: newText,
-                mutation: mutation
+                edit: edit
             )
         }
     }
@@ -140,6 +151,10 @@ final class AnnotationRepository {
     ) throws {
         let rootPath = root.standardizedFileURL.path
         guard loadedLibraryRootPath != rootPath else { return }
+        if let failedAt = loadFailureCooldowns[rootPath],
+           Date.now.timeIntervalSince(failedAt) < Self.loadRetryInterval {
+            return
+        }
         let portableURL = root.appending(
             path: AnnotationPersistenceService.portableFilename
         )
@@ -163,8 +178,10 @@ final class AnnotationRepository {
             }
             loadedLibraryRootPath = rootPath
             blockedLibraryRootPaths.remove(rootPath)
+            loadFailureCooldowns[rootPath] = nil
         } catch {
             blockedLibraryRootPaths.insert(rootPath)
+            loadFailureCooldowns[rootPath] = .now
             throw error
         }
     }
@@ -209,6 +226,7 @@ final class AnnotationRepository {
 
     func transitionToLibrary() {
         loadedLibraryRootPath = nil
+        loadFailureCooldowns.removeAll()
         resolutionCache.reset()
     }
 }

@@ -5,6 +5,9 @@ final class MarkdownTextMarkSyntaxVisibilityController: NSObject,
     @preconcurrency NSLayoutManagerDelegate {
     private weak var layoutManager: NSLayoutManager?
     private(set) var hiddenRanges: [NSRange] = []
+    /// 排好序的隐藏区间，isHidden 走二分；字形生成回调对每个
+    /// 字形都会调用，线性扫全部区间在大文档上是千万级比较。
+    private var sortedHiddenRanges: [NSRange] = []
 
     func connect(to layoutManager: NSLayoutManager) {
         self.layoutManager = layoutManager
@@ -18,6 +21,20 @@ final class MarkdownTextMarkSyntaxVisibilityController: NSObject,
         guard hiddenRanges != newRanges else { return }
         let oldRanges = hiddenRanges
         hiddenRanges = newRanges
+        sortedHiddenRanges = newRanges
+            .filter { $0.length > 0 }
+            .sorted { $0.location < $1.location }
+        // 批注摘录行里可能嵌标记语法，区间会重叠；合并后二分才成立。
+        var merged: [NSRange] = []
+        merged.reserveCapacity(sortedHiddenRanges.count)
+        for range in sortedHiddenRanges {
+            if let last = merged.last, range.location <= NSMaxRange(last) {
+                merged[merged.count - 1] = NSUnionRange(last, range)
+            } else {
+                merged.append(range)
+            }
+        }
+        sortedHiddenRanges = merged
 
         let fullRange = NSRange(location: 0, length: max(0, textLength))
         guard let invalidatedRange = union(of: oldRanges + newRanges).map({
@@ -85,7 +102,20 @@ final class MarkdownTextMarkSyntaxVisibilityController: NSObject,
     }
 
     private func isHidden(_ characterIndex: Int) -> Bool {
-        hiddenRanges.contains { NSLocationInRange(characterIndex, $0) }
+        var low = 0
+        var high = sortedHiddenRanges.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            let range = sortedHiddenRanges[mid]
+            if characterIndex < range.location {
+                high = mid - 1
+            } else if characterIndex >= NSMaxRange(range) {
+                low = mid + 1
+            } else {
+                return true
+            }
+        }
+        return false
     }
 
     private func union(of ranges: [NSRange]) -> NSRange? {
